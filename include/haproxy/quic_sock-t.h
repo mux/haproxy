@@ -4,6 +4,7 @@
 
 #include <haproxy/buf-t.h>
 #include <haproxy/obj_type-t.h>
+#include <haproxy/bring.h>
 
 /* QUIC socket allocation strategy. */
 enum quic_sock_mode {
@@ -17,15 +18,6 @@ struct quic_accept_queue {
 	struct tasklet *tasklet;  /* task responsible to call listener_accept */
 };
 
-/* Buffer used to receive QUIC datagrams on random thread and redispatch them
- * to the connection thread.
- */
-struct quic_receiver_buf {
-	struct buffer buf; /* storage for datagrams received. */
-	struct list dgram_list; /* datagrams received with this rxbuf. */
-	struct mt_list rxbuf_el; /* list element into receiver.rxbuf_list. */
-};
-
 #define QUIC_DGRAM_FL_REJECT			0x00000001
 #define QUIC_DGRAM_FL_SEND_RETRY		0x00000002
 
@@ -37,19 +29,18 @@ struct quic_dgram {
 	size_t len;
 	unsigned char *dcid;
 	size_t dcid_len;
+	unsigned int origin;
+	unsigned long long read_time_ns;
 	struct sockaddr_storage saddr;
 	struct sockaddr_storage daddr;
 	struct quic_conn *qc;
-
-	struct list recv_list; /* element pointing to quic_receiver_buf <dgram_list>. */
-	struct mt_list handler_list; /* element pointing to quic_dghdlr <dgrams>. */
 
 	int flags; /* QUIC_DGRAM_FL_* values */
 };
 
 /* QUIC datagram handler */
 struct quic_dghdlr {
-	struct mt_list dgrams;
+	struct bring buf;      /* MPSC ring buffer for datagrams. */
 	struct tasklet *task;
 };
 

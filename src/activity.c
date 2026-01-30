@@ -659,6 +659,10 @@ void activity_count_runtime(uint32_t run_time)
 	up = 1000;
 	down = up * 99 / 100;
 
+#if defined(DEBUG_DEV)
+	if (run_time > activity[tid].ctr0)
+		activity[tid].ctr0 = run_time;
+#endif
 	run_time = swrate_add(&activity[tid].avg_loop_us, TIME_STATS_SAMPLES, run_time);
 
 	/* In automatic mode, reaching the "up" threshold on average switches
