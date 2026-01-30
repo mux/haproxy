@@ -29,6 +29,7 @@ extern struct protocol proto_quic4;
 extern struct protocol proto_quic6;
 
 extern struct quic_dghdlr *quic_dghdlrs;
+extern struct quic_receiver_buf *quic_rxbufs;
 
 extern THREAD_LOCAL struct cshared quic_mem_diff;
 

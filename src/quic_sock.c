@@ -489,10 +489,7 @@ void quic_lstnr_sock_fd_iocb(int fd)
 	if (!(fdtab[fd].state & FD_POLL_IN) || !fd_recv_ready(fd))
 		return;
 
-	rxbuf = MT_LIST_POP(&l->rx.rxbuf_list, typeof(rxbuf), rxbuf_el);
-	if (!rxbuf)
-		goto out;
-
+	rxbuf = &quic_rxbufs[tid];
 	buf = &rxbuf->buf;
 
 	max_dgrams = global.tune.maxpollevents;
@@ -561,7 +558,6 @@ void quic_lstnr_sock_fd_iocb(int fd)
 		goto start;
  out:
 	pool_free(pool_head_quic_dgram, new_dgram);
-	MT_LIST_APPEND(&l->rx.rxbuf_list, &rxbuf->rxbuf_el);
 }
 
 /* FD-owned quic-conn socket callback. */
@@ -932,8 +928,7 @@ int qc_rcv_buf(struct quic_conn *qc)
 
 			TRACE_STATE("datagram for other connection on quic-conn socket, requeue it", QUIC_EV_CONN_RCV, qc);
 
-			rxbuf = MT_LIST_POP(&l->rx.rxbuf_list, typeof(rxbuf), rxbuf_el);
-			ASSUME_NONNULL(rxbuf);
+			rxbuf = &quic_rxbufs[tid];
 			cspace = b_contig_space(&rxbuf->buf);
 
 			tmp_dgram = quic_rxbuf_purge_dgrams(rxbuf);
@@ -944,7 +939,6 @@ int qc_rcv_buf(struct quic_conn *qc)
 				struct quic_dgram *fake_dgram = pool_alloc(pool_head_quic_dgram);
 				if (!fake_dgram) {
 					/* TODO count lost datagrams */
-					MT_LIST_APPEND(&l->rx.rxbuf_list, &rxbuf->rxbuf_el);
 					continue;
 				}
 
@@ -957,7 +951,6 @@ int qc_rcv_buf(struct quic_conn *qc)
 			/* Recheck contig space after fake datagram insert. */
 			if (b_contig_space(&rxbuf->buf) < new_dgram->len) {
 				/* TODO count lost datagrams */
-				MT_LIST_APPEND(&l->rx.rxbuf_list, &rxbuf->rxbuf_el);
 				continue;
 			}
 
@@ -973,7 +966,6 @@ int qc_rcv_buf(struct quic_conn *qc)
 				new_dgram = NULL;
 			}
 
-			MT_LIST_APPEND(&l->rx.rxbuf_list, &rxbuf->rxbuf_el);
 			continue;
 		}
 
