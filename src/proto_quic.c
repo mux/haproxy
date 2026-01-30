@@ -29,6 +29,8 @@
 #include <haproxy/api.h>
 #include <haproxy/arg.h>
 #include <haproxy/connection.h>
+#include <haproxy/counters.h>
+#include <haproxy/dv_mpscq.h>
 #include <haproxy/errors.h>
 #include <haproxy/fd.h>
 #include <haproxy/global.h>
@@ -43,6 +45,7 @@
 #include <haproxy/proxy-t.h>
 #include <haproxy/quic_conn.h>
 #include <haproxy/quic_sock.h>
+#include <haproxy/quic_stats.h>
 #include <haproxy/quic_tune.h>
 #include <haproxy/sock.h>
 #include <haproxy/sock_inet.h>
@@ -59,10 +62,7 @@ struct quic_receiver_buf *quic_rxbufs;
 static uint64_t quic_mem_global;
 THREAD_LOCAL struct cshared quic_mem_diff;
 
-/* Size of the internal buffer of QUIC RX buffer at the fd level */
-#define QUIC_RX_BUFSZ  (1UL << 18)
-
-DECLARE_STATIC_POOL(pool_head_quic_rxbuf, "quic_rxbuf", QUIC_RX_BUFSZ);
+#define QUIC_RX_NUM_BUFS	256
 
 static int quic_bind_listener(struct listener *listener, char *errmsg, int errlen);
 static int quic_connect_server(struct connection *conn, int flags);
@@ -446,28 +446,94 @@ int quic_connect_server(struct connection *conn, int flags)
 	return SF_ERR_NONE;  /* connection is OK */
 }
 
+static struct quic_dgram *quic_dgram_alloc(struct quic_receiver_buf *rxbuf)
+{
+	struct quic_dgram *dgram;
+
+	dgram = pool_alloc(pool_head_quic_dgram);
+	if (!dgram)
+		return NULL;
+
+	dgram->buf = malloc(QUIC_MAX_UDP_PAYLOAD_SIZE);
+	if (!dgram->buf) {
+		pool_free(pool_head_quic_dgram, dgram);
+		return NULL;
+	}
+
+	dgram->obj_type = OBJ_TYPE_DGRAM;
+	dgram->retqueue = &rxbuf->dgrams;
+	dgram->owner = NULL;
+	dgram->qc = NULL;
+	dgram->len = 0;
+	dgram->flags = 0;
+
+	return dgram;
+}
+
+struct quic_dgram *quic_dgram_get(struct listener *l, struct quic_receiver_buf *rxbuf)
+{
+	struct quic_counters *prx_counters;
+	struct proxy *px;
+	struct dv_mpscq_node *node;
+	struct quic_dgram *dgram;
+
+	/* In this case, we don't use the datagram that is being returned, but
+	 * the last stub element of the queue. This is because we need an
+	 * element we can freely use and push to the handler's queue. Using
+	 * that last stub element rather than the one being returned is fine
+	 * because those are strictly fungible: we don't care which one it is,
+	 * we just need one to store data in.
+	 */
+	if (!dv_mpscq_pop(&rxbuf->dgrams, &node)) {
+		px = l->bind_conf->frontend;
+		prx_counters = EXTRA_COUNTERS_GET(px->extra_counters_fe, &quic_stats_module);
+		HA_ATOMIC_INC(&prx_counters->rxbuf_full);
+		return NULL;
+	}
+
+	dgram = DV_MPSCQ_ELEM(node, struct quic_dgram, next);
+	quic_dgram_reset(dgram);
+	BUG_ON_HOT(dgram->retqueue != &rxbuf->dgrams);
+	return dgram;
+}
+
+/* Reset a datagram before reusing it. */
+void quic_dgram_reset(struct quic_dgram *dgram)
+{
+	dgram->owner = NULL;
+	dgram->qc = NULL;
+	dgram->flags = 0;
+}
+
 /* Allocate the RX buffers for <l> listener.
  * Return 1 if succeeded, 0 if not.
  */
 static int quic_alloc_rxbufs(void)
 {
 	struct quic_receiver_buf *rxbuf;
-	int i;
+	struct quic_dgram *dgram, *stub;
+	int i, j;
 
 	quic_rxbufs = calloc(global.nbthread, sizeof(*quic_rxbufs));
 	if (!quic_rxbufs)
 		return 0;
 
 	for (i = 0; i < global.nbthread; i++) {
-		char *buf;
 		rxbuf = &quic_rxbufs[i];
 
-		buf = pool_alloc(pool_head_quic_rxbuf);
-		if (!buf)
+		stub = quic_dgram_alloc(rxbuf);
+		if (!stub)
 			goto err;
 
-		rxbuf->buf = b_make(buf, QUIC_RX_BUFSZ, 0, 0);
-		LIST_INIT(&rxbuf->dgram_list);
+		dv_mpscq_init(&rxbuf->dgrams, &stub->next);
+
+		for (j = 0; j < QUIC_RX_NUM_BUFS - 1; j++) {
+			dgram = quic_dgram_alloc(rxbuf);
+			if (!dgram)
+				goto err;
+
+			dv_mpscq_push(&rxbuf->dgrams, &dgram->next);
+		}
 	}
 
 	return 1;
@@ -481,13 +547,31 @@ REGISTER_POST_CHECK(quic_alloc_rxbufs);
 static int quic_deallocate_rxbufs(void)
 {
 	struct quic_receiver_buf *rxbuf;
+	struct quic_dgram *dgram;
+	struct dv_mpscq_node *node;
 	int i;
 
 	if (quic_rxbufs) {
 		for (i = 0; i < global.nbthread; i++) {
 			rxbuf = &quic_rxbufs[i];
 
-			pool_free(pool_head_quic_rxbuf, rxbuf->buf.area);
+			if (dv_mpscq_deinit(&rxbuf->dgrams)) {
+				/* The only reason dv_mpscq_deinit() would return NULL is
+				 * if we never reached dv_mpscq_init() because the stub node
+				 * allocation failed. In this case, we have nothing to do.
+				 * Otherwise, we need to empty the queue.
+				 */
+				while (dv_mpscq_pop(&rxbuf->dgrams, &node)) {
+					dgram = DV_MPSCQ_ELEM(node, struct quic_dgram, next);
+					free(dgram->buf);
+					pool_free(pool_head_quic_dgram, dgram);
+				}
+
+				node = dv_mpscq_deinit(&rxbuf->dgrams);
+				dgram = DV_MPSCQ_ELEM(node, struct quic_dgram, next);
+				free(dgram->buf);
+				pool_free(pool_head_quic_dgram, dgram);
+			}
 		}
 		free(quic_rxbufs);
 	}
@@ -642,6 +726,7 @@ REGISTER_PER_THREAD_INIT(quic_init_mem);
 
 static int quic_alloc_dghdlrs(void)
 {
+	struct quic_dgram *stub;
 	int i;
 
 	quic_dghdlrs = calloc(global.nbthread, sizeof(*quic_dghdlrs));
@@ -663,7 +748,18 @@ static int quic_alloc_dghdlrs(void)
 		dghdlr->task->context = dghdlr;
 		dghdlr->task->process = quic_lstnr_dghdlr;
 
-		MT_LIST_INIT(&dghdlr->dgrams);
+		stub = pool_alloc(pool_head_quic_dgram);
+		if (!stub) {
+			ha_alert("Failed to allocate the stub quic datagram on thread %d.\n", i);
+			return 0;
+		}
+
+		/* Setting the return queue to NULL here lets us know that we are
+		 * dealing with the initial stub node and that we can free it
+		 * instead of pushing it back to a listener queue.
+		 */
+		stub->retqueue = NULL;
+		dv_mpscq_init(&dghdlr->dgrams, &stub->next);
 	}
 
 	return 1;
