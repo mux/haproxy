@@ -44,7 +44,9 @@ int quic_sock_accepting_conn(const struct receiver *rx);
 struct connection *quic_sock_accept_conn(struct listener *l, int *status);
 
 struct task *quic_lstnr_dghdlr(struct task *t, void *ctx, unsigned int state);
+struct task *quic_lstnr_flush_task(struct task *t, void *ctx, unsigned int state);
 void quic_lstnr_sock_fd_iocb(int fd);
+int quic_dgram_requeue(struct quic_dgram *dgram, int cid_tid);
 int qc_snd_buf(struct quic_conn *qc, const struct buffer *buf, size_t count,
                int flags, uint16_t gso_size);
 int qc_rcv_buf(struct quic_conn *qc);

@@ -29,7 +29,7 @@ void *bring_write_reserve(struct bring *ring, size_t len);
 
 /* Commit data to the buffer after it was written to the pointer given by
  * bring_write_reserve(). The <ptr> and <len> parameters MUST be identical to
- * the values passed to bring_write_reserve().
+ * the ones returned by and passed to bring_write_reserve(), respectively.
  */
 void bring_write_commit(struct bring *ring, void *ptr, size_t len);
 
