@@ -53,6 +53,9 @@
 /* per-thread quic datagram handlers */
 struct quic_dghdlr *quic_dghdlrs;
 
+/* per-thread quic receive buffers */
+struct quic_receiver_buf *quic_rxbufs;
+
 static uint64_t quic_mem_global;
 THREAD_LOCAL struct cshared quic_mem_diff;
 
@@ -69,6 +72,7 @@ static int quic_bind_tid_prep(struct connection *conn, int new_tid);
 static void quic_bind_tid_commit(struct connection *conn);
 static void quic_bind_tid_reset(struct connection *conn);
 static int quic_get_info(struct connection *conn, long long int *info, int info_num);
+static int quic_deallocate_rxbufs(void);
 
 /* Note: must not be declared <const> as its list will be overwritten */
 struct protocol proto_quic4 = {
@@ -445,40 +449,52 @@ int quic_connect_server(struct connection *conn, int flags)
 /* Allocate the RX buffers for <l> listener.
  * Return 1 if succeeded, 0 if not.
  */
-static int quic_alloc_rxbufs_listener(struct listener *l)
+static int quic_alloc_rxbufs(void)
 {
+	struct quic_receiver_buf *rxbuf;
 	int i;
-	struct quic_receiver_buf *tmp;
 
-	MT_LIST_INIT(&l->rx.rxbuf_list);
-	for (i = 0; i < my_popcountl(l->rx.bind_thread); i++) {
-		struct quic_receiver_buf *rxbuf;
+	quic_rxbufs = calloc(global.nbthread, sizeof(*quic_rxbufs));
+	if (!quic_rxbufs)
+		return 0;
+
+	for (i = 0; i < global.nbthread; i++) {
 		char *buf;
-
-		rxbuf = calloc(1, sizeof(*rxbuf));
-		if (!rxbuf)
-			goto err;
+		rxbuf = &quic_rxbufs[i];
 
 		buf = pool_alloc(pool_head_quic_rxbuf);
-		if (!buf) {
-			free(rxbuf);
+		if (!buf)
 			goto err;
-		}
 
 		rxbuf->buf = b_make(buf, QUIC_RX_BUFSZ, 0, 0);
 		LIST_INIT(&rxbuf->dgram_list);
-		MT_LIST_APPEND(&l->rx.rxbuf_list, &rxbuf->rxbuf_el);
 	}
 
 	return 1;
 
  err:
-	while ((tmp = MT_LIST_POP(&l->rx.rxbuf_list, typeof(tmp), rxbuf_el))) {
-		pool_free(pool_head_quic_rxbuf, tmp->buf.area);
-		free(tmp);
-	}
+	quic_deallocate_rxbufs();
 	return 0;
 }
+REGISTER_POST_CHECK(quic_alloc_rxbufs);
+
+static int quic_deallocate_rxbufs(void)
+{
+	struct quic_receiver_buf *rxbuf;
+	int i;
+
+	if (quic_rxbufs) {
+		for (i = 0; i < global.nbthread; i++) {
+			rxbuf = &quic_rxbufs[i];
+
+			pool_free(pool_head_quic_rxbuf, rxbuf->buf.area);
+		}
+		free(quic_rxbufs);
+	}
+
+	return 1;
+}
+REGISTER_POST_DEINIT(quic_deallocate_rxbufs);
 
 /* This function tries to bind a QUIC4/6 listener. It may return a warning or
  * an error message in <errmsg> if the message is at most <errlen> bytes long
@@ -533,12 +549,6 @@ static int quic_bind_listener(struct listener *listener, char *errmsg, int errle
 		break;
 	default:
 		break;
-	}
-
-	if (!quic_alloc_rxbufs_listener(listener)) {
-		msg = "could not initialize tx/rx rings";
-		err |= ERR_WARN;
-		goto udp_return;
 	}
 
 	if (global.tune.frontend_rcvbuf)
