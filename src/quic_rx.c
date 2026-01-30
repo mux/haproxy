@@ -2436,10 +2436,35 @@ int quic_dgram_parse(struct quic_dgram *dgram, struct quic_conn *from_qc,
 			 */
 			if (!qc) {
 				if (new_tid >= 0) {
+					/* We cannot requeue the datagram we are processing right now,
+					 * because it is still being used as the stub element in the queue.
+					 * Instead, we allocate an out-of-band datagram and use this one.
+					 * It will be freed after processing because we set the retqueue
+					 * field to NULL.
+					 */
+					struct quic_dgram *new;
 					TRACE_STATE("re-enqueue packet to conn thread", QUIC_EV_CONN_LPKT);
-					MT_LIST_APPEND(&quic_dghdlrs[new_tid].dgrams,
-					               &dgram->handler_list);
+
+					new = pool_alloc(pool_head_quic_dgram);
+					if (!new) {
+						pool_free(pool_head_quic_rx_packet, pkt);
+						goto err;
+					}
+
+					memcpy(new, dgram, sizeof(*new));
+					new->retqueue = NULL;
+					new->buf = malloc(dgram->len);
+					if (!new->buf) {
+						pool_free(pool_head_quic_rx_packet, pkt);
+						pool_free(pool_head_quic_dgram, new);
+						goto err;
+					}
+
+					memcpy(new->buf, dgram->buf, dgram->len);
+
+					dv_mpscq_push(&quic_dghdlrs[new_tid].dgrams, &new->next);
 					tasklet_wakeup(quic_dghdlrs[new_tid].task);
+
 					pool_free(pool_head_quic_rx_packet, pkt);
 					goto out;
 				}
@@ -2498,8 +2523,6 @@ int quic_dgram_parse(struct quic_dgram *dgram, struct quic_conn *from_qc,
 	/* This must never happen. */
 	BUG_ON(pos > end);
 	BUG_ON(pos < end || pos > dgram->buf + dgram->len);
-	/* Mark this datagram as consumed */
-	HA_ATOMIC_STORE(&dgram->buf, NULL);
 
  out:
 	TRACE_LEAVE(QUIC_EV_CONN_LPKT);
@@ -2507,7 +2530,6 @@ int quic_dgram_parse(struct quic_dgram *dgram, struct quic_conn *from_qc,
 
  err:
 	/* Mark this datagram as consumed as maybe at least some packets were parsed. */
-	HA_ATOMIC_STORE(&dgram->buf, NULL);
 	TRACE_LEAVE(QUIC_EV_CONN_LPKT);
 	return -1;
 }

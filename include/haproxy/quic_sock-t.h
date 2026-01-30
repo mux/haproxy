@@ -3,6 +3,7 @@
 #ifdef USE_QUIC
 
 #include <haproxy/buf-t.h>
+#include <haproxy/dv_mpscq.h>
 #include <haproxy/obj_type-t.h>
 
 /* QUIC socket allocation strategy. */
@@ -21,10 +22,8 @@ struct quic_accept_queue {
  * to the connection thread.
  */
 struct quic_receiver_buf {
-	struct buffer buf; /* storage for datagrams received. */
-	struct list dgram_list; /* datagrams received with this rxbuf. */
-	struct mt_list rxbuf_el; /* list element into receiver.rxbuf_list. */
-};
+	struct dv_mpscq_head dgrams; /* free-list of datagrams. */
+} THREAD_ALIGNED();
 
 #define QUIC_DGRAM_FL_REJECT			0x00000001
 #define QUIC_DGRAM_FL_SEND_RETRY		0x00000002
@@ -41,15 +40,15 @@ struct quic_dgram {
 	struct sockaddr_storage daddr;
 	struct quic_conn *qc;
 
-	struct list recv_list; /* element pointing to quic_receiver_buf <dgram_list>. */
-	struct mt_list handler_list; /* element pointing to quic_dghdlr <dgrams>. */
+	struct dv_mpscq_head *retqueue; /* pointer to the free-list to return this buffer to. */
+	struct dv_mpscq_node next;      /* linkage for the MPSC queues (listener and handler). */
 
 	int flags; /* QUIC_DGRAM_FL_* values */
 };
 
 /* QUIC datagram handler */
 struct quic_dghdlr {
-	struct mt_list dgrams;
+	struct dv_mpscq_head dgrams;
 	struct tasklet *task;
 };
 
