@@ -446,13 +446,13 @@ int quic_connect_server(struct connection *conn, int flags)
 	return SF_ERR_NONE;  /* connection is OK */
 }
 
-/* Allocate the RX buffers for <l> listener.
+/* Allocate the per-thread RX buffers.
  * Return 1 if succeeded, 0 if not.
  */
 static int quic_alloc_rxbufs(void)
 {
 	struct quic_receiver_buf *rxbuf;
-	int i;
+	int i, j;
 
 	quic_rxbufs = calloc(global.nbthread, sizeof(*quic_rxbufs));
 	if (!quic_rxbufs)
@@ -462,13 +462,36 @@ static int quic_alloc_rxbufs(void)
 		char *buf;
 		rxbuf = &quic_rxbufs[i];
 
+		/* Global pending datagrams list */
+		LIST_INIT(&rxbuf->pending);
+		/* Free list of datagrams */
+		LIST_INIT(&rxbuf->free);
+
+		/* Per-handler pending lists */
+		rxbuf->dghdlrs = calloc(global.nbthread, sizeof(*rxbuf->dghdlrs));
+		if (!rxbuf->dghdlrs)
+			goto err;
+
+		for (j = 0; j < global.nbthread; j++) {
+			LIST_INIT(&rxbuf->dghdlrs[j].pending);
+			rxbuf->dghdlrs[j].last_flush = now_ms;
+			rxbuf->dghdlrs[j].last_msg = INT_MIN;
+		}
+
 		buf = pool_alloc(pool_head_quic_rxbuf);
 		if (!buf)
 			goto err;
 
 		rxbuf->buf = b_make(buf, QUIC_RX_BUFSZ, 0, 0);
-		LIST_INIT(&rxbuf->dgram_list);
-	}
+
+		rxbuf->task = tasklet_new();
+		if (!rxbuf->task)
+			return 0;
+
+		tasklet_set_tid(rxbuf->task, i);
+		rxbuf->task->context = rxbuf;
+		rxbuf->task->process = quic_lstnr_flush_task;
+}
 
 	return 1;
 
@@ -487,6 +510,7 @@ static int quic_deallocate_rxbufs(void)
 		for (i = 0; i < global.nbthread; i++) {
 			rxbuf = &quic_rxbufs[i];
 
+			free(rxbuf->dghdlrs);
 			pool_free(pool_head_quic_rxbuf, rxbuf->buf.area);
 		}
 		free(quic_rxbufs);
@@ -642,6 +666,7 @@ REGISTER_PER_THREAD_INIT(quic_init_mem);
 
 static int quic_alloc_dghdlrs(void)
 {
+	char *buf;
 	int i;
 
 	quic_dghdlrs = calloc(global.nbthread, sizeof(*quic_dghdlrs));
@@ -653,6 +678,14 @@ static int quic_alloc_dghdlrs(void)
 	for (i = 0; i < global.nbthread; i++) {
 		struct quic_dghdlr *dghdlr = &quic_dghdlrs[i];
 
+		buf = malloc(QUIC_RX_BUFSZ);
+		if (!buf) {
+			ha_alert("Failed to allocate the buffer for the quic datagram handler on thread %d.\n", i);
+			return 0;
+		}
+
+		bring_init(&dghdlr->buf, buf, QUIC_RX_BUFSZ);
+
 		dghdlr->task = tasklet_new();
 		if (!dghdlr->task) {
 			ha_alert("Failed to allocate the quic datagram handler on thread %d.\n", i);
@@ -662,8 +695,6 @@ static int quic_alloc_dghdlrs(void)
 		tasklet_set_tid(dghdlr->task, i);
 		dghdlr->task->context = dghdlr;
 		dghdlr->task->process = quic_lstnr_dghdlr;
-
-		MT_LIST_INIT(&dghdlr->dgrams);
 	}
 
 	return 1;

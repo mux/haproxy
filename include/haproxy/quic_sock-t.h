@@ -4,6 +4,7 @@
 
 #include <haproxy/buf-t.h>
 #include <haproxy/obj_type-t.h>
+#include <haproxy/bring.h>
 
 /* QUIC socket allocation strategy. */
 enum quic_sock_mode {
@@ -18,12 +19,19 @@ struct quic_accept_queue {
 };
 
 /* Buffer used to receive QUIC datagrams on random thread and redispatch them
- * to the connection thread.
+ * to the connection thread. We have a single quic_receiver_buf per thread.
  */
 struct quic_receiver_buf {
-	struct buffer buf; /* storage for datagrams received. */
-	struct list dgram_list; /* datagrams received with this rxbuf. */
-	struct mt_list rxbuf_el; /* list element into receiver.rxbuf_list. */
+	struct tasklet *task;
+	struct buffer buf;           /* overflow storage for datagrams received. */
+	struct list pending;         /* global (all handlers) datagram pending list. */
+	struct hdlr_pending {
+		int has_pending;     /* set to 1 if the pending list is not empty. */
+		int last_flush;
+		int last_msg;
+		struct list pending;
+	} *dghdlrs;                  /* per-handler datagram pending lists. */
+	struct list free;            /* free list of quic_dgram structures. */
 };
 
 #define QUIC_DGRAM_FL_REJECT			0x00000001
@@ -41,15 +49,20 @@ struct quic_dgram {
 	struct sockaddr_storage daddr;
 	struct quic_conn *qc;
 
-	struct list recv_list; /* element pointing to quic_receiver_buf <dgram_list>. */
-	struct mt_list handler_list; /* element pointing to quic_dghdlr <dgrams>. */
+	/* These fields are private to each listener. */
+	struct list p_next;    /* linkage for per-handler pending list. */
+	/* We kind of abuse the following linkage field because it used for both
+	 * the global pending list and the free list. This is fine because a
+	 * datagram cannot be on both lists at the same time.
+	 */
+	struct list gp_next;
 
 	int flags; /* QUIC_DGRAM_FL_* values */
 };
 
 /* QUIC datagram handler */
 struct quic_dghdlr {
-	struct mt_list dgrams;
+	struct bring buf;      /* MPSC ring buffer for datagrams. */
 	struct tasklet *task;
 };
 
