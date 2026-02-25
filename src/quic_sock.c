@@ -210,21 +210,19 @@ struct task *quic_lstnr_dghdlr(struct task *t, void *ctx, unsigned int state)
 		quic_dgram_parse(dgram, NULL, dgram->owner);
 		bring_read_end(&dghdlr->buf, len);
 
+		if (--max_dgrams <= 0)
+			break;
+	}
+
+	if (max_dgrams < global.tune.maxpollevents) {
 		/* Notify listeners that are waiting to push datagrams to us. */
-		// FIXME: this trashes the L1 cache, maybe we need a bitmap
+		// FIXME: this trashes the L1 cache, an atomic bitmap would be better
 		for (i = 0; i < global.nbthread; i++) {
 			if (HA_ATOMIC_LOAD(&quic_rxbufs[i].dghdlrs[tid].has_pending))
 				tasklet_wakeup(quic_rxbufs[i].task);
 		}
-
-		if (--max_dgrams <= 0)
-			goto stop_here;
 	}
 
-	TRACE_LEAVE(QUIC_EV_CONN_LPKT);
-	return t;
-
- stop_here:
 	/* too much work done at once, come back here later */
 	if (max_dgrams <= 0)
 		tasklet_wakeup((struct tasklet *)t);
