@@ -62,7 +62,8 @@ struct quic_receiver_buf *quic_rxbufs;
 static uint64_t quic_mem_global;
 THREAD_LOCAL struct cshared quic_mem_diff;
 
-#define QUIC_RX_NUM_BUFS	256
+#define QUIC_RX_NUM_BUFS_LARGE  256   /* Number of buffers of QUIC_MAX_UDP_PAYLOAD_SIZE bytes */
+#define QUIC_RX_NUM_BUFS_SMALL  4096  /* Number of buffers of QUIC_RX_SMALL_BUFSZ bytes */
 
 static int quic_bind_listener(struct listener *listener, char *errmsg, int errlen);
 static int quic_connect_server(struct connection *conn, int flags);
@@ -446,7 +447,7 @@ int quic_connect_server(struct connection *conn, int flags)
 	return SF_ERR_NONE;  /* connection is OK */
 }
 
-static struct quic_dgram *quic_dgram_alloc(struct quic_receiver_buf *rxbuf)
+static struct quic_dgram *quic_dgram_alloc(struct quic_receiver_buf *rxbuf, struct dv_mpscq_head *queue, size_t size)
 {
 	struct quic_dgram *dgram;
 
@@ -454,14 +455,14 @@ static struct quic_dgram *quic_dgram_alloc(struct quic_receiver_buf *rxbuf)
 	if (!dgram)
 		return NULL;
 
-	dgram->buf = malloc(QUIC_MAX_UDP_PAYLOAD_SIZE);
+	dgram->buf = malloc(size);
 	if (!dgram->buf) {
 		pool_free(pool_head_quic_dgram, dgram);
 		return NULL;
 	}
 
 	dgram->obj_type = OBJ_TYPE_DGRAM;
-	dgram->retqueue = &rxbuf->dgrams;
+	dgram->retqueue = queue;
 	dgram->owner = NULL;
 	dgram->qc = NULL;
 	dgram->len = 0;
@@ -470,7 +471,7 @@ static struct quic_dgram *quic_dgram_alloc(struct quic_receiver_buf *rxbuf)
 	return dgram;
 }
 
-struct quic_dgram *quic_dgram_get(struct listener *l, struct quic_receiver_buf *rxbuf)
+struct quic_dgram *quic_dgram_get(struct listener *l, struct quic_receiver_buf *rxbuf, struct dv_mpscq_head *queue)
 {
 	struct quic_counters *prx_counters;
 	struct proxy *px;
@@ -484,7 +485,7 @@ struct quic_dgram *quic_dgram_get(struct listener *l, struct quic_receiver_buf *
 	 * because those are strictly fungible: we don't care which one it is,
 	 * we just need one to store data in.
 	 */
-	if (!dv_mpscq_pop(&rxbuf->dgrams, &node)) {
+	if (!dv_mpscq_pop(queue, &node)) {
 		px = l->bind_conf->frontend;
 		prx_counters = EXTRA_COUNTERS_GET(px->extra_counters_fe, &quic_stats_module);
 		HA_ATOMIC_INC(&prx_counters->rxbuf_full);
@@ -493,7 +494,7 @@ struct quic_dgram *quic_dgram_get(struct listener *l, struct quic_receiver_buf *
 
 	dgram = DV_MPSCQ_ELEM(node, struct quic_dgram, next);
 	quic_dgram_reset(dgram);
-	BUG_ON_HOT(dgram->retqueue != &rxbuf->dgrams);
+	BUG_ON_HOT(dgram->retqueue != queue);
 	return dgram;
 }
 
@@ -521,18 +522,32 @@ static int quic_alloc_rxbufs(void)
 	for (i = 0; i < global.nbthread; i++) {
 		rxbuf = &quic_rxbufs[i];
 
-		stub = quic_dgram_alloc(rxbuf);
+		stub = quic_dgram_alloc(rxbuf, &rxbuf->dgrams, QUIC_MAX_UDP_PAYLOAD_SIZE);
 		if (!stub)
 			goto err;
 
 		dv_mpscq_init(&rxbuf->dgrams, &stub->next);
 
-		for (j = 0; j < QUIC_RX_NUM_BUFS - 1; j++) {
-			dgram = quic_dgram_alloc(rxbuf);
+		for (j = 0; j < QUIC_RX_NUM_BUFS_LARGE - 1; j++) {
+			dgram = quic_dgram_alloc(rxbuf, &rxbuf->dgrams, QUIC_MAX_UDP_PAYLOAD_SIZE);
 			if (!dgram)
 				goto err;
 
 			dv_mpscq_push(&rxbuf->dgrams, &dgram->next);
+		}
+
+		stub = quic_dgram_alloc(rxbuf, &rxbuf->dgrams_small, QUIC_RX_SMALL_BUFSZ);
+		if (!stub)
+			goto err;
+
+		dv_mpscq_init(&rxbuf->dgrams_small, &stub->next);
+
+		for (j = 0; j < QUIC_RX_NUM_BUFS_SMALL - 1; j++) {
+			dgram = quic_dgram_alloc(rxbuf, &rxbuf->dgrams_small, QUIC_RX_SMALL_BUFSZ);
+			if (!dgram)
+				goto err;
+
+			dv_mpscq_push(&rxbuf->dgrams_small, &dgram->next);
 		}
 	}
 
@@ -568,6 +583,19 @@ static int quic_deallocate_rxbufs(void)
 				}
 
 				node = dv_mpscq_deinit(&rxbuf->dgrams);
+				dgram = DV_MPSCQ_ELEM(node, struct quic_dgram, next);
+				free(dgram->buf);
+				pool_free(pool_head_quic_dgram, dgram);
+			}
+
+			if (dv_mpscq_deinit(&rxbuf->dgrams_small)) {
+				while (dv_mpscq_pop(&rxbuf->dgrams_small, &node)) {
+					dgram = DV_MPSCQ_ELEM(node, struct quic_dgram, next);
+					free(dgram->buf);
+					pool_free(pool_head_quic_dgram, dgram);
+				}
+
+				node = dv_mpscq_deinit(&rxbuf->dgrams_small);
 				dgram = DV_MPSCQ_ELEM(node, struct quic_dgram, next);
 				free(dgram->buf);
 				pool_free(pool_head_quic_dgram, dgram);
@@ -759,6 +787,7 @@ static int quic_alloc_dghdlrs(void)
 		 * instead of pushing it back to a listener queue.
 		 */
 		stub->retqueue = NULL;
+		stub->buf = NULL;
 		dv_mpscq_init(&dghdlr->dgrams, &stub->next);
 	}
 

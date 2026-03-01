@@ -22,7 +22,8 @@ struct quic_accept_queue {
  * to the connection thread.
  */
 struct quic_receiver_buf {
-	struct dv_mpscq_head dgrams; /* free-list of datagrams. */
+	struct dv_mpscq_head dgrams;       /* free-list of large datagrams. */
+	struct dv_mpscq_head dgrams_small; /* free-list of small datagrams. */
 } THREAD_ALIGNED();
 
 #define QUIC_DGRAM_FL_REJECT			0x00000001
