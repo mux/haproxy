@@ -447,7 +447,7 @@ int quic_connect_server(struct connection *conn, int flags)
 	return SF_ERR_NONE;  /* connection is OK */
 }
 
-static struct quic_dgram *quic_dgram_alloc(struct quic_receiver_buf *rxbuf, struct dv_mpscq_head *queue, size_t size)
+static struct quic_dgram *quic_dgram_alloc(struct quic_receiver_buf *rxbuf, struct dv_mpscq_head *queue, void *buf)
 {
 	struct quic_dgram *dgram;
 
@@ -455,12 +455,7 @@ static struct quic_dgram *quic_dgram_alloc(struct quic_receiver_buf *rxbuf, stru
 	if (!dgram)
 		return NULL;
 
-	dgram->buf = malloc(size);
-	if (!dgram->buf) {
-		pool_free(pool_head_quic_dgram, dgram);
-		return NULL;
-	}
-
+	dgram->buf = buf;
 	dgram->obj_type = OBJ_TYPE_DGRAM;
 	dgram->retqueue = queue;
 	dgram->owner = NULL;
@@ -513,6 +508,8 @@ static int quic_alloc_rxbufs(void)
 {
 	struct quic_receiver_buf *rxbuf;
 	struct quic_dgram *dgram, *stub;
+	char *buf;
+	size_t off;
 	int i, j;
 
 	quic_rxbufs = calloc(global.nbthread, sizeof(*quic_rxbufs));
@@ -522,38 +519,53 @@ static int quic_alloc_rxbufs(void)
 	for (i = 0; i < global.nbthread; i++) {
 		rxbuf = &quic_rxbufs[i];
 
-		stub = quic_dgram_alloc(rxbuf, &rxbuf->dgrams, QUIC_MAX_UDP_PAYLOAD_SIZE);
+		buf = malloc(QUIC_RX_NUM_BUFS_LARGE * QUIC_MAX_UDP_PAYLOAD_SIZE);
+		if (!buf)
+			goto err;
+
+		stub = quic_dgram_alloc(rxbuf, &rxbuf->dgrams, buf);
 		if (!stub)
 			goto err;
 
 		dv_mpscq_init(&rxbuf->dgrams, &stub->next);
 
+		off = QUIC_MAX_UDP_PAYLOAD_SIZE;
 		for (j = 0; j < QUIC_RX_NUM_BUFS_LARGE - 1; j++) {
-			dgram = quic_dgram_alloc(rxbuf, &rxbuf->dgrams, QUIC_MAX_UDP_PAYLOAD_SIZE);
+			dgram = quic_dgram_alloc(rxbuf, &rxbuf->dgrams, buf + off);
 			if (!dgram)
 				goto err;
 
 			dv_mpscq_push(&rxbuf->dgrams, &dgram->next);
+			off += QUIC_MAX_UDP_PAYLOAD_SIZE;
 		}
+		rxbuf->base = buf;
 
-		stub = quic_dgram_alloc(rxbuf, &rxbuf->dgrams_small, QUIC_RX_SMALL_BUFSZ);
+		buf = malloc(QUIC_RX_NUM_BUFS_SMALL * QUIC_RX_SMALL_BUFSZ);
+		if (!buf)
+			goto err;
+
+		stub = quic_dgram_alloc(rxbuf, &rxbuf->dgrams_small, buf);
 		if (!stub)
 			goto err;
 
 		dv_mpscq_init(&rxbuf->dgrams_small, &stub->next);
 
+		off = QUIC_RX_SMALL_BUFSZ;
 		for (j = 0; j < QUIC_RX_NUM_BUFS_SMALL - 1; j++) {
-			dgram = quic_dgram_alloc(rxbuf, &rxbuf->dgrams_small, QUIC_RX_SMALL_BUFSZ);
+			dgram = quic_dgram_alloc(rxbuf, &rxbuf->dgrams_small, buf + off);
 			if (!dgram)
 				goto err;
 
 			dv_mpscq_push(&rxbuf->dgrams_small, &dgram->next);
+			off += QUIC_RX_SMALL_BUFSZ;
 		}
+		rxbuf->base_small = buf;
 	}
 
 	return 1;
 
  err:
+	free(buf);
 	quic_deallocate_rxbufs();
 	return 0;
 }
@@ -578,28 +590,26 @@ static int quic_deallocate_rxbufs(void)
 				 */
 				while (dv_mpscq_pop(&rxbuf->dgrams, &node)) {
 					dgram = DV_MPSCQ_ELEM(node, struct quic_dgram, next);
-					free(dgram->buf);
 					pool_free(pool_head_quic_dgram, dgram);
 				}
 
 				node = dv_mpscq_deinit(&rxbuf->dgrams);
 				dgram = DV_MPSCQ_ELEM(node, struct quic_dgram, next);
-				free(dgram->buf);
 				pool_free(pool_head_quic_dgram, dgram);
 			}
+			free(rxbuf->base);
 
 			if (dv_mpscq_deinit(&rxbuf->dgrams_small)) {
 				while (dv_mpscq_pop(&rxbuf->dgrams_small, &node)) {
 					dgram = DV_MPSCQ_ELEM(node, struct quic_dgram, next);
-					free(dgram->buf);
 					pool_free(pool_head_quic_dgram, dgram);
 				}
 
 				node = dv_mpscq_deinit(&rxbuf->dgrams_small);
 				dgram = DV_MPSCQ_ELEM(node, struct quic_dgram, next);
-				free(dgram->buf);
 				pool_free(pool_head_quic_dgram, dgram);
 			}
+			free(rxbuf->base_small);
 		}
 		free(quic_rxbufs);
 	}
