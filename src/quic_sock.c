@@ -190,8 +190,8 @@ struct connection *quic_sock_accept_conn(struct listener *l, int *status)
 struct task *quic_lstnr_dghdlr(struct task *t, void *ctx, unsigned int state)
 {
 	struct quic_dghdlr *dghdlr = ctx;
-	struct quic_dgram *dgram, *old_dgram;
-	struct dv_mpscq_node *node, *old;
+	struct quic_dgram *dgram, *next_dgram, *old_dgram;
+	struct dv_mpscq_node *node, *next, *old, *old_next;
 	int max_dgrams = global.tune.maxpollevents;
 
 	TRACE_ENTER(QUIC_EV_CONN_LPKT);
@@ -204,7 +204,18 @@ struct task *quic_lstnr_dghdlr(struct task *t, void *ctx, unsigned int state)
 	 * queue, we cannot recycle it immediately. Instead, we recycle the
 	 * last stub element (old).
 	 */
-	while ((node = dv_mpscq_pop(&dghdlr->dgrams, &old))) {
+	node = dv_mpscq_pop(&dghdlr->dgrams, &old);
+	while (node) {
+		if (max_dgrams > 1) {
+			next = dv_mpscq_pop(&dghdlr->dgrams, &old_next);
+			if (next) {
+				next_dgram = DV_MPSCQ_ELEM(next, struct quic_dgram, next);
+				__builtin_prefetch(next_dgram->buf, 0, 0);
+			}
+		} else {
+			next = NULL;
+		}
+
 		/* Process the new datagram. */
 		dgram = DV_MPSCQ_ELEM(node, struct quic_dgram, next);
 		quic_dgram_parse(dgram, NULL, dgram->owner);
@@ -226,6 +237,9 @@ struct task *quic_lstnr_dghdlr(struct task *t, void *ctx, unsigned int state)
 
 		if (--max_dgrams <= 0)
 			goto stop_here;
+
+		node = next;
+		old = old_next;
 	}
 
 	TRACE_LEAVE(QUIC_EV_CONN_LPKT);
