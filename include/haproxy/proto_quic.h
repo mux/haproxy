@@ -27,6 +27,8 @@
 
 #define QUIC_MAX_UDP_PAYLOAD_SIZE     2048
 
+#define QUIC_RX_SMALL_BUFSZ           64
+
 extern struct protocol proto_quic4;
 extern struct protocol proto_quic6;
 
@@ -37,8 +39,9 @@ extern THREAD_LOCAL struct cshared quic_mem_diff;
 
 struct listener;
 struct quic_dgram;
+struct dv_mpscq_head;
 
-struct quic_dgram *quic_dgram_get(struct listener *l, struct quic_receiver_buf *rxbuf);
+struct quic_dgram *quic_dgram_get(struct listener *l, struct quic_receiver_buf *rxbuf, struct dv_mpscq_head *queue);
 void quic_dgram_reset(struct quic_dgram *dgram);
 
 #endif /* _HAPROXY_PROTO_QUIC_H  */

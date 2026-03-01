@@ -427,12 +427,12 @@ static ssize_t quic_recv(int fd, void *out, size_t len,
 static struct quic_dgram *quic_dgram_recv(struct listener *l, struct quic_receiver_buf *rxbuf, int fd)
 {
 	struct quic_transport_params *params;
-	struct quic_dgram *dgram;
+	struct quic_dgram *dgram, *dgram2;
 	ssize_t ret;
 
 	params = &l->bind_conf->quic_params;
 
-	dgram = quic_dgram_get(l, rxbuf);
+	dgram = quic_dgram_get(l, rxbuf, &rxbuf->dgrams);
 	if (!dgram)
 		return NULL;
 
@@ -443,6 +443,20 @@ static struct quic_dgram *quic_dgram_recv(struct listener *l, struct quic_receiv
 	if (ret <= 0) {
 		dv_mpscq_push(&rxbuf->dgrams, &dgram->next);
 		return NULL;
+	}
+
+	if (ret <= QUIC_RX_SMALL_BUFSZ) {
+		/* Try to use a small buffer, but if that fails, we can just
+		 * keep using the one we've got.
+		 */
+		dgram2 = quic_dgram_get(l, rxbuf, &rxbuf->dgrams_small);
+		if (dgram2) {
+			memcpy(dgram2->buf, dgram->buf, ret);
+			dgram2->saddr = dgram->saddr;
+			dgram2->daddr = dgram->daddr;
+			dv_mpscq_push(&rxbuf->dgrams, &dgram->next);
+			dgram = dgram2;
+		}
 	}
 
 	dgram->owner = l;
@@ -847,7 +861,10 @@ int qc_rcv_buf(struct quic_conn *qc)
 			TRACE_STATE("datagram for other connection on quic-conn socket, requeue it", QUIC_EV_CONN_RCV, qc);
 
 			rxbuf = &quic_rxbufs[tid];
-			dgram = quic_dgram_get(l, rxbuf);
+			if (new_dgram->len <= QUIC_RX_SMALL_BUFSZ)
+				dgram = quic_dgram_get(l, rxbuf, &rxbuf->dgrams_small);
+			else
+				dgram = quic_dgram_get(l, rxbuf, &rxbuf->dgrams);
 			if (!dgram)
 				continue;
 
