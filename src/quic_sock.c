@@ -580,8 +580,7 @@ static void quic_lstnr_flush(struct quic_receiver_buf *rxbuf)
 			}
 			if (LIST_ISEMPTY(&hdlr->pending))
 				HA_ATOMIC_STORE(&hdlr->has_pending, 0);
-			else if (now_ms - hdlr->last_flush > 1000 &&
-			         now_ms - hdlr->last_msg > 100) {
+			else if (now_ms - hdlr->last_flush > 50) {
 				fprintf(stderr,
 					"thread %d has not flushed data to thread %d for %u ms\n",
 					tid, i, now_ms - hdlr->last_flush);
