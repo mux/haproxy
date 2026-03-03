@@ -27,8 +27,6 @@ struct quic_receiver_buf {
 	struct list pending;         /* global (all handlers) datagram pending list. */
 	struct hdlr_pending {
 		int has_pending;     /* set to 1 if the pending list is not empty. */
-		int last_flush;
-		int last_msg;
 		struct list pending;
 	} *dghdlrs;                  /* per-handler datagram pending lists. */
 	struct list free;            /* free list of quic_dgram structures. */
@@ -45,6 +43,7 @@ struct quic_dgram {
 	size_t len;
 	unsigned char *dcid;
 	size_t dcid_len;
+	int enqueue_time_ms;
 	struct sockaddr_storage saddr;
 	struct sockaddr_storage daddr;
 	struct quic_conn *qc;

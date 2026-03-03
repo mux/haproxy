@@ -517,9 +517,8 @@ again:
 			}
 
 			/* Queue this this datagram to retry later. */
+			dgram->enqueue_time_ms = now_ms;
 			b_add(&rxbuf->buf, dgram->len);
-			if (LIST_ISEMPTY(&hdlr->pending))
-				hdlr->last_flush = now_ms;
 			LIST_APPEND(&hdlr->pending, &dgram->p_next);
 			LIST_APPEND(&rxbuf->pending, &dgram->gp_next);
 		}
@@ -555,7 +554,7 @@ static void quic_lstnr_flush(struct quic_receiver_buf *rxbuf)
 {
 	struct hdlr_pending *hdlr;
 	struct quic_dgram *dgram;
-	int i;
+	int i, latency_ms;
 
 	/* First we go through the per-handler pending lists and try to flush
 	 * as many datagrams as we can.
@@ -565,27 +564,25 @@ static void quic_lstnr_flush(struct quic_receiver_buf *rxbuf)
 		if (hdlr->has_pending) {
 			while (!LIST_ISEMPTY(&hdlr->pending)) {
 				dgram = LIST_ELEM(hdlr->pending.n, struct quic_dgram *, p_next);
+				latency_ms = now_ms - dgram->enqueue_time_ms;
 				if (!quic_lstnr_dgram_dispatch(rxbuf, dgram, i)) {
 					/* This handler is still full, try the next one */
 					break;
 				}
 
 				/* LIST_DEL_INIT will allow us to to use LIST_INLIST
-				* later to check if the datagram was successfully
-				* flushed.
-				*/
+				 * later to see that this datagram was successfully
+				 * flushed.
+				 */
+				if (latency_ms > 50) {
+					fprintf(stderr,
+						"datagram for thread %d stayed %u ms in queue of thread %d\n",
+						i, latency_ms, tid);
+				}
 				LIST_DEL_INIT(&dgram->p_next);
-				hdlr->last_flush = now_ms;
-				hdlr->last_msg = INT_MIN;
 			}
 			if (LIST_ISEMPTY(&hdlr->pending))
 				HA_ATOMIC_STORE(&hdlr->has_pending, 0);
-			else if (now_ms - hdlr->last_flush > 50) {
-				fprintf(stderr,
-					"thread %d has not flushed data to thread %d for %u ms\n",
-					tid, i, now_ms - hdlr->last_flush);
-				hdlr->last_msg = now_ms;
-			}
 		}
 	}
 

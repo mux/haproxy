@@ -474,8 +474,6 @@ static int quic_alloc_rxbufs(void)
 
 		for (j = 0; j < global.nbthread; j++) {
 			LIST_INIT(&rxbuf->dghdlrs[j].pending);
-			rxbuf->dghdlrs[j].last_flush = now_ms;
-			rxbuf->dghdlrs[j].last_msg = INT_MIN;
 		}
 
 		buf = pool_alloc(pool_head_quic_rxbuf);
