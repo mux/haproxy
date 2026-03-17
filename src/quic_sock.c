@@ -186,6 +186,13 @@ struct connection *quic_sock_accept_conn(struct listener *l, int *status)
 	return NULL;
 }
 
+static __thread struct {
+	uint64_t lat_total;
+	uint64_t lat_samples;
+	unsigned int lat_max;
+	unsigned int last_msg;
+} lat;
+
 /* QUIC datagrams handler task. */
 struct task *quic_lstnr_dghdlr(struct task *t, void *ctx, unsigned int state)
 {
@@ -193,6 +200,7 @@ struct task *quic_lstnr_dghdlr(struct task *t, void *ctx, unsigned int state)
 	struct quic_dgram *dgram, *next_dgram, *old_dgram;
 	struct dv_mpscq_node *node, *next, *old, *old_next;
 	int max_dgrams = global.tune.maxpollevents;
+	unsigned int latency_ms;
 
 	TRACE_ENTER(QUIC_EV_CONN_LPKT);
 
@@ -218,6 +226,21 @@ struct task *quic_lstnr_dghdlr(struct task *t, void *ctx, unsigned int state)
 
 		/* Process the new datagram. */
 		dgram = DV_MPSCQ_ELEM(node, struct quic_dgram, next);
+
+		if (now_ns < dgram->read_time_ns)
+			latency_ms = 0;
+		else
+			latency_ms = (now_ns - dgram->read_time_ns) / 1000000;
+		lat.lat_total += latency_ms;
+		lat.lat_samples++;
+		if (latency_ms > lat.lat_max)
+			lat.lat_max = latency_ms;
+		if (now_ms - lat.last_msg > 5000 && lat.lat_samples > 0) {
+			fprintf(stderr, "[%d] datagram latency: avg=%fms max=%ums\n",
+			        tid, (double)lat.lat_total / lat.lat_samples, lat.lat_max);
+			lat.last_msg = now_ms;
+		}
+
 		quic_dgram_parse(dgram, NULL, dgram->owner);
 
 		/* Recycle the old datagram. */
@@ -449,6 +472,7 @@ static struct quic_dgram *quic_dgram_recv(struct listener *l, struct quic_receiv
 	struct quic_transport_params *params;
 	struct quic_dgram *dgram, *dgram2;
 	ssize_t ret;
+	unsigned long long read_time_ns;
 
 	params = &l->bind_conf->quic_params;
 
@@ -465,6 +489,7 @@ static struct quic_dgram *quic_dgram_recv(struct listener *l, struct quic_receiv
 		return NULL;
 	}
 
+	read_time_ns = now_ns;
 	if (ret <= QUIC_RX_SMALL_BUFSZ) {
 		/* Try to use a small buffer, but if that fails, we can just
 		 * keep using the one we've got.
@@ -479,6 +504,7 @@ static struct quic_dgram *quic_dgram_recv(struct listener *l, struct quic_receiv
 		}
 	}
 
+	dgram->read_time_ns = read_time_ns;
 	dgram->owner = l;
 	dgram->len = ret;
 
