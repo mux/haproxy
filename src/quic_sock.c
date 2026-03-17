@@ -186,12 +186,29 @@ struct connection *quic_sock_accept_conn(struct listener *l, int *status)
 	return NULL;
 }
 
-static __thread struct {
+/* Rate limit messages. */
+static unsigned int last_msg;
+
+/* Latencies for datagrams originating from the same thread and from other threads. */
+static __thread struct dgram_lat {
 	uint64_t lat_total;
 	uint64_t lat_samples;
 	unsigned int lat_max;
-	unsigned int last_msg;
-} lat;
+} lat_same, lat_other;
+
+static void lat_update(struct dgram_lat *lat, const struct quic_dgram *dgram)
+{
+	unsigned int latency_ms;
+
+	if (now_ns < dgram->read_time_ns)
+		latency_ms = 0;
+	else
+		latency_ms = (now_ns - dgram->read_time_ns) / 1000000;
+	lat->lat_total += latency_ms;
+	lat->lat_samples++;
+	if (latency_ms > lat->lat_max)
+		lat->lat_max = latency_ms;
+}
 
 /* QUIC datagrams handler task. */
 struct task *quic_lstnr_dghdlr(struct task *t, void *ctx, unsigned int state)
@@ -200,7 +217,6 @@ struct task *quic_lstnr_dghdlr(struct task *t, void *ctx, unsigned int state)
 	struct quic_dgram *dgram, *next_dgram, *old_dgram;
 	struct dv_mpscq_node *node, *next, *old, *old_next;
 	int max_dgrams = global.tune.maxpollevents;
-	unsigned int latency_ms;
 
 	TRACE_ENTER(QUIC_EV_CONN_LPKT);
 
@@ -227,18 +243,17 @@ struct task *quic_lstnr_dghdlr(struct task *t, void *ctx, unsigned int state)
 		/* Process the new datagram. */
 		dgram = DV_MPSCQ_ELEM(node, struct quic_dgram, next);
 
-		if (now_ns < dgram->read_time_ns)
-			latency_ms = 0;
+		if (dgram->origin == tid)
+			lat_update(&lat_same, dgram);
 		else
-			latency_ms = (now_ns - dgram->read_time_ns) / 1000000;
-		lat.lat_total += latency_ms;
-		lat.lat_samples++;
-		if (latency_ms > lat.lat_max)
-			lat.lat_max = latency_ms;
-		if (now_ms - lat.last_msg > 5000 && lat.lat_samples > 0) {
-			fprintf(stderr, "[%d] datagram latency: avg=%fms max=%ums\n",
-			        tid, (double)lat.lat_total / lat.lat_samples, lat.lat_max);
-			lat.last_msg = now_ms;
+			lat_update(&lat_other, dgram);
+
+		if (now_ms - last_msg > 5000) {
+			fprintf(stderr, "[%d] datagram latency same thread: avg=%fms max=%ums, other thread: avg=%fms max=%ums\n",
+				tid,
+				lat_same.lat_samples == 0 ? 0 : (double)lat_same.lat_total / lat_same.lat_samples, lat_same.lat_max,
+				lat_other.lat_samples == 0 ? 0 : (double)lat_other.lat_total / lat_other.lat_samples, lat_other.lat_max);
+			last_msg = now_ms;
 		}
 
 		quic_dgram_parse(dgram, NULL, dgram->owner);
@@ -504,6 +519,7 @@ static struct quic_dgram *quic_dgram_recv(struct listener *l, struct quic_receiv
 		}
 	}
 
+	dgram->origin = tid;
 	dgram->read_time_ns = read_time_ns;
 	dgram->owner = l;
 	dgram->len = ret;
