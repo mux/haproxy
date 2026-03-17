@@ -187,6 +187,13 @@ struct connection *quic_sock_accept_conn(struct listener *l, int *status)
 	return NULL;
 }
 
+static __thread struct {
+	uint64_t lat_total;
+	uint64_t lat_samples;
+	unsigned int lat_max;
+	unsigned int last_msg;
+} lat;
+
 /* QUIC datagrams handler task. */
 struct task *quic_lstnr_dghdlr(struct task *t, void *ctx, unsigned int state)
 {
@@ -195,12 +202,27 @@ struct task *quic_lstnr_dghdlr(struct task *t, void *ctx, unsigned int state)
 	size_t len;
 	int max_dgrams = global.tune.maxpollevents;
 	int i;
+	unsigned int latency_ms;
 
 	TRACE_ENTER(QUIC_EV_CONN_LPKT);
 
 	while ((dgram = bring_read_begin(&dghdlr->buf, &len))) {
 		BUG_ON(dgram->buf != (unsigned char *)(dgram + 1));
 		BUG_ON(len != sizeof(*dgram) + dgram->len);
+
+		if (now_ns < dgram->read_time_ns)
+			latency_ms = 0;
+		else
+			latency_ms = (now_ns - dgram->read_time_ns) / 1000000;
+		lat.lat_total += latency_ms;
+		lat.lat_samples++;
+		if (latency_ms > lat.lat_max)
+			lat.lat_max = latency_ms;
+		if (now_ms - lat.last_msg > 5000 && lat.lat_samples > 0) {
+			fprintf(stderr, "[%d] datagram latency: avg=%fms max=%ums\n",
+			        tid, (double)lat.lat_total / lat.lat_samples, lat.lat_max);
+			lat.last_msg = now_ms;
+		}
 
 		/* We ignore the return value of quic_dgram_parse() because
 		 * whether it was successful or not, we still need to empty the
@@ -310,6 +332,7 @@ static int quic_dgram_init(struct quic_dgram *dgram,
 	dgram->daddr = *daddr;
 	dgram->qc = NULL;
 	dgram->flags = 0;
+	dgram->read_time_ns = now_ns;
 	LIST_INIT(&dgram->p_next);
 	LIST_INIT(&dgram->gp_next);
 
@@ -554,7 +577,7 @@ static void quic_lstnr_flush(struct quic_receiver_buf *rxbuf)
 {
 	struct hdlr_pending *hdlr;
 	struct quic_dgram *dgram;
-	int i, latency_ms;
+	int i; //, latency_ms;
 
 	/* First we go through the per-handler pending lists and try to flush
 	 * as many datagrams as we can.
@@ -564,7 +587,7 @@ static void quic_lstnr_flush(struct quic_receiver_buf *rxbuf)
 		if (hdlr->has_pending) {
 			while (!LIST_ISEMPTY(&hdlr->pending)) {
 				dgram = LIST_ELEM(hdlr->pending.n, struct quic_dgram *, p_next);
-				latency_ms = now_ms - dgram->enqueue_time_ms;
+				//latency_ms = now_ms - dgram->enqueue_time_ms;
 				if (!quic_lstnr_dgram_dispatch(rxbuf, dgram, i)) {
 					/* This handler is still full, try the next one */
 					break;
@@ -574,11 +597,13 @@ static void quic_lstnr_flush(struct quic_receiver_buf *rxbuf)
 				 * later to see that this datagram was successfully
 				 * flushed.
 				 */
+#if 0
 				if (latency_ms > 50) {
 					fprintf(stderr,
 						"datagram for thread %d stayed %u ms in queue of thread %d\n",
 						i, latency_ms, tid);
 				}
+#endif
 				LIST_DEL_INIT(&dgram->p_next);
 			}
 			if (LIST_ISEMPTY(&hdlr->pending))

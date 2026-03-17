@@ -44,6 +44,7 @@ struct quic_dgram {
 	unsigned char *dcid;
 	size_t dcid_len;
 	int enqueue_time_ms;
+	unsigned long long read_time_ns;
 	struct sockaddr_storage saddr;
 	struct sockaddr_storage daddr;
 	struct quic_conn *qc;
