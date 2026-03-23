@@ -605,7 +605,6 @@ static int quic_alloc_dghdlrs(void)
 			ha_alert("Failed to allocate the buffer for the quic datagram handler on thread %d.\n", i);
 			return 0;
 		}
-
 		bring_init(&dghdlr->buf, buf, QUIC_RX_BUFSZ);
 
 		dghdlr->task = tasklet_new();

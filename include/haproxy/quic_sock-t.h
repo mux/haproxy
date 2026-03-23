@@ -27,7 +27,7 @@ struct quic_dgram {
 	void *owner;
 	unsigned char *buf;
 	size_t len;
-	unsigned char *dcid;
+	size_t dcid_off;
 	size_t dcid_len;
 	unsigned int origin;
 	unsigned long long read_time_ns;
