@@ -488,11 +488,13 @@ int quic_dgram_requeue(struct quic_dgram *dgram, int cid_tid)
  * lists. In all cases, take complete ownership of dgram - it won't be valid
  * anymore after calling this function.
  */
-static int quic_lstnr_dgram_dispatch(unsigned char *pos, size_t len, void *owner,
+static int quic_lstnr_dgram_dispatch(unsigned char *pos, size_t len, struct listener *l,
                                      size_t dcid_off, size_t dcid_len,
                                      struct sockaddr_storage *saddr,
                                      struct sockaddr_storage *daddr)
 {
+	struct proxy *px;
+	struct quic_counters *prx_counters;
 	int cid_tid;
 
 	if (!len)
@@ -509,12 +511,15 @@ static int quic_lstnr_dgram_dispatch(unsigned char *pos, size_t len, void *owner
 		cid_tid = tid;
 	}
 
-	if (!quic_dgram_write(pos, len, owner, dcid_off, dcid_len, saddr, daddr, cid_tid))
+	if (!quic_dgram_write(pos, len, l, dcid_off, dcid_len, saddr, daddr, cid_tid))
 		goto err;
 
 	return 1;
 
  err:
+	px = l->bind_conf->frontend;
+	prx_counters = EXTRA_COUNTERS_GET(px->extra_counters_fe, &quic_stats_module);
+	HA_ATOMIC_INC(&prx_counters->rxbuf_full);
 	return 0;
 }
 
