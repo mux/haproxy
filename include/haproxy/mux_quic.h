@@ -109,14 +109,16 @@ static inline void qcs_wait_http_req(struct qcs *qcs)
 {
 	struct qcc *qcc = qcs->qcc;
 
-	/* A stream cannot be registered several times. */
-	BUG_ON_HOT(tick_isset(qcs->start));
-	qcs->start = now_ms;
+	if (!conn_is_back(qcc->conn)) {
+		/* A stream cannot be registered several times. */
+		BUG_ON_HOT(tick_isset(qcs->start));
+		qcs->start = now_ms;
 
-	/* qcc.opening_list size is limited by flow-control so no custom
-	 * restriction is needed here.
-	 */
-	LIST_APPEND(&qcc->opening_list, &qcs->el_opening);
+		/* qcc.opening_list size is limited by flow-control so no
+		 * custom restriction is needed here.
+		 */
+		LIST_APPEND(&qcc->opening_list, &qcs->el_opening);
+	}
 }
 
 void qcc_show_quic(struct qcc *qcc);
