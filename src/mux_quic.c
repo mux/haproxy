@@ -223,7 +223,16 @@ static struct qcs *qcs_new(struct qcc *qcc, uint64_t id, enum qcs_type type)
 		}
 	}
 
-	if (qcc->app_ops->attach && qcc->app_ops->attach(qcs, qcc->ctx)) {
+	/* If app layer is closed, reset immediately a new stream if proto does
+	 * not implement graceful shutdown. Else proto is responsible to either
+	 * accept or reject the new stream via its attach() operation.
+	 */
+	if (qcc->app_st >= QCC_APP_ST_SHUT && !qcc->app_ops->shutdown) {
+		qcc_abort_stream_read(qcs);
+		qcc_reset_stream(qcs, 0, 0);
+		goto out;
+	}
+	else if (qcc->app_ops->attach && qcc->app_ops->attach(qcs, qcc->ctx)) {
 		TRACE_ERROR("app proto failure", QMUX_EV_QCS_NEW, qcc->conn, qcs);
 		goto err;
 	}
