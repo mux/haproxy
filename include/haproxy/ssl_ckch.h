@@ -53,6 +53,13 @@ int ckch_store_load_payload(char *path, char *payload, char **err);
 int ckch_store_rebuild_instances(struct ckch_store *old_ckchs, struct ckch_store *new_ckchs,
                                  struct ckch_inst **ckchi, int max, int *count, char **err);
 
+int ckch_store_update_init(char *path, struct ckch_store **old_ckchs,
+                           struct ckch_store **new_ckchs, char **err);
+int ckch_store_update_process(struct ckch_store **old_ckchs, struct ckch_store **new_ckchs,
+                              struct ckch_inst **ckchi, int *state,
+                              struct buffer *msg, char **err);
+void ckch_store_update_cleanup(struct ckch_store *new_ckchs);
+
 /* ckch_conf functions */
 
 int ckch_conf_parse(char **args, int cur_arg, struct ckch_conf *f, int *found, const char *file, int linenum, char **err);
