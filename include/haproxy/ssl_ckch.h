@@ -84,6 +84,7 @@ const char *ha_default_cert_dir();
 
 extern struct cert_exts cert_exts[];
 extern int (*ssl_commit_crlfile_cb)(const char *path, X509_STORE *ctx, char **err);
+extern char current_crtstore_name[];
 
 /*
  * ckch_conf keywords loading

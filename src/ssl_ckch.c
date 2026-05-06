@@ -5307,7 +5307,7 @@ void ckch_conf_clean(struct ckch_conf *conf)
 
 }
 
-static char current_crtstore_name[PATH_MAX] = {};
+char current_crtstore_name[PATH_MAX] = {};
 
 static int crtstore_parse_load(char **args, int section_type, struct proxy *curpx, const struct proxy *defpx,
                         const char *file, int linenum, char **err)
