@@ -50,6 +50,8 @@ void ckch_store_replace(struct ckch_store *old_ckchs, struct ckch_store *new_ckc
 int ckch_store_load_files(struct ckch_conf *f, struct ckch_store *c, int cli, const char *file, int linenum, char **err);
 int ckch_store_create(char *path, char **err);
 int ckch_store_load_payload(char *path, char *payload, char **err);
+int ckch_store_rebuild_instances(struct ckch_store *old_ckchs, struct ckch_store *new_ckchs,
+                                 struct ckch_inst **ckchi, int max, int *count, char **err);
 
 /* ckch_conf functions */
 
