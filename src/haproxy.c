@@ -3266,6 +3266,68 @@ static void set_identity(const char *program_name)
 #endif
 }
 
+#if defined(CLONE_NEWUSER)
+/* Setup the user namespace after a successful unshare(CLONE_NEWUSER). We don't
+ * return a value because this is best-effort; if this fails, which is unlikely,
+ * future setuid() or setgid() calls might fail as well.
+ */
+static void setup_user_ns(uid_t euid, gid_t egid)
+{
+	char buf[64];
+	int n, ret, fd;
+
+	/* Creating uid_map and gid_map files is required for future setuid()
+	 * and setgid() calls to work after a successful unshare(CLONE_NEWUSER).
+	 * Since unprivileged users can only setuid()/setgid() to themselves,
+	 * and because we only use unshare() for unprivileged users, this is
+	 * only useful for configurations that have user/group directives that
+	 * are identical to the user/group of the binary. While these directives
+	 * would effectively be a no-op, we still support this because it is
+	 * likely that such setups exist in the wild, and we want to avoid a
+	 * seemingly unrelated setuid failure when a user enables chroot as an
+	 * unprivileged user in an otherwise working setup. While CAP_SETUID
+	 * setups are probably very rare, it could also be useful in this case.
+	 *
+	 * See user_namespaces(7) for more information.
+	 */
+	if (global.uid > 0) {
+		n = snprintf(buf, sizeof(buf), "%u %u 1\n", euid, euid);
+		fd = open("/proc/self/uid_map", O_WRONLY);
+		if (fd == -1)
+			return;
+
+		ret = write(fd, buf, n);
+		close(fd);
+		if (ret != n)
+			return;
+	}
+
+	if (global.gid > 0) {
+		/* In order to write to the gid_map file, we first need to write
+		 * "deny" to the setgroups file. We allow for failure because
+		 * older kernels do not support the setgroups file.
+		 */
+		fd = open("/proc/self/setgroups", O_WRONLY);
+		if (fd != -1) {
+			ret = write(fd, "deny", 4);
+			close(fd);
+			if (ret != 4)
+				return;
+		}
+
+		n = snprintf(buf, sizeof(buf), "%u %u 1\n", egid, egid);
+		fd = open("/proc/self/gid_map", O_WRONLY);
+		if (fd == -1)
+			return;
+
+		ret = write(fd, buf, n);
+		close(fd);
+		if (ret != n)
+			return;
+	}
+}
+#endif
+
 int main(int argc, char **argv)
 {
 	struct rlimit limit;
@@ -3581,6 +3643,20 @@ int main(int argc, char **argv)
 			}
 		}
 	}
+
+#ifdef CLONE_NEWUSER
+	/* When we aren't root and intend to chroot, we try the Linux-only
+	 * unshare(CLONE_NEWUSER) mechanism if available to allow chroot as an
+	 * unprivileged user. If that doesn't work, we just let the subsequent
+	 * chroot() fail as it would have previously.
+	 */
+	if (geteuid() != 0 && global.chroot != NULL) {
+		uid_t euid = geteuid();
+		gid_t egid = getegid();
+		if (unshare(CLONE_NEWUSER) == 0)
+			setup_user_ns(euid, egid);
+	}
+#endif
 
 	/* Must chroot and setgid/setuid in the children */
 	/* chroot if needed */
