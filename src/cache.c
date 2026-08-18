@@ -82,7 +82,7 @@ struct cache_tree {
 	__decl_thread(HA_SPINLOCK_T cleanup_lock);
 } ALIGNED(64);
 
-struct cache {
+struct http_cache {
 	struct cache_tree trees[CACHE_TREE_NUM];
 	struct list list;        /* cache linked list */
 	struct list full_lru;    /* LRU list of full entries */
@@ -99,7 +99,7 @@ struct cache {
 
 /* the appctx context of a cache applet, stored in appctx->svcctx */
 struct cache_appctx {
-	struct cache *cache;
+	struct http_cache *cache;
 	struct cache_tree *cache_tree;
 	struct cache_entry *entry;       /* Entry to be sent from cache. */
 	unsigned int sent;               /* The number of bytes already sent for this cache entry. */
@@ -114,7 +114,7 @@ struct cache_appctx {
 /* cache config for filters */
 struct cache_flt_conf {
 	union {
-		struct cache *cache; /* cache used by the filter */
+		struct http_cache *cache; /* cache used by the filter */
 		char *name;          /* cache name used during conf parsing */
 	} c;
 	unsigned int flags;   /* CACHE_FLT_F_* */
@@ -122,7 +122,7 @@ struct cache_flt_conf {
 
 /* CLI context used during "show cache" */
 struct show_cache_ctx {
-	struct cache *cache;
+	struct http_cache *cache;
 	struct cache_tree *cache_tree;
 	uint next_key;
 };
@@ -260,11 +260,11 @@ struct cache_entry {
 
 static struct list caches = LIST_HEAD_INIT(caches);
 static struct list caches_config = LIST_HEAD_INIT(caches_config); /* cache config to init */
-static struct cache *tmp_cache_config = NULL;
+static struct http_cache *tmp_cache_config = NULL;
 
 DECLARE_STATIC_TYPED_POOL(pool_head_cache_st, "cache_st", struct cache_st);
 
-static struct eb32_node *insert_entry(struct cache *cache, struct cache_tree *tree, struct cache_entry *new_entry);
+static struct eb32_node *insert_entry(struct http_cache *cache, struct cache_tree *tree, struct cache_entry *new_entry);
 static void delete_entry(struct cache_entry *del_entry);
 static inline void release_entry_locked(struct cache_tree *cache, struct cache_entry *entry);
 static inline void release_entry_unlocked(struct cache_tree *cache, struct cache_entry *entry);
@@ -444,7 +444,7 @@ struct cache_entry *get_secondary_entry(struct cache_tree *cache, struct cache_e
 	return entry;
 }
 
-static inline struct cache_tree *get_cache_tree_from_hash(struct cache *cache, unsigned int hash)
+static inline struct cache_tree *get_cache_tree_from_hash(struct http_cache *cache, unsigned int hash)
 {
 	if (!cache)
 		return NULL;
@@ -501,7 +501,7 @@ static unsigned int clear_expired_duplicates(struct cache_tree *cache, struct eb
  *
  * This function must be called under a cache write lock.
  */
-static struct eb32_node *insert_entry(struct cache *cache, struct cache_tree *tree, struct cache_entry *new_entry)
+static struct eb32_node *insert_entry(struct http_cache *cache, struct cache_tree *tree, struct cache_entry *new_entry)
 {
 	struct eb32_node *prev = NULL;
 	struct cache_entry *entry = NULL;
@@ -617,7 +617,7 @@ static void delete_entry(struct cache_entry *del_entry)
 }
 
 
-static inline struct shared_context *shctx_ptr(struct cache *cache)
+static inline struct shared_context *shctx_ptr(struct http_cache *cache)
 {
 	return (struct shared_context *)((unsigned char *)cache -  offsetof(struct shared_context, data));
 }
@@ -634,7 +634,7 @@ static inline struct shared_block *block_ptr(struct cache_entry *entry)
  * it is moved to the tail. LRU bookkeeping is skipped when the cache has
  * early-hints disabled. Must be called under shctx wrlock.
  */
-static inline void cache_row_reattach(struct cache *cache, struct shared_block *first)
+static inline void cache_row_reattach(struct http_cache *cache, struct shared_block *first)
 {
 	struct cache_entry *entry = (struct cache_entry *)first->data;
 
@@ -676,7 +676,7 @@ cache_store_check(struct proxy *px, struct flt_conf *fconf)
 {
 	struct cache_flt_conf *cconf = fconf->conf;
 	struct flt_conf *f;
-	struct cache *cache;
+	struct http_cache *cache;
 	int comp = 0;
 
 	/* Find the cache corresponding to the name in the filter config.  The
@@ -751,7 +751,7 @@ cache_store_strm_deinit(struct stream *s, struct filter *filter)
 {
 	struct cache_st *st = filter->ctx;
 	struct cache_flt_conf *cconf = FLT_CONF(filter);
-	struct cache *cache = cconf->c.cache;
+	struct http_cache *cache = cconf->c.cache;
 	struct shared_context *shctx = shctx_ptr(cache);
 
 	/* Everything should be released in the http_end filter, but we need to do it
@@ -819,7 +819,7 @@ static inline void disable_cache_entry(struct cache_st *st,
                                        struct filter *filter, struct shared_context *shctx)
 {
 	struct cache_entry *object;
-	struct cache *cache = (struct cache*)shctx->data;
+	struct http_cache *cache = (struct http_cache*)shctx->data;
 
 	object = (struct cache_entry *)st->first_block->data;
 	filter->ctx = NULL; /* disable cache  */
@@ -927,7 +927,7 @@ cache_store_http_end(struct stream *s, struct filter *filter,
 {
 	struct cache_st *st = filter->ctx;
 	struct cache_flt_conf *cconf = FLT_CONF(filter);
-	struct cache *cache = cconf->c.cache;
+	struct http_cache *cache = cconf->c.cache;
 	struct shared_context *shctx = shctx_ptr(cache);
 	struct cache_entry *object;
 
@@ -1006,7 +1006,7 @@ char *directive_value(const char *sample, int slen, const char *word, int wlen)
  *  - the default-max-age of the cache
  *
  */
-int http_calc_maxage(struct stream *s, struct cache *cache, int *true_maxage)
+int http_calc_maxage(struct stream *s, struct http_cache *cache, int *true_maxage)
 {
 	struct htx *htx = htxbuf(&s->res.buf);
 	struct http_hdr_ctx ctx = { .blk = NULL };
@@ -1180,7 +1180,7 @@ static int link_is_hint(struct ist val)
 static void cache_free_blocks(struct shared_block *first, void *data)
 {
 	struct cache_entry *object = (struct cache_entry *)first->data;
-	struct cache *cache = (struct cache *)data;
+	struct http_cache *cache = (struct http_cache *)data;
 	struct cache_tree *cache_tree;
 
 	if (LIST_INLIST(&object->lru)) {
@@ -1342,7 +1342,7 @@ static int cache_strip_entry(struct shared_context *shctx,
                              struct cache_entry *entry,
                              const struct buffer *hint_buf)
 {
-	struct cache *cache = (struct cache *)shctx->data;
+	struct http_cache *cache = (struct http_cache *)shctx->data;
 	struct shared_block *first = block_ptr(entry);
 	struct shared_block *block = first;
 	const char *src = b_head(hint_buf);
@@ -1388,7 +1388,7 @@ static int cache_strip_entry(struct shared_context *shctx,
  */
 static int cache_make_room(struct shared_context *shctx)
 {
-	struct cache *cache = (struct cache *)shctx->data;
+	struct http_cache *cache = (struct http_cache *)shctx->data;
 	struct cache_entry *entry, *back;
 	int can_strip = (cache->hints_blocks < CACHE_HINTS_CAP(cache));
 
@@ -1439,7 +1439,7 @@ static int cache_make_room(struct shared_context *shctx)
 static void cache_reserve_finish(struct shared_context *shctx)
 {
 	struct cache_entry *object, *back;
-	struct cache *cache = (struct cache *)shctx->data;
+	struct http_cache *cache = (struct http_cache *)shctx->data;
 	struct cache_tree *cache_tree;
 	int cache_tree_idx = 0;
 
@@ -1603,7 +1603,7 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 	struct filter *filter;
 	struct shared_block *first = NULL;
 	struct cache_flt_conf *cconf = rule->arg.act.p[0];
-	struct cache *cache = cconf->c.cache;
+	struct http_cache *cache = cconf->c.cache;
 	struct shared_context *shctx = shctx_ptr(cache);
 	struct cache_st *cache_ctx = NULL;
 	struct cache_entry *object = NULL, *old;
@@ -2468,7 +2468,7 @@ int sha1_hosturi(struct stream *s)
  *
  * Returns 1 if "304 Not Modified" should be sent, 0 otherwise.
  */
-static int should_send_notmodified_response(struct cache *cache, struct htx *htx,
+static int should_send_notmodified_response(struct http_cache *cache, struct htx *htx,
                                             struct cache_entry *entry)
 {
 	int retval = 0;
@@ -2587,7 +2587,7 @@ enum act_return http_action_req_cache_use(struct act_rule *rule, struct proxy *p
 	struct http_txn *txn = s->txn.http;
 	struct cache_entry *res, *sec_entry = NULL;
 	struct cache_flt_conf *cconf = rule->arg.act.p[0];
-	struct cache *cache = cconf->c.cache;
+	struct http_cache *cache = cconf->c.cache;
 	struct shared_context *shctx = shctx_ptr(cache);
 	struct shared_block *entry_block;
 	struct buffer *hint_buf = NULL;
@@ -2867,7 +2867,7 @@ int cfg_parse_cache(const char *file, int linenum, char **args, int kwm)
 		}
 
 		if (tmp_cache_config == NULL) {
-			struct cache *cache_config;
+			struct http_cache *cache_config;
 
 			tmp_cache_config = calloc(1, sizeof(*tmp_cache_config));
 			if (!tmp_cache_config) {
@@ -3099,7 +3099,7 @@ out:
 int post_check_cache()
 {
 	struct proxy *px;
-	struct cache *back, *cache_config, *cache;
+	struct http_cache *back, *cache_config, *cache;
 	struct shared_context *shctx;
 	int ret_shctx;
 	int err_code = ERR_NONE;
@@ -3108,7 +3108,7 @@ int post_check_cache()
 	list_for_each_entry_safe(cache_config, back, &caches_config, list) {
 
 		ret_shctx = shctx_init(&shctx, cache_config->maxblocks, CACHE_BLOCKSIZE,
-		                       cache_config->maxobjsz, sizeof(struct cache), cache_config->id);
+		                       cache_config->maxobjsz, sizeof(struct http_cache), cache_config->id);
 
 		if (ret_shctx <= 0) {
 			if (ret_shctx == SHCTX_E_INIT_LOCK)
@@ -3126,8 +3126,8 @@ int post_check_cache()
 		/* the cache structure is stored in the shctx and added to the
 		 * caches list, we can remove the entry from the caches_config
 		 * list */
-		memcpy(shctx->data, cache_config, sizeof(struct cache));
-		cache = (struct cache *)shctx->data;
+		memcpy(shctx->data, cache_config, sizeof(struct http_cache));
+		cache = (struct http_cache *)shctx->data;
 		LIST_APPEND(&caches, &cache->list);
 		LIST_DELETE(&cache_config->list);
 		free(cache_config);
@@ -3608,7 +3608,7 @@ static int cli_parse_show_cache(char **args, char *payload, struct appctx *appct
 	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
 		return 1;
 
-	ctx->cache = LIST_ELEM((caches).n, typeof(struct cache *), list);
+	ctx->cache = LIST_ELEM((caches).n, typeof(struct http_cache *), list);
 	return 0;
 }
 
@@ -3616,7 +3616,7 @@ static int cli_parse_show_cache(char **args, char *payload, struct appctx *appct
 static int cli_io_handler_show_cache(struct appctx *appctx)
 {
 	struct show_cache_ctx *ctx = appctx->svcctx;
-	struct cache* cache = ctx->cache;
+	struct http_cache* cache = ctx->cache;
 	struct buffer *buf = alloc_trash_chunk();
 
 	if (buf == NULL)
