@@ -2403,26 +2403,21 @@ enum act_parse_ret parse_cache_store(const char **args, int *orig_arg, struct pr
 	return ACT_RET_PRS_OK;
 }
 
-/* This produces a sha1 hash of the concatenation of the HTTP method,
- * the first occurrence of the Host header followed by the path component
- * if it begins with a slash ('/'). */
-int sha1_hosturi(struct stream *s)
+/* Normalize a URI to make it suitable as a cache key. Returns 0 on success,
+ * or -1 if the request carries no usable URI or <buf> is too small. */
+static int cache_normalize_uri(struct stream *s, struct buffer *buf)
 {
-	struct http_txn *txn = s->txn.http;
 	struct htx *htx = htxbuf(&s->req.buf);
 	struct htx_sl *sl;
 	struct http_hdr_ctx ctx;
 	struct ist uri;
-	blk_SHA_CTX sha1_ctx;
-	struct buffer *trash;
 
-	trash = get_trash_chunk();
 	ctx.blk = NULL;
 
 	sl = http_get_stline(htx);
 	uri = htx_sl_req_uri(sl); // whole uri
 	if (!uri.len)
-		return 0;
+		return -1;
 
 	/* In HTTP/1, most URIs are seen in origin form ('/path/to/resource'),
 	 * unless haproxy is deployed in front of an outbound cache. In HTTP/2,
@@ -2437,13 +2432,31 @@ int sha1_hosturi(struct stream *s)
 	 * well.
 	 */
 	if (!(sl->flags & HTX_SL_F_HAS_AUTHORITY)) {
-		chunk_istcat(trash, ist("https://"));
+		if (!chunk_istcat(buf, ist("https://")))
+			return -1;
 		if (!http_find_header(htx, ist("Host"), &ctx, 0))
-			return 0;
-		chunk_istcat(trash, ctx.value);
+			return -1;
+		if (!chunk_istcat(buf, ctx.value))
+			return -1;
 	}
 
-	chunk_istcat(trash, uri);
+	if (!chunk_istcat(buf, uri))
+		return -1;
+	return 0;
+}
+
+/* This produces a sha1 hash of the concatenation of the HTTP method,
+ * the first occurrence of the Host header followed by the path component
+ * if it begins with a slash ('/'). */
+int sha1_hosturi(struct stream *s)
+{
+	struct http_txn *txn = s->txn.http;
+	blk_SHA_CTX sha1_ctx;
+	struct buffer *trash;
+
+	trash = get_trash_chunk();
+	if (cache_normalize_uri(s, trash) != 0)
+		return 0;
 
 	/* hash everything */
 	blk_SHA1_Init(&sha1_ctx);
