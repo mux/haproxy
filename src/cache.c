@@ -53,6 +53,19 @@
 /* Soft cap on the number of cache blocks that may be held by hints entries. */
 #define CACHE_HINTS_CAP(cache)     ((cache)->maxblocks * (cache)->early_hints_ratio / 100)
 
+/* Increment the http <stat> counter on whichever side of <px> the stream uses. */
+#define CACHE_INC_STAT(px, s, stat)								\
+do {												\
+	if ((px) == strm_fe(s)) {								\
+		if ((px)->fe_counters.shared.tg)						\
+			_HA_ATOMIC_INC(&(px)->fe_counters.shared.tg[tgid - 1]->p.http.stat);	\
+	}											\
+	else {											\
+		if ((px)->be_counters.shared.tg)						\
+			_HA_ATOMIC_INC(&(px)->be_counters.shared.tg[tgid - 1]->p.http.stat);	\
+	}											\
+} while(0)
+
 static uint64_t cache_hash_seed = 0;
 
 const char *cache_store_flt_id = "cache store filter";
@@ -2599,14 +2612,7 @@ enum act_return http_action_req_cache_use(struct act_rule *rule, struct proxy *p
 	if (s->txn.http->flags & TX_CACHE_IGNORE)
 		return ACT_RET_CONT;
 
-	if (px == strm_fe(s)) {
-		if (px->fe_counters.shared.tg)
-			_HA_ATOMIC_INC(&px->fe_counters.shared.tg[tgid - 1]->p.http.cache_lookups);
-	}
-	else {
-		if (px->be_counters.shared.tg)
-			_HA_ATOMIC_INC(&px->be_counters.shared.tg[tgid - 1]->p.http.cache_lookups);
-	}
+	CACHE_INC_STAT(px, s, cache_lookups);
 
 	cache_tree = get_cache_tree_from_hash(cache,
 					      read_u32(s->txn.http->cache_hash));
@@ -2685,14 +2691,7 @@ enum act_return http_action_req_cache_use(struct act_rule *rule, struct proxy *p
 
 		if (hint_buf && b_data(hint_buf) > 0 &&
 		    cache_emit_early_hints(s, b_orig(hint_buf), b_data(hint_buf))) {
-			if (px == strm_fe(s)) {
-				if (px->fe_counters.shared.tg)
-					_HA_ATOMIC_INC(&px->fe_counters.shared.tg[tgid - 1]->p.http.cache_hint_hits);
-			}
-			else {
-				if (px->be_counters.shared.tg)
-					_HA_ATOMIC_INC(&px->be_counters.shared.tg[tgid - 1]->p.http.cache_hint_hits);
-			}
+			CACHE_INC_STAT(px, s, cache_hint_hits);
 		}
 
 		/* In case of Vary, we could have multiple entries with the same
@@ -2804,14 +2803,7 @@ enum act_return http_action_req_cache_use(struct act_rule *rule, struct proxy *p
 			ctx->send_notmodified =
                                 should_send_notmodified_response(cache, htxbuf(&s->req.buf), res);
 
-			if (px == strm_fe(s)) {
-				if (px->fe_counters.shared.tg)
-					_HA_ATOMIC_INC(&px->fe_counters.shared.tg[tgid - 1]->p.http.cache_hits);
-			}
-			else {
-				if (px->be_counters.shared.tg)
-					_HA_ATOMIC_INC(&px->be_counters.shared.tg[tgid - 1]->p.http.cache_hits);
-			}
+			CACHE_INC_STAT(px, s, cache_hits);
 			return ACT_RET_CONT;
 		} else {
 			s->target = NULL;
