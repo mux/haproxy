@@ -1625,6 +1625,10 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 	if (!(txn->req.flags & HTTP_MSGF_VER_11))
 		goto out;
 
+	/* no cache-use rule computed a key for this transaction */
+	if (!(txn->flags & TX_CACHE_HASH))
+		goto out;
+
 	cache_tree = get_cache_tree_from_hash(cache, read_u32(txn->cache_hash));
 
 	/* cache only GET method */
@@ -1654,10 +1658,6 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 		}
 		goto out;
 	}
-
-	/* cache key was not computed */
-	if (!key)
-		goto out;
 
 	/* cache only 200 status code */
 	if (txn->status != 200)
@@ -2621,6 +2621,7 @@ enum act_return http_action_req_cache_use(struct act_rule *rule, struct proxy *p
 	 * (see RFC7234#4.4). */
 	if (!sha1_hosturi(s))
 		return ACT_RET_CONT;
+	txn->flags |= TX_CACHE_HASH;
 
 	if (s->txn.http->flags & TX_CACHE_IGNORE)
 		return ACT_RET_CONT;
