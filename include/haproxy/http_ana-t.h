@@ -75,6 +75,7 @@
 
 #define TX_L7_RETRY     0x00080000      /* The transaction may attempt L7 retries */
 #define TX_D_L7_RETRY   0x00100000      /* Disable L7 retries on this transaction, even if configured to do it */
+#define TX_CACHE_HASH   0x00200000      /* Cache primary key was computed for this transaction */
 
 /* This function is used to report flags in debugging tools. Please reflect
  * below any single-bit flag addition above in the same order via the
@@ -90,7 +91,7 @@ static forceinline char *txn_show_flags(char *buf, size_t len, const char *delim
 	/* flags & enums */
 	_(TX_SCK_PRESENT, _(TX_CACHEABLE, _(TX_CACHE_COOK, _(TX_CACHE_IGNORE,
 	_(TX_CON_WANT_TUN, _(TX_CACHE_HAS_SEC_KEY, _(TX_USE_PX_CONN,
-	_(TX_NOT_FIRST, _(TX_L7_RETRY, _(TX_D_L7_RETRY))))))))));
+	_(TX_NOT_FIRST, _(TX_L7_RETRY, _(TX_D_L7_RETRY, _(TX_CACHE_HASH)))))))))));
 
 	_e(TX_SCK_MASK, TX_SCK_FOUND,     _e(TX_SCK_MASK, TX_SCK_DELETED,
 	_e(TX_SCK_MASK, TX_SCK_INSERTED,  _e(TX_SCK_MASK, TX_SCK_REPLACED,
