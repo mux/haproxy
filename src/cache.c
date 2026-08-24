@@ -2238,6 +2238,30 @@ int cfg_parse_cache(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 		tmp_cache_config->store_cfg.seg_size = segsz;
+	} else if (strcmp(args[0], "mean-object-size") == 0) {
+		unsigned long long meansz;
+		char *err;
+
+		if (alertif_too_many_args(1, file, linenum, args, &err_code)) {
+			err_code |= ERR_ABORT;
+			goto out;
+		}
+
+		if (!*args[1]) {
+			ha_warning("parsing [%s:%d]: '%s' expects a mean object size parameter in bytes.\n",
+			        file, linenum, args[0]);
+			err_code |= ERR_WARN;
+		}
+
+		meansz = strtoull(args[1], &err, 10);
+		if (err == args[1] || *err != '\0' || meansz < 128 ||
+		    meansz != (unsigned long long)(size_t)meansz) {
+			ha_warning("parsing [%s:%d]: mean-object-size wrong value '%s' (128 bytes minimum)\n",
+			           file, linenum, args[1]);
+			err_code |= ERR_ABORT;
+			goto out;
+		}
+		tmp_cache_config->store_cfg.mean_obj_size = meansz;
 	} else if (strcmp(args[0], "admission-filter") == 0) {
 		if (alertif_too_many_args(3, file, linenum, args, &err_code)) {
 			err_code |= ERR_ABORT;

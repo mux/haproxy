@@ -20632,6 +20632,16 @@ max-secondary-entries <number>
   key in the cache. This needs the vary support to be enabled. Its default value is 10
   and should be passed a strictly positive integer.
 
+mean-object-size <bytes>
+  Expected mean size of a cached object, headers included, used to size the
+  cache's fixed index at startup. Set it to the mean observed on your traffic;
+  the index provisions enough slots to tolerate a mean up to about three times
+  smaller than configured before new objects start being refused (the
+  "publish_fails" counter of "show cache stats" reveals such refusals). The
+  default is 4096, deliberately at the small end of real-world means so that
+  small-object workloads work without tuning; large-object workloads may raise
+  it to reclaim a fraction of a percent of memory. The minimum is 128.
+
 process-vary <on/off>
   Enable or disable the processing of the Vary header. When disabled, a response
   containing such a header will never be cached. When enabled, we need to calculate
