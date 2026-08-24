@@ -84,11 +84,13 @@ haproxy h1 -conf {
         http-response set-header X-Cache-Name %[res.cache_name]
 
     cache first_cache
+            admission-filter off
             total-max-size 3
             max-age 40
             max-object-size 3000
 
     cache second_cache
+            admission-filter off
             total-max-size 3
             max-age 20
             max-object-size 3072

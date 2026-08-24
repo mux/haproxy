@@ -44,6 +44,7 @@ haproxy h1 -conf {
         http-response cache-store my_cache
 
     cache my_cache
+	    admission-filter off
 	    total-max-size 3
 	    max-age 20
 	    max-object-size 3072
