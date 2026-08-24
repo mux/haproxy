@@ -89,7 +89,7 @@ haproxy h1 -conf {
         total-max-size 1
         max-age 300
         max-object-size 500000
-        early-hints on ratio 25
+        early-hints on size 262144
 } -start
 
 

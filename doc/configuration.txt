@@ -20589,7 +20589,7 @@ admission-filter <on/off> [min-size <bytes>]
   collapses it instead, which a high "admit_rotations" rate signals: the
   filter forgets first sightings faster than objects are re-requested.
 
-early-hints <on/off/only> [ratio <integer>]
+early-hints <on/off/only> [size <bytes>]
   Enable or disable support for HTTP 103 Early Hints responses (see RFC 8297).
   When enabled, the cache remembers relevant "Link" response headers (with a
   "rel" parameter of preload, preconnect, dns-prefetch, modulepreload or
@@ -20608,13 +20608,12 @@ early-hints <on/off/only> [ratio <integer>]
   this mode, the "max-object-size" limit does not apply: hints are extracted
   and stored regardless of the response's size.
 
-  The optional "ratio" argument sets the percentage of total cache blocks
-  that may be reserved for hints-only entries (1 to 99, default 25). Higher
-  values keep hints alive longer at the cost of less space for full responses;
-  lower values prioritize full responses. This argument only makes sense when
-  "early-hints" is set to on, and is ignored otherwise. In "only" mode every
-  stored entry is a hints entry, so the whole cache is available to them and
-  this ratio has no practical effect.
+  The optional "size" argument sets the memory dedicated to hint entries, in
+  bytes. Hints are kept in their own small cache, separate from the response
+  cache, so storing them never competes with full responses. That memory
+  comes in addition to "total-max-size", and defaults to a tenth of it. In
+  "only" mode the whole "total-max-size" is used for hints, and the "size"
+  argument is not accepted.
 
 max-age <seconds>
   Define the maximum expiration duration. The expiration is set as the lowest

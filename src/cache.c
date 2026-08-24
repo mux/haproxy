@@ -78,12 +78,11 @@ struct http_cache {
 	struct cache_config store_cfg;
 	size_t total_size;
 	struct cache *early_hints; /* hints cache */
-	size_t early_hints_size;   /* size the hints cache got */
+	size_t early_hints_size;   /* size of the hints cache, 0 = default */
 	struct list list;          /* cache linked list */
 	unsigned int maxage;       /* max-age */
 	unsigned int max_secondary_entries;  /* maximum number of secondary entries (Vary) */
 	uint8_t flags;             /* configuration flags, see CACHE_CF_* */
-	uint8_t early_hints_ratio; /* ratio of total_size used by hint cache */
 	char id[33];               /* cache name */
 };
 
@@ -2130,7 +2129,6 @@ int cfg_parse_cache(const char *file, int linenum, char **args, int kwm)
 			tmp_cache_config->maxage = 60;
 			tmp_cache_config->total_size = 0;
 			tmp_cache_config->store_cfg.max_obj_size = 0;
-			tmp_cache_config->early_hints_ratio = 25;
 			tmp_cache_config->max_secondary_entries = DEFAULT_MAX_SECONDARY_ENTRY;
 		}
 	} else if (strcmp(args[0], "total-max-size") == 0) {
@@ -2313,28 +2311,41 @@ int cfg_parse_cache(const char *file, int linenum, char **args, int kwm)
 
 		if (*args[2]) {
 			char *err;
-			unsigned int ratio;
+			unsigned long long size;
 
-			if (strcmp(args[2], "ratio") != 0) {
-				ha_alert("parsing [%s:%d]: '%s' unexpected argument '%s', expected 'ratio'.\n",
+			if (tmp_cache_config->flags & CACHE_CF_EARLY_HINTS_ONLY) {
+				ha_alert("parsing [%s:%d]: '%s' does not take a 'size' argument in \"only\" mode, where the whole \"total-max-size\" is used for hints.\n",
+					 file, linenum, args[0]);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+			if (strcmp(args[2], "size") != 0) {
+				ha_alert("parsing [%s:%d]: '%s' unexpected argument '%s', expected 'size'.\n",
 					 file, linenum, args[0], args[2]);
 				err_code |= ERR_ALERT | ERR_FATAL;
 				goto out;
 			}
 			if (!*args[3]) {
-				ha_alert("parsing [%s:%d]: '%s ratio' expects an integer argument between 1 and 99.\n",
+				ha_alert("parsing [%s:%d]: '%s size' expects a size in bytes.\n",
 					 file, linenum, args[0]);
 				err_code |= ERR_ALERT | ERR_FATAL;
 				goto out;
 			}
-			ratio = strtoul(args[3], &err, 10);
-			if (err == args[3] || *err != '\0' || ratio < 1 || ratio > 99) {
-				ha_alert("parsing [%s:%d]: '%s ratio' expects an integer argument between 1 and 99, got '%s'.\n",
+			size = strtoull(args[3], &err, 10);
+			if (err == args[3] || *err != '\0' || size == 0) {
+				ha_alert("parsing [%s:%d]: '%s size' expects a size in bytes, got '%s'.\n",
 					 file, linenum, args[0], args[3]);
 				err_code |= ERR_ALERT | ERR_FATAL;
 				goto out;
 			}
-			tmp_cache_config->early_hints_ratio = ratio;
+			if (size > CACHE_MAX_TOTAL_SIZE ||
+			    size != (unsigned long long)(size_t)size) {
+				ha_alert("parsing [%s:%d]: '%s size' too large '%s'.\n",
+					 file, linenum, args[0], args[3]);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+			tmp_cache_config->early_hints_size = size;
 		}
 	} else if (strcmp(args[0], "max-secondary-entries") == 0) {
 		unsigned int max_sec_entries;
@@ -2439,13 +2450,26 @@ int post_check_cache()
 			}
 		}
 		if (cache->flags & CACHE_CF_EARLY_HINTS) {
-			size_t size = cache->total_size * cache->early_hints_ratio / 100;
+			/* Hint entries hold only Link header values; preconnect-only
+			 * deployments average under 200 bytes per entry.
+			 */
+			struct cache_config hints_cfg = { .mean_obj_size = 256 };
+			size_t size = cache->early_hints_size;
 			char *id;
 
-			cache->early_hints_size = size;
+			if (!size) {
+				/* A hints-only cache stores nothing else, so it
+				 * gets the whole configured size.
+				 */
+				if (cache->flags & CACHE_CF_EARLY_HINTS_ONLY)
+					size = cache->total_size;
+				else
+					size = (uint64_t)cache->total_size * CACHE_HINTS_DFL_PCT / 100;
+				cache->early_hints_size = size;
+			}
 			if (asprintf(&id, "%s-hints", cache->id) > 0) {
 				/* Hints are always stored, so no admission filter. */
-				cache->early_hints = cache_new(NULL, CACHE_F_NO_ADM_FILTER,
+				cache->early_hints = cache_new(&hints_cfg, CACHE_F_NO_ADM_FILTER,
 				                               size, cache_hash_seed, id);
 				free(id);
 			}
