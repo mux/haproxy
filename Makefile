@@ -985,7 +985,8 @@ OBJS += src/mux_h1.o src/log.o						\
         src/http_acl.o src/dict.o src/dgram.o src/pipe.o		\
         src/hpack-huff.o src/hpack-enc.o src/ebtree.o src/hash.o	\
         src/httpclient_cli.o src/version.o src/ncbmbuf.o src/ech.o	\
-        src/flt_decomp.o src/cfgparse-peers.o src/haterm.o
+        src/flt_decomp.o src/cfgparse-peers.o src/haterm.o	\
+        src/cache_storage.o
 
 ifneq ($(TRACE),)
   OBJS += src/calltrace.o
