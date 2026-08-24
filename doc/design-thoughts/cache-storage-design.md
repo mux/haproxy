@@ -461,15 +461,15 @@ composition.
 ## Early hints
 
 103 Early Hints live in a *separate, smaller* cache instance dedicated to hints,
-sized by `early-hints <on|off|only> [ratio N]` as N percent of the configured
-total, 25 by default. The hints instance is created with no admission filter
-at all: a hint is created deliberately by the store path, never admitted from
-request traffic, so the instance-level opt-out also spares the filter's
-memory. When a response carrying `Link` hints is cached, a hints-only entry is
-written under the request's primary key; on a miss for the main entry the
-hints are replayed as a 103 while the origin is queried, and a hit needs none.
-Hint entries are reserved with the engine's maximum TTL rather than the
-response's expiry, so
+sized by `early-hints <on|off|only> [size <bytes>]`, defaulting to a tenth of
+the configured total -- or all of it in `only` mode, where nothing else is
+stored. The hints instance is created with no admission filter at all: a hint
+is created deliberately by the store path, never admitted from request traffic,
+so the instance-level opt-out also spares the filter's memory. When a response
+carrying `Link` hints is cached, a hints-only entry is written under the
+request's primary key; on a miss for the main entry the hints are replayed as
+a 103 while the origin is queried, and a hit needs none. Hint entries are
+reserved with the engine's maximum TTL rather than the response's expiry, so
 they deliberately outlive its freshness: a 103 is most valuable exactly when
 the response has expired and an origin round-trip is coming, and a stale hint
 is harmless -- RFC 8297 makes hints advisory.
