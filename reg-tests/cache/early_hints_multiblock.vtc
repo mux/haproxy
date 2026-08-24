@@ -1,6 +1,6 @@
 varnishtest "Cache HTTP 103 Early Hints: multi-segment hint entries"
 # Hint records are stored as entries of the hints cache, which is sized by
-# "ratio" and uses small segments (4KB here). A Link value larger than one
+# "size" and uses small segments (4KB here). A Link value larger than one
 # segment makes the hint entry span a segment chain: the store must write it
 # whole and the replay must read it back across the chain - the assertion on
 # the value's tail fails if the entry is truncated at a segment boundary.
@@ -48,7 +48,7 @@ haproxy h1 -conf {
         total-max-size 1
         max-age 300
         max-object-size 4096
-        early-hints on ratio 25
+        early-hints on size 262144
 } -start
 
 client c1 -connect ${h1_fe_sock} {

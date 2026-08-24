@@ -21277,7 +21277,7 @@ cache <name>
   Declare a cache section, allocate a shared cache memory named <name>, the
   size of cache is mandatory (see keyword "total-max-size" below).
 
-early-hints <on/off/only> [ratio <integer>]
+early-hints <on/off/only> [size <bytes>]
   Enable or disable support for HTTP 103 Early Hints responses (see RFC 8297).
   When enabled, the cache remembers relevant "Link" response headers (with a
   "rel" parameter of preload, preconnect, dns-prefetch, modulepreload or
@@ -21296,11 +21296,12 @@ early-hints <on/off/only> [ratio <integer>]
   this mode, the "max-object-size" limit does not apply: hints are extracted
   and stored regardless of the response's size.
 
-  The optional "ratio" argument sizes the separate hints arena as a percentage
-  of "total-max-size" (1 to 99, default 25). Its memory is additional to the
-  response arena, so hint records do not compete with responses for blocks.
-  The configured fraction also sizes the hints arena in "only" mode, where no
-  response arena is created.
+  The optional "size" argument sets the memory dedicated to hint entries, in
+  bytes. Hints are kept in their own small cache, separate from the response
+  cache, so storing them never competes with full responses. That memory
+  comes in addition to "total-max-size", and defaults to a tenth of it. In
+  "only" mode the whole "total-max-size" is used for hints, and the "size"
+  argument is not accepted.
 
 max-age <seconds>
   Define the maximum expiration duration. The expiration is set as the lowest

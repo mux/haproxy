@@ -70,7 +70,7 @@ haproxy h1 -conf {
         max-age 3600
         process-vary on
         vary-cache-size 65536
-        early-hints on ratio 2
+        early-hints on size 16384
 } -start
 
 client c1 -connect ${h1_fe_sock} {
