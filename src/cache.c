@@ -122,6 +122,7 @@ struct show_cache_ctx {
 	struct cache_iter it;
 	int store_idx; /* response, Vary anchors, then early hints */
 	int group_done;
+	int stats;
 };
 
 
@@ -3233,11 +3234,52 @@ static int cli_parse_show_cache(char **args, char *payload, struct appctx *appct
 	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
 		return 1;
 
+	if (*args[2] && strcmp(args[2], "stats") != 0)
+		return cli_err(appctx, "Expects no argument or 'stats'.\n");
+
 	ctx->cache = LIST_ELEM((caches).n, typeof(struct http_cache *), list);
 	memset(&ctx->it, 0, sizeof(ctx->it));
 	ctx->store_idx = 0;
 	ctx->group_done = 0;
+	ctx->stats = !!*args[2];
 	return 0;
+}
+
+/* Dumps <store>'s activity counters into <buf>. These are storage-level
+ * counters, unlike the per-proxy cache_lookups/cache_hits the regular stats
+ * already report: they say why a store or a lookup did not go through.
+ */
+static void show_cache_stats(struct buffer *buf, const char *id,
+                             const char *suffix, const struct cache *store)
+{
+	struct cache_stats st;
+
+	cache_get_stats(store, &st);
+
+#define SHOW_CACHE_METRIC(name) \
+	chunk_appendf(buf, "%s%s." #name ": %llu\n", id, suffix, (unsigned long long)st.name)
+
+	SHOW_CACHE_METRIC(publish_supersedes);
+	SHOW_CACHE_METRIC(aborts);
+	SHOW_CACHE_METRIC(dead_bytes);
+	SHOW_CACHE_METRIC(segs_emptied);
+	SHOW_CACHE_METRIC(reserve_fails);
+	SHOW_CACHE_METRIC(reserve_fail_giveup);
+	SHOW_CACHE_METRIC(reserve_fail_attempts);
+	SHOW_CACHE_METRIC(reserve_fail_busy);
+	SHOW_CACHE_METRIC(reserve_fail_infeasible);
+	SHOW_CACHE_METRIC(reclaim_calls);
+	SHOW_CACHE_METRIC(reclaim_elect_losses);
+	SHOW_CACHE_METRIC(reclaim_blocked);
+	SHOW_CACHE_METRIC(reclaim_no_candidate);
+	SHOW_CACHE_METRIC(publish_fails);
+	SHOW_CACHE_METRIC(read_pin_fails);
+	SHOW_CACHE_METRIC(segs_expired);
+	SHOW_CACHE_METRIC(segs_evicted);
+	SHOW_CACHE_METRIC(merges);
+	SHOW_CACHE_METRIC(merges_empty);
+
+#undef SHOW_CACHE_METRIC
 }
 
 static int show_cache_cb(const struct cache *store, const struct cache_rhandle *h, void *data)
@@ -3351,14 +3393,22 @@ static int cli_io_handler_show_cache(struct appctx *appctx)
 			if (store == NULL)
 				continue;
 
-			if (show_cache_group(appctx, buf, store, cache->id,
-			                     suffixes[ctx->store_idx], sizes[ctx->store_idx]) == -1)
-				goto yield;
-			yield = cache_foreach(store, &ctx->it, show_cache_cb, appctx);
-			if (yield)
-				goto yield;
-			memset(&ctx->it, 0, sizeof(ctx->it));
-			ctx->group_done = 0;
+			if (ctx->stats) {
+				show_cache_stats(buf, cache->id,
+				                 suffixes[ctx->store_idx], store);
+				if (applet_putchk(appctx, buf) == -1)
+					goto yield;
+			}
+			else {
+				if (show_cache_group(appctx, buf, store, cache->id,
+				                     suffixes[ctx->store_idx], sizes[ctx->store_idx]) == -1)
+					goto yield;
+				yield = cache_foreach(store, &ctx->it, show_cache_cb, appctx);
+				if (yield)
+					goto yield;
+				memset(&ctx->it, 0, sizeof(ctx->it));
+				ctx->group_done = 0;
+			}
 		}
 		ctx->store_idx = 0;
 	}
@@ -3431,7 +3481,7 @@ static struct flt_kw_list filter_kws = { "CACHE", { }, {
 INITCALL1(STG_REGISTER, flt_register_keywords, &filter_kws);
 
 static struct cli_kw_list cli_kws = {{},{
-	{ { "show", "cache", NULL }, "show cache                              : show cache status", cli_parse_show_cache, cli_io_handler_show_cache, NULL, NULL },
+	{ { "show", "cache", NULL }, "show cache [stats]                      : show cache status, or its storage counters", cli_parse_show_cache, cli_io_handler_show_cache, NULL, NULL },
 	{{},}
 }};
 

@@ -152,7 +152,8 @@ shell {
     expiry=$(printf '%s\n' "$anchor" | awk '{ sub(/.* expire:/, ""); print }')
     test "$expiry" -gt 280 && test "$expiry" -le 300
 
-
+    stats=$(echo "show cache stats" | socat -t 5 "${tmpdir}/h1/stats" -)
+    printf '%s\n' "$stats" | grep -q '^my_cache-anchors.merges: 0$'
 }
 
 client c3 -connect ${h1_fe_sock} {

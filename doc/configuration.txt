@@ -21351,7 +21351,7 @@ vary-cache-size <bytes>
   sized independently for these small objects and consumes additional memory.
   Segment merging is disabled for this store; "segment-size" configures only
   the response store. The anchor cache appears as "<cache-name>-anchors" in
-  "show cache".
+  "show cache" and "show cache stats".
 
   An evicted anchor makes its URL's variants unreachable until new responses
   populate a new family. Increase this budget if the anchor store experiences
