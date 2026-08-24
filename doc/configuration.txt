@@ -21322,6 +21322,16 @@ max-secondary-entries <number>
   limit on variants differing in Origin or Referer; those remain bounded by
   arena and index capacity. Vary processing must be enabled.
 
+mean-object-size <bytes>
+  Expected mean size of a cached object, headers included, used to size the
+  cache's fixed index at startup. Set it to the mean observed on your traffic;
+  the index provisions enough slots to tolerate a mean up to about three times
+  smaller than configured before new objects start being refused (the
+  "publish_fails" counter of "show cache stats" reveals such refusals). The
+  default is 4096, deliberately at the small end of real-world means so that
+  small-object workloads work without tuning; large-object workloads may raise
+  it to reclaim a fraction of a percent of memory. The minimum is 128.
+
 process-vary <on/off>
   Enable or disable the processing of the Vary header. When disabled, a response
   containing such a header will never be cached. When enabled, we need to calculate
@@ -21349,9 +21359,9 @@ vary-cache-size <bytes>
 
   Anchors are fixed-size records stored in 4096-byte segments. Their index is
   sized independently for these small objects and consumes additional memory.
-  Segment merging is disabled for this store; "segment-size" configures only
-  the response store. The anchor cache appears as "<cache-name>-anchors" in
-  "show cache" and "show cache stats".
+  Segment merging is disabled for this store; "segment-size" and "mean-object-
+  size" configure only the response store. The anchor cache appears as
+  "<cache-name>-anchors" in "show cache" and "show cache stats".
 
   An evicted anchor makes its URL's variants unreachable until new responses
   populate a new family. Increase this budget if the anchor store experiences
