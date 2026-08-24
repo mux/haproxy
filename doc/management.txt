@@ -3045,7 +3045,7 @@ show cli sockets
      127.0.0.2:9969 user 2
      [::1]:9999 operator 2
 
-show cache
+show cache [stats]
   List the configured caches and the objects stored in each of them.
 
   The objects are listed per storage, each group preceded by a line naming it.
@@ -3072,6 +3072,58 @@ show cache
   Entries holding early hints have no secondary hash. The listing is a
   snapshot taken while the cache keeps running, so an entry being stored or
   reclaimed as it is walked may be left out of it.
+
+  With the "stats" argument, objects are not listed; each storage dumps its
+  activity counters instead, one per line, each named after the storage it
+  belongs to. All counters are cumulative since startup.
+
+  $ echo 'show cache stats' | socat stdio /tmp/sock1
+  foobar.admit_rejects: 1204
+  foobar.admit_inserts: 1310
+  foobar.admit_rotations: 0
+  foobar.reserve_fails: 0
+  (...)
+  foobar.segs_evicted: 3773
+  foobar-hints.admit_rejects: 0
+  (...)
+
+     admit_rejects             Objects not stored because the admission filter
+                               had never seen their key; not an error
+     admit_inserts             Keys recorded by the admission filter
+     admit_rotations           Times the filter forgot its oldest keys
+     reserve_fails             Objects not stored because no space could be
+                               reclaimed in time
+     reserve_fail_giveup       Of those, the ones finding nothing left to
+                               reclaim (free, being written, or draining)
+     reserve_fail_attempts     Of those, the ones that ran out of attempts
+     reserve_fail_busy         Of those, the ones making no progress
+     reserve_fail_infeasible   Of those, the ones needing more space than the
+                               remaining attempts could supply
+     reclaim_calls             Scans looking for space to reclaim
+     reclaim_elect_losses      Scans whose chosen segment was reclaimed by
+                               another thread first
+     reclaim_blocked           Segments left alone because an object was still
+                               being written into them
+     reclaim_no_candidate      Scans that found no reclaimable segment
+     publish_fails             Objects written in full but not indexed: no free
+                               index slot for their key, or an incomplete entry
+     publish_supersedes        Publishes that replaced a live entry of the same
+                               key, typically concurrent stores of one URL; the
+                               replaced copy stays dead until reclaim
+     aborts                    Reservations abandoned before publishing
+     dead_bytes                Bytes abandoned in segments until reclaim:
+                               superseded live copies, plus aborted or failed
+                               stores in shared segments (a private chain is
+                               returned to the pool at once instead)
+     read_pin_fails            Lookups that gave up reading an object because
+                               stores or deletes of the same key kept replacing
+                               its index entry
+     segs_expired              Segments reclaimed after their contents expired
+     segs_evicted              Live segments evicted to make room
+
+  Sustained growth of "reserve_fails" or "publish_fails" means objects are
+  failing to be cached, the former pointing at reclamation, the latter at
+  index capacity.
 
 show default-server [<backend>]
   Dump the list of default-server instances still present in a backend after
