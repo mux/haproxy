@@ -1,0 +1,64 @@
+varnishtest "Response-store eviction does not evict Vary anchors"
+
+feature ignore_unknown_macro
+feature cmd "command -v curl && command -v socat"
+
+server s1 -repeat 13 {
+    rxreq
+    txresp -hdr "Vary: Accept-Encoding" -hdr "Cache-Control: max-age=300" \
+        -bodylen 400000
+} -start
+
+haproxy h1 -conf {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+        stats socket "${tmpdir}/h1/stats" level admin
+
+    defaults
+        mode http
+        timeout connect "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout client "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout server "${HAPROXY_TEST_TIMEOUT-5s}"
+
+    frontend fe
+        bind "fd@${fe}"
+        default_backend test
+
+    backend test
+        http-reuse never
+        http-request cache-use my_cache
+        server www ${s1_addr}:${s1_port}
+        http-response cache-store my_cache
+
+    cache my_cache
+        total-max-size 1
+        max-age 3600
+        max-object-size 500000
+        process-vary on
+        vary-cache-size 65536
+} -start
+
+shell {
+    for i in $(seq 1 13); do
+        curl -fs -H 'Accept-Encoding: identity' -o /dev/null \
+            "http://${h1_fe_addr}:${h1_fe_port}/page$i"
+    done
+    sleep 0.1
+
+    out=$(echo "show cache" | socat -t 5 "${tmpdir}/h1/stats" -)
+    counts=$(printf '%s\n' "$out" | awk '
+        /: my_cache \(/ { store="responses"; next }
+        /: my_cache-anchors / { store="anchors"; next }
+        /^0x.* hash:0x/ { n[store]++ }
+        END { print n["responses"]+0, n["anchors"]+0 }')
+    # Only two jumbo bodies fit, but all thirteen tiny anchors survive.
+    if [ "$counts" != "2 13" ]; then
+        echo "expected two responses and thirteen anchors: $counts"
+        echo "$out"
+        exit 1
+    fi
+
+
+}
