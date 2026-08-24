@@ -1455,7 +1455,7 @@ static int cache_index_init(struct cache *cache, uint64_t total_size)
 	 *
 	 * The count is clamped before pow2_up(), whose uint32 domain overflows
 	 * well within the 128 TB of arena that CACHE_MAX_TOTAL_SIZE permits:
-	 * from 16 TB at the default mean. 2^26
+	 * from 16 TB at the default mean, 512 GB at the 128-byte minimum. 2^26
 	 * buckets is 4 GB of index, and well below the 2^52 that two-choice
 	 * hashing tops out at here.
 	 */
