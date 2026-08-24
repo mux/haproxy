@@ -5398,7 +5398,7 @@ struct http_txn *http_create_txn(struct stream *s)
 	txn->server_status = -1;
 	txn->http_reply = NULL;
 	txn->l7_buffer = BUF_NULL;
-	write_u32(txn->cache_hash, 0);
+	memset(&txn->cache_hash, 0, sizeof(txn->cache_hash));
 
 	txn->cookie_first_date = 0;
 	txn->cookie_last_date = 0;

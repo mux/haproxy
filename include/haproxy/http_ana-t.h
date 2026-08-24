@@ -23,6 +23,7 @@
 #define _HAPROXY_PROTO_HTTP_T_H
 
 #include <haproxy/api-t.h>
+#include <haproxy/cache_storage.h>
 #include <haproxy/channel-t.h>
 #include <haproxy/http-t.h>
 
@@ -249,7 +250,7 @@ struct http_txn {
 	short server_status;            /* HTTP status received from the server, negative if not received */
 	struct http_reply *http_reply;  /* The HTTP reply to use as reply */
 	struct buffer l7_buffer;        /* To store the data, in case we have to retry */
-	char cache_hash[20];               /* Store the cache hash  */
+	struct cache_key cache_hash;    /* Store the cache hash  */
 	char cache_secondary_hash[HTTP_CACHE_SEC_KEY_LEN]; /* Optional cache secondary key. */
 	char *uri;                      /* first line if log needed, NULL otherwise */
 	char *cli_cookie;               /* cookie presented by the client, in capture mode */

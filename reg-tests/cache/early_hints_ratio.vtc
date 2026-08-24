@@ -1,11 +1,9 @@
-varnishtest "Cache early-hints ratio cap test"
-# Verify the "early-hints ratio" option is respected: with ratio=1 on a 1MB
-# (1024-block) cache, the cap on hints blocks is 10. Storing more URLs than
-# 2 (full entries that fit) + 10 (hints entries that fit in the cap)
-# triggers eviction of the oldest hints entry instead of accumulating an
-# 11th. The test populates 13 URLs and verifies via "show cache" that the
-# cache holds exactly 10 hints-only entries and 2 full entries (the 1st
-# stored URL having been evicted).
+varnishtest "Cache early-hints ratio: hints survive main-store eviction"
+# "early-hints on ratio N" sizes a separate hints cache at N% of
+# total-max-size. Hint entries live there and are never candidates for the
+# main store's eviction. Storing thirteen 400KB bodies into a 1MB cache can
+# keep only the last two responses, but all thirteen hint entries must
+# survive: thirteen tiny records easily fit the 1% hints cache.
 
 feature ignore_unknown_macro
 feature cmd "command -v curl && command -v socat"
@@ -44,6 +42,7 @@ haproxy h1 -conf {
         http-response cache-store my_cache
 
     cache my_cache
+        admission-filter off
         total-max-size 1
         max-age 300
         max-object-size 500000
@@ -52,11 +51,6 @@ haproxy h1 -conf {
 
 
 shell {
-    # Issue 13 stores. With 400KB bodies into a 1MB cache, 2 fit as full
-    # entries. Each subsequent store strips one previously-full entry into
-    # a 1-block hints-only entry, until hints_blocks reaches the cap (10).
-    # The 13th store hits the cap, so an eviction is forced before another
-    # strip can succeed.
     for i in $(seq 1 13); do
         curl -fs -o /dev/null "http://${h1_fe_addr}:${h1_fe_port}/page$i"
     done
@@ -65,18 +59,18 @@ shell {
     sleep 0.1
 
     out=$(echo "show cache" | socat -t 5 "${tmpdir}/h1/stats" -)
-    hints=$(echo "$out" | grep -c "type:hints")
-    full=$(echo "$out" | grep -c "type:full")
+    # Entry lines carry a hash; only the full entries carry a vary key.
+    entries=$(echo "$out" | grep -E "^0x[0-9a-f]+ hash:0x")
+    hints=$(echo "$entries" | grep -vc " vary:0x")
+    full=$(echo "$entries" | grep -c " vary:0x")
 
-    if [ "$hints" -ne 10 ]; then
-        echo "ratio test: expected 10 hints entries, got $hints"
-        echo "show cache output:"
+    if [ "$hints" -ne 13 ]; then
+        echo "ratio test: expected 13 hint entries, got $hints"
         echo "$out"
         exit 1
     fi
     if [ "$full" -ne 2 ]; then
         echo "ratio test: expected 2 full entries, got $full"
-        echo "show cache output:"
         echo "$out"
         exit 1
     fi

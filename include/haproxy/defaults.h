@@ -643,15 +643,6 @@
 /* system sysfs directory */
 #define NUMA_DETECT_SYSTEM_SYSFS_PATH "/sys/devices/system"
 
-/* Number of cache trees */
-#ifndef CACHE_TREE_NUM
-# if defined(USE_THREAD)
-#  define CACHE_TREE_NUM 8
-# else
-#  define CACHE_TREE_NUM 1
-# endif
-#endif
-
 /* number of ring wait queues depending on the number
  * of threads.
  */

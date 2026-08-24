@@ -20560,6 +20560,35 @@ cache <name>
   Declare a cache section, allocate a shared cache memory named <name>, the
   size of cache is mandatory (see keyword "total-max-size" below).
 
+admission-filter <on/off> [min-size <bytes>]
+  Enable or disable the cache's admission filter. When enabled, an object is
+  only stored when requested for the second time, so objects requested once
+  and never again do not occupy cache space. Such "one-hit wonders" are often
+  the majority of URLs in CDN-like traffic, and filtering them out improves
+  the hit ratio. The default value is on (enabled).
+
+  The optional "min-size" argument restricts the filter to objects of at
+  least <bytes> bytes; smaller ones are always stored on first request.
+  What an object requested only once wastes is its size, so filtering small
+  objects costs more in delayed caching than it saves in space. It defaults
+  to 16 times "mean-object-size", so only objects well above the workload's
+  typical size need to be seen twice; setting it to 1 filters every object.
+
+  The "admit_rejects" counter of "show cache stats" tells how often the
+  filter refuses a first sighting. Near zero, the filter is inactive on this
+  traffic and tuning it changes nothing. When it is high, every refused
+  object that does come back paid one extra origin fetch: if the hit ratio
+  is no better than with the filter off, the delayed objects were mostly
+  legitimate - raise "min-size". Lowering it extends the protection to
+  smaller objects, which pays when many URLs are requested only once
+  (crawlers, scans, long-tail media) but delays every reused object above
+  the new threshold. "min-size 1" is a special regime: when the cache is
+  far smaller than the set of live objects and the popular ones return
+  constantly, making everything prove reuse can raise the hit ratio
+  substantially; on traffic with long gaps between repeat requests it
+  collapses it instead, which a high "admit_rotations" rate signals: the
+  filter forgets first sightings faster than objects are re-requested.
+
 early-hints <on/off/only> [ratio <integer>]
   Enable or disable support for HTTP 103 Early Hints responses (see RFC 8297).
   When enabled, the cache remembers relevant "Link" response headers (with a
@@ -20616,6 +20645,17 @@ process-vary <on/off>
   considered malformed. For such requests no secondary key is built and the
   response is never delivered from the cache so that we can let the server
   decide how to handle the situation. The default value is off (disabled).
+
+segment-size <bytes>
+  Define the size of the segments the cache's storage is divided into.
+  Objects are packed into segments, and space is reclaimed one whole segment
+  at a time. Larger segments make reclamation less frequent and shorten the
+  chains of objects larger than a segment; smaller segments evict at a finer
+  grain and waste less space in partially filled segments, which every object
+  stored without a known length and every object larger than a segment leave
+  behind. The value must be a multiple of 8, no larger than 8388608 (8 MB),
+  and must divide "total-max-size" evenly. By default the size is derived
+  from "total-max-size" and this setting rarely needs to be changed.
 
 total-max-size <megabytes>
   Define the size in RAM of the cache in megabytes. This size is split in

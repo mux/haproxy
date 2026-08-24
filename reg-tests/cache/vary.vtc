@@ -235,12 +235,14 @@ haproxy h1 -conf {
                http-response set-header X-Cache-Hit %[res.cache_hit]
 
        cache my_cache
+               admission-filter off
                total-max-size 3
                max-age 20
                max-object-size 3072
                process-vary on
 
        cache no_vary_cache
+               admission-filter off
                total-max-size 3
                max-age 20
                max-object-size 3072
