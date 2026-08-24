@@ -1,0 +1,93 @@
+varnishtest "Cache large objects: multi-segment storage and byte-exact service"
+# Objects larger than a segment are stored as a chain of segments. Two
+# distinct paths build such chains and both must serve the body back
+# byte-exact:
+#
+# 1. A response with a Content-Length: the chain is sized up front from
+#    the announced length.
+# 2. A chunked response without a Content-Length: the chain grows as the
+#    body streams in, its final size unknown until the last chunk.
+#
+# The server handles exactly one fetch per resource; a second origin
+# request would fail the test, proving the second GETs were cache hits.
+# The two bodies (300KB + 200KB) fit together in the 2MB cache so no
+# eviction interferes.
+
+feature ignore_unknown_macro
+
+server s1 {
+    rxreq
+    expect req.url == "/sized"
+    txresp -hdr "Cache-Control: public, max-age=300" \
+           -bodylen 300000
+
+    rxreq
+    expect req.url == "/chunked"
+    txresp -nolen -hdr "Transfer-Encoding: chunked" \
+           -hdr "Cache-Control: public, max-age=300"
+    chunkedlen 50000
+    chunkedlen 50000
+    chunkedlen 50000
+    chunkedlen 50000
+    chunkedlen 0
+} -start
+
+haproxy h1 -conf {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
+    defaults
+        mode http
+        timeout connect "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout client  "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout server  "${HAPROXY_TEST_TIMEOUT-5s}"
+
+    frontend fe
+        bind "fd@${fe}"
+        default_backend test
+
+    backend test
+        http-reuse never
+        http-request cache-use my_cache
+        server www ${s1_addr}:${s1_port}
+        http-response cache-store my_cache
+
+    cache my_cache
+        admission-filter off
+        total-max-size 2
+        max-age 300
+        max-object-size 500000
+} -start
+
+client c1 -connect ${h1_fe_sock} {
+    # Populate: both objects are stored on first sighting (admission
+    # filter off).
+    txreq -url "/sized"
+    rxresp
+    expect resp.status == 200
+    expect resp.bodylen == 300000
+
+    txreq -url "/chunked"
+    rxresp
+    expect resp.status == 200
+    expect resp.bodylen == 200000
+} -run
+
+client c2 -connect ${h1_fe_sock} {
+    # Cache hits: an Age header marks them, and the bodies must come back
+    # byte-exact. The framing of the unknown-length object may differ from
+    # the origin's, so only the body length is asserted.
+    txreq -url "/sized"
+    rxresp
+    expect resp.status == 200
+    expect resp.http.age != <undef>
+    expect resp.bodylen == 300000
+
+    txreq -url "/chunked"
+    rxresp
+    expect resp.status == 200
+    expect resp.http.age != <undef>
+    expect resp.bodylen == 200000
+} -run

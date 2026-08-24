@@ -1,0 +1,97 @@
+varnishtest "Cache HTTP 103 Early Hints: replay on expiry and variant miss"
+# Hint entries deliberately outlive the response they came from: a 103 is
+# most valuable when the stored response has expired and an origin
+# round-trip is coming. Two scenarios are pinned here:
+#
+# 1. Revalidation: a stored response expires; the next fetch is a
+#    main-store miss whose hint entry is still fresh, so a 103 is replayed
+#    before the request is forwarded to the origin.
+# 2. Variant miss: a varying resource's anchor is found but the request's
+#    accepted encodings match no stored variant; the request goes to the
+#    origin, and the hints (keyed by the primary hash) replay for it too.
+
+feature ignore_unknown_macro
+
+server s1 -repeat 2 {
+    rxreq
+    expect req.url == "/reval"
+    txresp -hdr "Cache-Control: public, max-age=1" \
+           -hdr "Link: </reval.css>; rel=preload" \
+           -bodylen 100
+
+    rxreq
+    expect req.url == "/varied"
+    txresp -hdr "Cache-Control: public, max-age=60" \
+           -hdr "Vary: accept-encoding" \
+           -hdr "Content-Encoding: gzip" \
+           -hdr "Link: </varied.js>; rel=preload" \
+           -bodylen 100
+} -start
+
+haproxy h1 -conf {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
+    defaults
+        mode http
+        timeout connect "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout client  "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout server  "${HAPROXY_TEST_TIMEOUT-5s}"
+
+    frontend fe
+        bind "fd@${fe}"
+        default_backend test
+
+    backend test
+        http-reuse never
+        http-request cache-use my_cache
+        server www ${s1_addr}:${s1_port}
+        http-response cache-store my_cache
+
+    cache my_cache
+        admission-filter off
+        total-max-size 1
+        max-age 300
+        max-object-size 4096
+        process-vary on
+        early-hints on
+} -start
+
+client c1 -connect ${h1_fe_sock} {
+    # Populate: both responses and their hint entries are stored on the
+    # first sighting (admission filter off); no 103 on a fresh store.
+    txreq -url "/reval"
+    rxresp
+    expect resp.status == 200
+    txreq -url "/varied" -hdr "Accept-Encoding: gzip"
+    rxresp
+    expect resp.status == 200
+} -run
+
+# Let /reval expire (max-age=1). Its hint entry must survive the expiry.
+delay 2
+
+client c2 -connect ${h1_fe_sock} {
+    # Revalidation: the stored /reval response is expired, so this is a
+    # main-store miss with a fresh hint entry: 103 first, then the 200
+    # fetched from the origin.
+    txreq -url "/reval"
+    rxresphdrs
+    expect resp.status == 103
+    expect resp.http.link == "</reval.css>; rel=preload"
+    rxresp
+    expect resp.status == 200
+
+    # Variant miss: /varied is fresh and its anchor matches, but only a
+    # gzip variant is stored and this client accepts br alone, so the
+    # variant probe misses. The request goes to the origin and the hints
+    # replay for it as for any other miss.
+    txreq -url "/varied" -hdr "Accept-Encoding: br"
+    rxresphdrs
+    expect resp.status == 103
+    expect resp.http.link == "</varied.js>; rel=preload"
+    rxresp
+    expect resp.status == 200
+} -run
