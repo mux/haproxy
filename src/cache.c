@@ -93,7 +93,7 @@ struct cache_appctx {
 	const struct cache_entry *entry; /* Entry to be sent from cache. */
 	struct cache_rhandle handle;
 	size_t entry_size;               /* Total size of the entry data */
-	unsigned int sent;               /* The number of bytes already sent for this cache entry. */
+	size_t sent;                     /* The number of bytes already sent for this cache entry. */
 	unsigned int send_notmodified:1; /* In case of conditional request, we might want to send a "304 Not Modified" response instead of the stored data. */
 	unsigned int unused:31;
 };
@@ -1452,7 +1452,7 @@ static unsigned int htx_cache_dump_data_blk(struct appctx *appctx, struct htx *h
 	return total;
 }
 
-static size_t htx_cache_dump_msg(struct appctx *appctx, struct htx *htx, unsigned int len,
+static size_t htx_cache_dump_msg(struct appctx *appctx, struct htx *htx, size_t len,
 				 enum htx_blk_type mark)
 {
 	struct cache_appctx *ctx = appctx->svcctx;
@@ -1489,7 +1489,7 @@ static size_t htx_cache_dump_msg(struct appctx *appctx, struct htx *htx, unsigne
 	return total;
 }
 
-static size_t ff_cache_dump_msg(struct appctx *appctx, struct buffer *buf, unsigned int len)
+static size_t ff_cache_dump_msg(struct appctx *appctx, struct buffer *buf, size_t len)
 {
 	struct cache_appctx *ctx = appctx->svcctx;
 	struct cache *store = ctx->cache->store;
@@ -1501,7 +1501,7 @@ static size_t ff_cache_dump_msg(struct appctx *appctx, struct buffer *buf, unsig
 
 		ptr = cache_peek(store, &ctx->handle, &sz);
 		BUG_ON(!sz);
-		sz = MIN(sz, (size_t)len);
+		sz = MIN(sz, len);
 		added = b_putblk(buf, ptr, sz);
 		cache_seek(store, &ctx->handle, added, SEEK_CUR);
 		total += added;
@@ -2132,7 +2132,7 @@ int cfg_parse_cache(const char *file, int linenum, char **args, int kwm)
 			tmp_cache_config->max_secondary_entries = DEFAULT_MAX_SECONDARY_ENTRY;
 		}
 	} else if (strcmp(args[0], "total-max-size") == 0) {
-		unsigned long int maxsize;
+		unsigned long long maxsize, maxmb;
 		char *err;
 
 		if (alertif_too_many_args(1, file, linenum, args, &err_code)) {
@@ -2140,7 +2140,7 @@ int cfg_parse_cache(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 
-		maxsize = strtoul(args[1], &err, 10);
+		maxsize = strtoull(args[1], &err, 10);
 		if (err == args[1] || *err != '\0') {
 			ha_warning("parsing [%s:%d]: total-max-size wrong value '%s'\n",
 			           file, linenum, args[1]);
@@ -2148,16 +2148,22 @@ int cfg_parse_cache(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 
-		if (maxsize > (UINT_MAX >> 20)) {
-			ha_warning("parsing [%s:%d]: \"total-max-size\" (%s) must not be greater than %u\n",
-			           file, linenum, args[1], UINT_MAX >> 20);
+		/* Bounded by what a slot's location can address, and on 32-bit
+		 * platforms by what a size_t holds.
+		 */
+		maxmb = CACHE_MAX_TOTAL_SIZE / (1024 * 1024);
+		if (maxmb > (unsigned long long)SIZE_MAX / (1024 * 1024))
+			maxmb = (unsigned long long)SIZE_MAX / (1024 * 1024);
+
+		if (maxsize > maxmb) {
+			ha_warning("parsing [%s:%d]: \"total-max-size\" (%s) must not be greater than %llu\n",
+			           file, linenum, args[1], maxmb);
 			err_code |= ERR_ABORT;
 			goto out;
 		}
 
 		/* size in megabytes */
-		maxsize *= 1024 * 1024;
-		tmp_cache_config->total_size = maxsize;
+		tmp_cache_config->total_size = maxsize * 1024 * 1024;
 	} else if (strcmp(args[0], "max-age") == 0) {
 		if (alertif_too_many_args(1, file, linenum, args, &err_code)) {
 			err_code |= ERR_ABORT;
@@ -2172,7 +2178,7 @@ int cfg_parse_cache(const char *file, int linenum, char **args, int kwm)
 
 		tmp_cache_config->maxage = atoi(args[1]);
 	} else if (strcmp(args[0], "max-object-size") == 0) {
-		unsigned int maxobjsz;
+		unsigned long long maxobjsz;
 		char *err;
 
 		if (alertif_too_many_args(1, file, linenum, args, &err_code)) {
@@ -2186,9 +2192,16 @@ int cfg_parse_cache(const char *file, int linenum, char **args, int kwm)
 			err_code |= ERR_WARN;
 		}
 
-		maxobjsz = strtoul(args[1], &err, 10);
+		maxobjsz = strtoull(args[1], &err, 10);
 		if (err == args[1] || *err != '\0') {
 			ha_warning("parsing [%s:%d]: max-object-size wrong value '%s'\n",
+			           file, linenum, args[1]);
+			err_code |= ERR_ABORT;
+			goto out;
+		}
+
+		if (maxobjsz != (unsigned long long)(size_t)maxobjsz) {
+			ha_warning("parsing [%s:%d]: max-object-size too large '%s'\n",
 			           file, linenum, args[1]);
 			err_code |= ERR_ABORT;
 			goto out;

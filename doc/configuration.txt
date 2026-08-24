@@ -20657,8 +20657,10 @@ segment-size <bytes>
   from "total-max-size" and this setting rarely needs to be changed.
 
 total-max-size <megabytes>
-  Define the size in RAM of the cache in megabytes. This size is split in
-  blocks of 1kB which are used by the cache entries. Its maximum value is 4095.
+  Define the size in RAM of the cache in megabytes. Its maximum value is
+  134217728 (128 TB) on 64-bit platforms and 4095 on 32-bit ones. This bounds
+  the memory holding the responses; with "early-hints" enabled, the hints
+  cache adds its own size to it.
 
 
 6.2.2. Proxy section
