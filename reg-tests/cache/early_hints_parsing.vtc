@@ -4,11 +4,10 @@ varnishtest "Cache HTTP 103 Early Hints: Link header parsing"
 # http_next_hdr_value(). The point is to make the intended behaviour explicit so
 # a future relaxation of the parser cannot silently change hint detection.
 #
-# A 103 is emitted not only for hints entries but also when a *complete* entry
-# has expired: the lookup re-extracts the Link hints from the stale entry and
-# replays them before forwarding the request to the backend. We use that path
-# here (short max-age + a delay) to exercise the parser deterministically,
-# without depending on cache-capacity eviction.
+# Responses are served with max-age=1 while hint entries are kept for the
+# engine's maximum TTL, so after a short pause the second fetch of each URL
+# is a main-store miss with a live hint entry: the 103 replay is exercised
+# deterministically, without depending on eviction.
 #
 # Positive cases must yield a 103 carrying the hint-worthy Link value verbatim;
 # negative cases must yield no 103 at all (the 200 is then read directly, which
@@ -124,7 +123,8 @@ haproxy h1 -conf {
 } -start
 
 client c1 -connect ${h1_fe_sock} {
-    # Populate every variant; a fresh store never replays hints, so plain 200s.
+    # Populate: each first sighting stores the response and its hint
+    # entry, so plain 200s with no 103.
     txreq -url "/quoted"
     rxresp
     expect resp.status == 200
@@ -169,9 +169,11 @@ client c1 -connect ${h1_fe_sock} {
     expect resp.status == 200
 } -run
 
-# Let the entries expire (max-age=1) so the lookup takes the hint-replay path.
-delay 2
+# Let the responses expire; the hint entries outlive them.
+delay 1.5
 
+# Second round: main-store misses with live hint entries, so the hints
+# replay.
 client c2 -connect ${h1_fe_sock} {
     # Positive: a quoted, space-separated rel list is parsed via the quoted
     # value branch; the whole link-value is replayed verbatim in the 103.

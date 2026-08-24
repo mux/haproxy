@@ -3046,27 +3046,32 @@ show cli sockets
      [::1]:9999 operator 2
 
 show cache
-  List the configured caches and the objects stored in each cache tree.
+  List the configured caches and the objects stored in each of them.
+
+  The objects are listed per storage, each group preceded by a line naming it.
 
   $ echo 'show cache' | socat stdio /tmp/sock1
-  0x7f6ac6c5b03a: foobar (shctx:0x7f6ac6c5b000, available blocks:3918)
-         1          2             3                             4
+  0x7f6ac6c5b000: foobar (size:8388608)
+         1          2          3
 
-  1. pointer to the cache structure
-  2. cache name
-  3. pointer to the mmap area (shctx)
-  4. number of blocks available for reuse in the shctx
+  1. pointer to the storage
+  2. name of the storage: the name of the cache for its responses, and that
+     name followed by "-hints" for its early hints, which a cache keeping no
+     hints does not have
+  3. size configured for this storage, in bytes
 
-  0x7f6ac6c5b4cc hash:286881868 vary:0x0011223344556677 size:39114 (39 blocks), refcount:9, expire:237
-           1               2               3                    4        5            6           7
+  0x7f6ac6c5b4cc hash:0x8f14e45fceea167a5a36dedd4bea2543 vary:0x0011223344556677 size:39114 expire:237
+        1                           2                               3                4          5
 
   1. pointer to the cache entry
-  2. first 32 bits of the hash
+  2. hash of the entry's key
   3. secondary hash of the entry in case of vary
   4. size of the object in bytes
-  5. number of blocks used for the object
-  6. number of transactions using the entry
-  7. expiration time, can be negative if already expired
+  5. expiration time, can be negative if already expired
+
+  Entries holding early hints have no secondary hash. The listing is a
+  snapshot taken while the cache keeps running, so an entry being stored or
+  reclaimed as it is walked may be left out of it.
 
 show default-server [<backend>]
   Dump the list of default-server instances still present in a backend after

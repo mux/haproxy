@@ -20687,6 +20687,17 @@ process-vary <on/off>
   response is never delivered from the cache so that we can let the server
   decide how to handle the situation. The default value is off (disabled).
 
+segment-size <bytes>
+  Define the size of the segments the cache's storage is divided into.
+  Objects are packed into segments, and space is reclaimed one whole segment
+  at a time. Larger segments make reclamation less frequent and shorten the
+  chains of objects larger than a segment; smaller segments evict at a finer
+  grain and waste less space in partially filled segments, which every object
+  stored without a known length and every object larger than a segment leave
+  behind. The value must be a multiple of 8, no larger than 8388608 (8 MB),
+  and must divide "total-max-size" evenly. By default the size is derived
+  from "total-max-size" and this setting rarely needs to be changed.
+
 total-max-size <megabytes>
   Define the size in RAM of the cache in megabytes. This size is split in
   blocks of 1kB which are used by the cache entries. Its maximum value is 4095.
