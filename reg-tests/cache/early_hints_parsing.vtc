@@ -4,11 +4,11 @@ varnishtest "Cache HTTP 103 Early Hints: Link header parsing"
 # http_next_hdr_value(). The point is to make the intended behaviour explicit so
 # a future relaxation of the parser cannot silently change hint detection.
 #
-# A 103 is emitted not only for hints entries but also when a *complete* entry
-# has expired: the lookup re-extracts the Link hints from the stale entry and
-# replays them before forwarding the request to the backend. We use that path
-# here (short max-age + a delay) to exercise the parser deterministically,
-# without depending on cache-capacity eviction.
+# Hint entries are exempt from the admission filter, so the first sighting of
+# a response stores its hints while the response itself is not admitted to
+# the main store before its second sighting. A second fetch of each URL is
+# therefore a main-store miss with a fresh hint entry: the 103 replay is
+# exercised deterministically, without depending on expiry or eviction.
 #
 # Positive cases must yield a 103 carrying the hint-worthy Link value verbatim;
 # negative cases must yield no 103 at all (the 200 is then read directly, which
@@ -23,72 +23,72 @@ feature ignore_unknown_macro
 server s1 -repeat 2 {
     rxreq
     expect req.url == "/quoted"
-    txresp -hdr "Cache-Control: public, max-age=1" \
+    txresp -hdr "Cache-Control: public, max-age=60" \
            -hdr "Link: <a.css>; rel=\"preload prefetch\"" -bodylen 100
 
     rxreq
     expect req.url == "/valueless"
-    txresp -hdr "Cache-Control: public, max-age=1" \
+    txresp -hdr "Cache-Control: public, max-age=60" \
            -hdr "Link: <a.css>; crossorigin; rel=preload" -bodylen 100
 
     rxreq
     expect req.url == "/badws"
-    txresp -hdr "Cache-Control: public, max-age=1" \
+    txresp -hdr "Cache-Control: public, max-age=60" \
            -hdr "Link: <a.css>; rel = preload" -bodylen 100
 
     rxreq
     expect req.url == "/comma"
-    txresp -hdr "Cache-Control: public, max-age=1" \
+    txresp -hdr "Cache-Control: public, max-age=60" \
            -hdr "Link: <a.css>; rel=stylesheet, , <b.js>; rel=preload" -bodylen 100
 
     rxreq
     expect req.url == "/unquoted"
-    txresp -hdr "Cache-Control: public, max-age=1" \
+    txresp -hdr "Cache-Control: public, max-age=60" \
            -hdr "Link: <a.css>; rel=preload prefetch" -bodylen 100
 
     rxreq
     expect req.url == "/nonhint"
-    txresp -hdr "Cache-Control: public, max-age=1" \
+    txresp -hdr "Cache-Control: public, max-age=60" \
            -hdr "Link: <a.css>; rel=stylesheet" -bodylen 100
 
     rxreq
     expect req.url == "/dup-first"
-    txresp -hdr "Cache-Control: public, max-age=1" \
+    txresp -hdr "Cache-Control: public, max-age=60" \
            -hdr "Link: <a.css>; rel=preload; rel=stylesheet" -bodylen 100
 
     rxreq
     expect req.url == "/dup-second"
-    txresp -hdr "Cache-Control: public, max-age=1" \
+    txresp -hdr "Cache-Control: public, max-age=60" \
            -hdr "Link: <a.css>; rel=stylesheet; rel=preload" -bodylen 100
 
     rxreq
     expect req.url == "/qpair"
-    txresp -hdr "Cache-Control: public, max-age=1" \
+    txresp -hdr "Cache-Control: public, max-age=60" \
            -hdr {Link: <a.css>; title="foo \"bar\""; rel=preload} -bodylen 100
 
     rxreq
     expect req.url == "/qpair-resync"
-    txresp -hdr "Cache-Control: public, max-age=1" \
+    txresp -hdr "Cache-Control: public, max-age=60" \
            -hdr {Link: </a>; title="x\"; rel=preload; y=\"z"} -bodylen 100
 
     rxreq
     expect req.url == "/multi"
-    txresp -hdr "Cache-Control: public, max-age=1" \
+    txresp -hdr "Cache-Control: public, max-age=60" \
            -hdr "Link: <a.css>; rel=preload, <b.js>; rel=prefetch" -bodylen 100
 
     rxreq
     expect req.url == "/modulepreload"
-    txresp -hdr "Cache-Control: public, max-age=1" \
+    txresp -hdr "Cache-Control: public, max-age=60" \
            -hdr "Link: <m.js>; rel=modulepreload" -bodylen 100
 
     rxreq
     expect req.url == "/dns-prefetch"
-    txresp -hdr "Cache-Control: public, max-age=1" \
+    txresp -hdr "Cache-Control: public, max-age=60" \
            -hdr "Link: <https://cdn.example>; rel=dns-prefetch" -bodylen 100
 
     rxreq
     expect req.url == "/comma-uri"
-    txresp -hdr "Cache-Control: public, max-age=1" \
+    txresp -hdr "Cache-Control: public, max-age=60" \
            -hdr "Link: </a,b.css>; rel=preload" -bodylen 100
 } -start
 
@@ -120,11 +120,13 @@ haproxy h1 -conf {
         total-max-size 1
         max-age 300
         max-object-size 4096
+        admission-filter on min-size 1
         early-hints on
 } -start
 
 client c1 -connect ${h1_fe_sock} {
-    # Populate every variant; a fresh store never replays hints, so plain 200s.
+    # Populate: each first sighting stores the hint entry but not the
+    # response (admission filter), so plain 200s with no 103.
     txreq -url "/quoted"
     rxresp
     expect resp.status == 200
@@ -169,8 +171,8 @@ client c1 -connect ${h1_fe_sock} {
     expect resp.status == 200
 } -run
 
-# Let the entries expire (max-age=1) so the lookup takes the hint-replay path.
-delay 2
+# Second round: main-store misses (the first sightings were not admitted)
+# with fresh hint entries, so the hints replay.
 
 client c2 -connect ${h1_fe_sock} {
     # Positive: a quoted, space-separated rel list is parsed via the quoted
