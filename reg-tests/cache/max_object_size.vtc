@@ -1,0 +1,86 @@
+varnishtest "Cache max-object-size: oversized responses are served but never stored"
+# Two refusal paths must both leave the client stream untouched:
+#
+# 1. A response with a Content-Length above max-object-size: the size is
+#    known up front and storage is refused before it starts.
+# 2. A chunked response with no Content-Length whose body grows past
+#    max-object-size mid-stream: storage begins, then is aborted once the
+#    accumulated body exceeds the cap.
+#
+# In both cases the client must receive the complete body byte-exact and
+# the object must never land in the cache: with the admission filter off a
+# cacheable response is stored on first sighting, so a second fetch
+# reaching the origin proves the refusal. The server expects the same
+# request sequence on each of its two connections; a cache hit would
+# desynchronize it and fail the test. The 64KB bodies sit well above the
+# 16KB cap, far from any headers-plus-metadata boundary effect.
+
+feature ignore_unknown_macro
+
+server s1 -repeat 2 {
+    rxreq
+    expect req.url == "/sized"
+    txresp -hdr "Cache-Control: public, max-age=300" \
+           -bodylen 65536
+
+    rxreq
+    expect req.url == "/chunked"
+    txresp -nolen -hdr "Transfer-Encoding: chunked" \
+           -hdr "Cache-Control: public, max-age=300"
+    chunkedlen 8192
+    chunkedlen 8192
+    chunkedlen 8192
+    chunkedlen 8192
+    chunkedlen 8192
+    chunkedlen 8192
+    chunkedlen 8192
+    chunkedlen 8192
+    chunkedlen 0
+} -start
+
+haproxy h1 -conf {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
+    defaults
+        mode http
+        timeout connect "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout client  "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout server  "${HAPROXY_TEST_TIMEOUT-5s}"
+
+    frontend fe
+        bind "fd@${fe}"
+        default_backend test
+
+    backend test
+        # Force one fresh backend connection per client session so server
+        # -repeat 2 sees each fetch round on its own connection.
+        http-reuse never
+        http-request cache-use my_cache
+        server www ${s1_addr}:${s1_port}
+        http-response cache-store my_cache
+
+    cache my_cache
+        admission-filter off
+        total-max-size 1
+        max-age 300
+        max-object-size 16384
+} -start
+
+client c1 -connect ${h1_fe_sock} {
+    # Both fetch rounds must come from the origin; the absence of an Age
+    # header confirms no response was served from the cache.
+    txreq -url "/sized"
+    rxresp
+    expect resp.status == 200
+    expect resp.http.age == <undef>
+    expect resp.bodylen == 65536
+
+    txreq -url "/chunked"
+    rxresp
+    expect resp.status == 200
+    expect resp.http.age == <undef>
+    expect resp.bodylen == 65536
+} -repeat 2 -run
