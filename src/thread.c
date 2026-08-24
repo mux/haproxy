@@ -506,6 +506,7 @@ const char *lock_label(enum lock_label label)
 	case QC_CID_LOCK:          return "QC_CID";
 	case CACHE_LOCK:           return "CACHE";
 	case CACHE_TTLB_LOCK:      return "CACHE_TTLB";
+	case CACHE_VARY_LOCK:      return "CACHE_VARY";
 	case GUID_LOCK:            return "GUID";
 	case PROXIES_DEL_LOCK:     return "PROXIES_DEL";
 	case OTHER_LOCK:           return "OTHER";

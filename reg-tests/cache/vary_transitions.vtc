@@ -1,0 +1,104 @@
+varnishtest "Plain and Vary responses replace one another across separate stores"
+
+feature ignore_unknown_macro
+
+server s1 {
+    rxreq
+    expect req.url == "/transition"
+    txresp -hdr "Cache-Control: max-age=1" -bodylen 21
+
+    rxreq
+    expect req.url == "/transition"
+    expect req.http.origin == "https://a.example"
+    txresp -hdr "Cache-Control: max-age=60" -hdr "Vary: Origin" -bodylen 23
+
+    rxreq
+    expect req.url == "/transition"
+    expect req.http.origin == "https://b.example"
+    txresp -hdr "Cache-Control: max-age=60" -bodylen 25
+
+    rxreq
+    expect req.url == "/transition"
+    expect req.method == "POST"
+    txresp -body ""
+
+    rxreq
+    expect req.url == "/transition"
+    expect req.http.origin == "https://a.example"
+    txresp -hdr "Cache-Control: max-age=60" -hdr "Vary: Origin" -bodylen 27
+} -start
+
+haproxy h1 -conf {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+        nbthread 1
+    .endif
+        tune.idle-pool.shared off
+
+    defaults
+        mode http
+        timeout connect "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout client "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout server "${HAPROXY_TEST_TIMEOUT-5s}"
+
+    frontend fe
+        bind "fd@${fe}"
+        default_backend test
+
+    backend test
+        http-request cache-use my_cache
+        server www ${s1_addr}:${s1_port}
+        http-response cache-store my_cache
+        http-response set-header X-Cache-Hit %[res.cache_hit]
+
+    cache my_cache
+        total-max-size 1
+        max-age 3600
+        process-vary on
+} -start
+
+client c1 -connect ${h1_fe_sock} {
+    txreq -url "/transition"
+    rxresp
+    expect resp.bodylen == 21
+    expect resp.http.X-Cache-Hit == 0
+
+    # After the plain response expires, establish a varying family.
+    delay 2
+    txreq -url "/transition" -hdr "Origin: https://a.example"
+    rxresp
+    expect resp.bodylen == 23
+    expect resp.http.X-Cache-Hit == 0
+
+    txreq -url "/transition" -hdr "Origin: https://a.example"
+    rxresp
+    expect resp.bodylen == 23
+    expect resp.http.X-Cache-Hit == 1
+
+    # An uncached Origin yields a plain response. It replaces the family.
+    txreq -url "/transition" -hdr "Origin: https://b.example"
+    rxresp
+    expect resp.bodylen == 25
+    expect resp.http.X-Cache-Hit == 0
+
+    txreq -url "/transition" -hdr "Origin: https://a.example"
+    rxresp
+    expect resp.bodylen == 25
+    expect resp.http.X-Cache-Hit == 1
+
+    txreq -method POST -url "/transition" -body ""
+    rxresp
+    expect resp.status == 200
+
+    # Both stores were invalidated; the old Origin A response cannot return.
+    txreq -url "/transition" -hdr "Origin: https://a.example"
+    rxresp
+    expect resp.bodylen == 27
+    expect resp.http.X-Cache-Hit == 0
+
+    txreq -url "/transition" -hdr "Origin: https://a.example"
+    rxresp
+    expect resp.bodylen == 27
+    expect resp.http.X-Cache-Hit == 1
+} -run

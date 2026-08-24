@@ -1,0 +1,50 @@
+varnishtest "Vary anchor cache size configuration"
+
+feature ignore_unknown_macro
+
+shell {
+    cat > ${tmpdir}/vary-size.cfg << EOF
+global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
+defaults
+    mode http
+    timeout connect 5s
+    timeout client 5s
+    timeout server 5s
+
+cache my_cache
+    total-max-size 1
+    process-vary on
+    vary-cache-size 65536
+EOF
+    $HAPROXY_PROGRAM -c -f ${tmpdir}/vary-size.cfg
+
+    for size in bogus 0 4096 65537; do
+        sed "s/vary-cache-size 65536/vary-cache-size $size/" \
+            ${tmpdir}/vary-size.cfg > ${tmpdir}/vary-size-bad.cfg
+        if out=$($HAPROXY_PROGRAM -c -f ${tmpdir}/vary-size-bad.cfg 2>&1); then
+            echo "accepted invalid vary-cache-size $size"
+            exit 1
+        fi
+        printf '%s\n' "$out" | grep -q 'vary-cache-size wrong value'
+    done
+
+    sed 's/process-vary on/process-vary off/' ${tmpdir}/vary-size.cfg \
+        > ${tmpdir}/vary-size-off.cfg
+    if out=$($HAPROXY_PROGRAM -c -f ${tmpdir}/vary-size-off.cfg 2>&1); then
+        echo 'accepted vary-cache-size without process-vary'
+        exit 1
+    fi
+    printf '%s\n' "$out" | grep -q 'requires "process-vary on" and a response cache'
+
+    cp ${tmpdir}/vary-size.cfg ${tmpdir}/vary-size-only.cfg
+    echo '    early-hints only' >> ${tmpdir}/vary-size-only.cfg
+    if out=$($HAPROXY_PROGRAM -c -f ${tmpdir}/vary-size-only.cfg 2>&1); then
+        echo 'accepted vary-cache-size with early-hints only'
+        exit 1
+    fi
+    printf '%s\n' "$out" | grep -q 'requires "process-vary on" and a response cache'
+}
