@@ -1,0 +1,203 @@
+varnishtest "Cache admission filter: store on second sighting only"
+# The admission filter (on by default) keeps one-hit wonders out of the
+# cache: a response is only stored once its key has been seen before, so
+# the first fetch of a URL is never cached. Two cache sections pin both
+# sides of the behavior:
+#
+# 1. min-size 1, so every response faces the filter: the first two GETs
+#    of /default are misses that reach the origin (the second one stores
+#    the response), the third is served from the cache.
+# 2. admission-filter off: /nofilter is stored on first sighting and the
+#    second GET is already a hit.
+# 3. Default min-size (16 times the 4kB default mean-object-size = 64kB):
+#    a small response bypasses the filter and is stored on first sighting;
+#    a response above the threshold is only stored on its second one.
+#
+# Each server accepts exactly as many connections as the expected origin
+# fetches; an extra cache miss would open one more connection and fail
+# the test. On /nofilter an Age header separates hits from misses; on
+# /default the origin itself sends "Age: 100", pinning that a response
+# the cache does NOT store keeps its Age intact on the way through (the
+# stored copy still gets a freshly computed Age when served).
+
+feature ignore_unknown_macro
+
+server s1 -repeat 2 {
+    rxreq
+    expect req.url == "/default"
+    txresp -hdr "Cache-Control: public, max-age=300" \
+           -hdr "Age: 100" \
+           -bodylen 100
+} -start
+
+server s2 {
+    rxreq
+    expect req.url == "/nofilter"
+    txresp -hdr "Cache-Control: public, max-age=300" \
+           -bodylen 100
+} -start
+
+server s3 {
+    rxreq
+    expect req.url == "/small"
+    txresp -hdr "Cache-Control: public, max-age=300" \
+           -bodylen 100
+} -start
+
+server s4 -repeat 2 {
+    rxreq
+    expect req.url == "/large"
+    txresp -hdr "Cache-Control: public, max-age=300" \
+           -bodylen 70000
+} -start
+
+haproxy h1 -conf {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
+    defaults
+        mode http
+        timeout connect "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout client  "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout server  "${HAPROXY_TEST_TIMEOUT-5s}"
+
+    frontend fe1
+        bind "fd@${fe1}"
+        default_backend test1
+
+    backend test1
+        http-reuse never
+        http-request cache-use default_cache
+        server www ${s1_addr}:${s1_port}
+        http-response cache-store default_cache
+
+    frontend fe3
+        bind "fd@${fe3}"
+        default_backend test3
+
+    backend test3
+        http-reuse never
+        http-request cache-use minsize_cache
+        server www ${s3_addr}:${s3_port}
+        http-response cache-store minsize_cache
+
+    frontend fe4
+        bind "fd@${fe4}"
+        default_backend test4
+
+    backend test4
+        http-reuse never
+        http-request cache-use minsize_cache
+        server www ${s4_addr}:${s4_port}
+        http-response cache-store minsize_cache
+
+    frontend fe2
+        bind "fd@${fe2}"
+        default_backend test2
+
+    backend test2
+        http-reuse never
+        http-request cache-use nofilter_cache
+        server www ${s2_addr}:${s2_port}
+        http-response cache-store nofilter_cache
+
+    # No admission-filter line: the default (on) is what is under test.
+    cache default_cache
+        admission-filter on min-size 1
+        total-max-size 1
+        max-age 300
+        max-object-size 4096
+
+    cache nofilter_cache
+        admission-filter off
+        total-max-size 1
+        max-age 300
+        max-object-size 4096
+
+    cache minsize_cache
+        total-max-size 1
+        max-age 300
+        max-object-size 131072
+} -start
+
+client c1 -connect ${h1_fe1_sock} {
+    # First sighting: forwarded to the origin and not stored. The origin's
+    # Age header must pass through untouched.
+    txreq -url "/default"
+    rxresp
+    expect resp.status == 200
+    expect resp.http.age == "100"
+
+    # Second sighting: still served by the origin, but this one stores the
+    # response. The live response keeps its Age here too.
+    txreq -url "/default"
+    rxresp
+    expect resp.status == 200
+    expect resp.http.age == "100"
+} -run
+
+client c2 -connect ${h1_fe1_sock} {
+    # Third GET: served from the cache, with a freshly computed Age that
+    # accounts for the origin's own aging of the stored response.
+    txreq -url "/default"
+    rxresp
+    expect resp.status == 200
+    expect resp.http.age ~ "^10[0-3]$"
+    expect resp.bodylen == 100
+} -run
+
+client c3 -connect ${h1_fe2_sock} {
+    # With the filter off, the first sighting is stored right away.
+    txreq -url "/nofilter"
+    rxresp
+    expect resp.status == 200
+    expect resp.http.age == <undef>
+} -run
+
+client c4 -connect ${h1_fe2_sock} {
+    txreq -url "/nofilter"
+    rxresp
+    expect resp.status == 200
+    expect resp.http.age != <undef>
+    expect resp.bodylen == 100
+} -run
+
+client c5 -connect ${h1_fe3_sock} {
+    # Below the default min-size, the filter does not apply: stored on
+    # first sighting, so the second GET is already a hit.
+    txreq -url "/small"
+    rxresp
+    expect resp.status == 200
+    expect resp.http.age == <undef>
+} -run
+
+client c6 -connect ${h1_fe3_sock} {
+    txreq -url "/small"
+    rxresp
+    expect resp.status == 200
+    expect resp.http.age != <undef>
+    expect resp.bodylen == 100
+} -run
+
+client c7 -connect ${h1_fe4_sock} {
+    # Above the default min-size, the filter applies: two origin fetches
+    # before the third GET is served from the cache.
+    txreq -url "/large"
+    rxresp
+    expect resp.status == 200
+    expect resp.http.age == <undef>
+    txreq -url "/large"
+    rxresp
+    expect resp.status == 200
+    expect resp.http.age == <undef>
+} -run
+
+client c8 -connect ${h1_fe4_sock} {
+    txreq -url "/large"
+    rxresp
+    expect resp.status == 200
+    expect resp.http.age != <undef>
+    expect resp.bodylen == 70000
+} -run

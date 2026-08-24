@@ -1,0 +1,109 @@
+varnishtest "Cache segment-size option"
+# The "segment-size" cache option sets the size in bytes of the fixed
+# segments the cache storage is carved into. Its config-time contract:
+#
+# 1. A value that divides total-max-size evenly is accepted.
+# 2. A value that does not divide total-max-size evenly is rejected by a
+#    fatal post-parse alert.
+# 3. A value that is not a number at all fails parsing.
+#
+# A last leg runs a haproxy with an explicit valid segment-size and
+# max-object-size and checks that a cacheable response is served from the
+# cache on its second fetch.
+
+feature ignore_unknown_macro
+
+shell {
+    set -e
+
+    cat << EOF > ${tmpdir}/segsize_ok.cfg
+global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
+defaults
+    mode http
+    timeout connect 5s
+    timeout client 5s
+    timeout server 5s
+
+cache my_cache
+    total-max-size 4
+    segment-size 32768
+EOF
+
+    # 32768 divides 4MB evenly: the config check must pass.
+    $HAPROXY_PROGRAM -f ${tmpdir}/segsize_ok.cfg -c
+
+    # 100000 does not divide 4MB: the post-parse alert is fatal.
+    sed 's/32768/100000/' ${tmpdir}/segsize_ok.cfg > ${tmpdir}/segsize_baddiv.cfg
+    set +e
+    out=$($HAPROXY_PROGRAM -f ${tmpdir}/segsize_baddiv.cfg -c 2>&1)
+    ret=$?
+    set -e
+    echo "$out"
+    [ $ret -ne 0 ]
+    echo "$out" | grep -q 'must divide "total-max-size" evenly'
+
+    # A non-numeric value must fail parsing.
+    sed 's/32768/bogus/' ${tmpdir}/segsize_ok.cfg > ${tmpdir}/segsize_garbage.cfg
+    set +e
+    out=$($HAPROXY_PROGRAM -f ${tmpdir}/segsize_garbage.cfg -c 2>&1)
+    ret=$?
+    set -e
+    echo "$out"
+    [ $ret -ne 0 ]
+    echo "$out" | grep -q "segment-size wrong value 'bogus'"
+}
+
+server s1 {
+    rxreq
+    txresp -hdr "Cache-Control: public, max-age=60" \
+        -bodylen 500
+} -start
+
+haproxy h1 -conf {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
+    defaults
+        mode http
+        timeout connect "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout client  "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout server  "${HAPROXY_TEST_TIMEOUT-5s}"
+
+    frontend fe
+        bind "fd@${fe}"
+        default_backend test
+
+    backend test
+        http-request cache-use my_cache
+        server www ${s1_addr}:${s1_port}
+        http-response cache-store my_cache
+
+    cache my_cache
+        admission-filter off
+        total-max-size 1
+        max-age 60
+        max-object-size 16384
+        segment-size 16384
+} -start
+
+client c1 -connect ${h1_fe_sock} {
+    txreq
+    rxresp
+    expect resp.status == 200
+    expect resp.bodylen == 500
+
+    # Second fetch must be served from the cache: the response carries an
+    # Age header and the origin, which accepts a single request, is not
+    # contacted again.
+    txreq
+    rxresp
+    expect resp.status == 200
+    expect resp.bodylen == 500
+    expect resp.http.age != <undef>
+} -run

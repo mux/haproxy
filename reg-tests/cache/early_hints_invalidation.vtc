@@ -1,0 +1,99 @@
+varnishtest "Cache HTTP 103 Early Hints: unsafe method invalidates hint entries"
+# A successful unsafe method (RFC7234#4.4) must invalidate the hint entry
+# along with the stored response. The admission filter is left at its
+# default (on) so the 103 is observable without expiry games: the first
+# sighting stores the hint entry but not the response, making the second
+# fetch a main-store miss with a fresh hint entry, hence a replayed 103.
+# After a successful POST on the same URL, both entries are gone: the next
+# fetch must get no 103 and must reach the origin.
+
+feature ignore_unknown_macro
+
+# All four requests must reach the origin; a cache hit on the last GET
+# would leave the server script incomplete and fail the test.
+server s1 {
+    rxreq
+    expect req.method == "GET"
+    txresp -hdr "Cache-Control: public, max-age=300" \
+           -hdr "Link: </style.css>; rel=preload" \
+           -bodylen 100
+
+    rxreq
+    expect req.method == "GET"
+    txresp -hdr "Cache-Control: public, max-age=300" \
+           -hdr "Link: </style.css>; rel=preload" \
+           -bodylen 100
+
+    rxreq
+    expect req.method == "POST"
+    txresp
+
+    rxreq
+    expect req.method == "GET"
+    txresp -hdr "Cache-Control: public, max-age=300" \
+           -hdr "Link: </style.css>; rel=preload" \
+           -bodylen 100
+} -start
+
+haproxy h1 -conf {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
+    defaults
+        mode http
+        timeout connect "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout client  "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout server  "${HAPROXY_TEST_TIMEOUT-5s}"
+
+    frontend fe
+        bind "fd@${fe}"
+        default_backend test
+
+    backend test
+        http-reuse never
+        http-request cache-use my_cache
+        server www ${s1_addr}:${s1_port}
+        http-response cache-store my_cache
+
+    # admission-filter min-size 1: a response is only stored on its second
+    # sighting, hint entries right away.
+    cache my_cache
+        total-max-size 1
+        max-age 300
+        max-object-size 4096
+        admission-filter on min-size 1
+        early-hints on
+} -start
+
+client c1 -connect ${h1_fe_sock} {
+    # First sighting: the hint entry is stored, the response is not
+    # admitted yet, and no 103 precedes a fresh store.
+    txreq -url "/page"
+    rxresp
+    expect resp.status == 200
+
+    # Second sighting: a main-store miss with a fresh hint entry, so a 103
+    # replays before the origin 200 (which is stored this time).
+    txreq -url "/page"
+    rxresphdrs
+    expect resp.status == 103
+    expect resp.http.link == "</style.css>; rel=preload"
+    rxresp
+    expect resp.status == 200
+
+    # A successful unsafe method on the URL invalidates the stored
+    # response and its hint entry alike.
+    txreq -method "POST" -url "/page" -body "submit"
+    rxresp
+    expect resp.status == 200
+
+    # No 103 must precede this response (rxresp would see it instead of
+    # the 200), and the request must reach the origin since the stored
+    # response is gone too.
+    txreq -url "/page"
+    rxresp
+    expect resp.status == 200
+    expect resp.http.age == <undef>
+} -run
