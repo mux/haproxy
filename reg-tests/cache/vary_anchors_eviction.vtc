@@ -60,5 +60,10 @@ shell {
         exit 1
     fi
 
-
+    stats=$(echo "show cache stats" | socat -t 5 "${tmpdir}/h1/stats" -)
+    evicted=$(printf '%s\n' "$stats" | awk '/^my_cache.segs_evicted:/ { print $2 }')
+    test "$evicted" -gt 0
+    printf '%s\n' "$stats" | grep -q '^my_cache-anchors.segs_evicted: 0$'
+    printf '%s\n' "$stats" | grep -q '^my_cache-anchors.reserve_fails: 0$'
+    printf '%s\n' "$stats" | grep -q '^my_cache-anchors.publish_fails: 0$'
 }
