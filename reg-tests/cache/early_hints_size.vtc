@@ -1,6 +1,5 @@
-varnishtest "Cache early-hints ratio: hints survive main-store eviction"
-# "early-hints on ratio N" sizes a separate hints cache at N% of
-# total-max-size. Hint entries live there and are never candidates for the
+varnishtest "Cache early-hints size: hints survive main-store eviction"
+# "early-hints on size N" sizes a separate hints cache of N bytes. Hint entries live there and are never candidates for the
 # main store's eviction. Storing thirteen 400KB bodies into a 1MB cache can
 # keep only the last two responses, but all thirteen hint entries must
 # survive: thirteen tiny records easily fit the 1% hints cache.
@@ -46,7 +45,7 @@ haproxy h1 -conf {
         total-max-size 1
         max-age 300
         max-object-size 500000
-        early-hints on ratio 1
+        early-hints on size 16384
 } -start
 
 
@@ -65,12 +64,12 @@ shell {
     full=$(echo "$entries" | grep -c " vary:0x")
 
     if [ "$hints" -ne 13 ]; then
-        echo "ratio test: expected 13 hint entries, got $hints"
+        echo "size test: expected 13 hint entries, got $hints"
         echo "$out"
         exit 1
     fi
     if [ "$full" -ne 2 ]; then
-        echo "ratio test: expected 2 full entries, got $full"
+        echo "size test: expected 2 full entries, got $full"
         echo "$out"
         exit 1
     fi
