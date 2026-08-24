@@ -21296,13 +21296,11 @@ early-hints <on/off/only> [ratio <integer>]
   this mode, the "max-object-size" limit does not apply: hints are extracted
   and stored regardless of the response's size.
 
-  The optional "ratio" argument sets the percentage of total cache blocks
-  that may be reserved for hints-only entries (1 to 99, default 25). Higher
-  values keep hints alive longer at the cost of less space for full responses;
-  lower values prioritize full responses. This argument only makes sense when
-  "early-hints" is set to on, and is ignored otherwise. In "only" mode every
-  stored entry is a hints entry, so the whole cache is available to them and
-  this ratio has no practical effect.
+  The optional "ratio" argument sizes the separate hints arena as a percentage
+  of "total-max-size" (1 to 99, default 25). Its memory is additional to the
+  response arena, so hint records do not compete with responses for blocks.
+  The configured fraction also sizes the hints arena in "only" mode, where no
+  response arena is created.
 
 max-age <seconds>
   Define the maximum expiration duration. The expiration is set as the lowest
@@ -21317,9 +21315,11 @@ max-object-size <bytes>
   All objects with sizes larger than "max-object-size" will not be cached.
 
 max-secondary-entries <number>
-  Define the maximum number of simultaneous secondary entries with the same primary
-  key in the cache. This needs the vary support to be enabled. Its default value is 10
-  and should be passed a strictly positive integer.
+  Limit the coding-mask directory of a Vary anchor when the response varies on
+  Accept-Encoding. The value must be positive, defaults to 10, and larger
+  values are clamped to 10 with a warning. This does not impose a total count
+  limit on variants differing in Origin or Referer; those remain bounded by
+  arena and index capacity. Vary processing must be enabled.
 
 process-vary <on/off>
   Enable or disable the processing of the Vary header. When disabled, a response
@@ -21334,9 +21334,42 @@ process-vary <on/off>
   response is never delivered from the cache so that we can let the server
   decide how to handle the situation. The default value is off (disabled).
 
+  Vary routing metadata is stored in a separate cache instance so response
+  storage pressure does not evict whole segments of URL anchors. Its memory
+  budget is controlled by "vary-cache-size". Plain response hits retain the
+  direct primary-key lookup path and do not consult this metadata store.
+
+vary-cache-size <bytes>
+  Set the arena size of the separate Vary anchor cache. This requires
+  "process-vary on" and is not accepted with "early-hints only". The memory
+  comes in addition to "total-max-size" and defaults to 1% of it, rounded
+  down to a multiple of 4096 bytes, with a minimum of 65536 bytes. An explicit
+  value must be at least 65536 and a multiple of 4096.
+
+  Anchors are fixed-size records stored in 4096-byte segments. Their index is
+  sized independently for these small objects and consumes additional memory.
+  Segment merging is disabled for this store; "segment-size" configures only
+  the response store. The anchor cache appears as "<cache-name>-anchors" in
+  "show cache".
+
+  An evicted anchor makes its URL's variants unreachable until new responses
+  populate a new family. Increase this budget if the anchor store experiences
+  excessive eviction or reservation/publication failures.
+
+segment-size <bytes>
+  Define the size of the segments the cache's storage is divided into.
+  Objects are packed into segments, and space is reclaimed one whole segment
+  at a time. Larger segments make reclamation less frequent and shorten the
+  chains of objects larger than a segment; smaller segments evict at a finer
+  grain and waste less space in partially filled segments, which every object
+  stored without a known length and every object larger than a segment leave
+  behind. The value must be a multiple of 8, no larger than 8388608 (8 MB),
+  and must divide "total-max-size" evenly. By default the size is derived
+  from "total-max-size" and this setting rarely needs to be changed.
+
 total-max-size <megabytes>
-  Define the size in RAM of the cache in megabytes. This size is split in
-  blocks of 1kB which are used by the cache entries. Its maximum value is 4095.
+  Define the size in RAM of the cache in megabytes. Its maximum value is
+  4095. Storage is divided into segments rather than 1 kB blocks.
 
 
 6.2.2. Proxy section

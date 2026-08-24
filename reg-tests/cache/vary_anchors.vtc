@@ -1,0 +1,183 @@
+varnishtest "Vary anchors use separate storage and invalidate entire families"
+
+feature ignore_unknown_macro
+feature cmd "command -v socat"
+
+server s1 {
+    rxreq
+    expect req.url == "/variants"
+    expect req.http.accept-encoding == "gzip"
+    txresp -hdr "Vary: Accept-Encoding" -hdr "Content-Encoding: gzip" \
+        -hdr "Cache-Control: max-age=60" -hdr "Link: </style.css>; rel=preload" -bodylen 11
+
+    rxreq
+    expect req.url == "/variants"
+    expect req.http.accept-encoding == "br"
+    txresp -hdr "Vary: Accept-Encoding" -hdr "Content-Encoding: br" \
+        -hdr "Cache-Control: max-age=300" -hdr "Link: </style.css>; rel=preload" -bodylen 13
+
+    rxreq
+    expect req.url == "/plain"
+    txresp -hdr "Cache-Control: max-age=60" -bodylen 7
+
+    rxreq
+    expect req.url == "/variants"
+    expect req.method == "POST"
+    txresp -body ""
+
+    rxreq
+    expect req.url == "/variants"
+    expect req.http.accept-encoding == "gzip"
+    txresp -hdr "Vary: Accept-Encoding" -hdr "Content-Encoding: gzip" \
+        -hdr "Cache-Control: max-age=60" -bodylen 17
+
+    rxreq
+    expect req.url == "/variants"
+    expect req.http.accept-encoding == "br"
+    txresp -hdr "Vary: Accept-Encoding" -hdr "Content-Encoding: br" \
+        -hdr "Cache-Control: max-age=60" -bodylen 19
+} -start
+
+haproxy h1 -conf {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+        nbthread 1
+    .endif
+        tune.idle-pool.shared off
+        stats socket "${tmpdir}/h1/stats" level admin
+
+    defaults
+        mode http
+        timeout connect "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout client "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout server "${HAPROXY_TEST_TIMEOUT-5s}"
+
+    frontend fe
+        bind "fd@${fe}"
+        default_backend test
+
+    backend test
+        http-reuse always
+        http-request cache-use my_cache no-early-hints
+        server www ${s1_addr}:${s1_port}
+        http-response cache-store my_cache
+        http-response set-header X-Cache-Hit %[res.cache_hit]
+
+    cache my_cache
+        total-max-size 1
+        segment-size 16384
+        max-age 3600
+        process-vary on
+        vary-cache-size 65536
+        early-hints on ratio 2
+} -start
+
+client c1 -connect ${h1_fe_sock} {
+    txreq -url "/variants" -hdr "Accept-Encoding: gzip"
+    rxresp
+    expect resp.bodylen == 11
+    expect resp.http.X-Cache-Hit == 0
+
+    # Compatible encoding requests still share the stored gzip response.
+    txreq -url "/variants" -hdr "Accept-Encoding: gzip, br"
+    rxresp
+    expect resp.bodylen == 11
+    expect resp.http.X-Cache-Hit == 1
+} -run
+
+shell {
+    sleep 0.1
+    out=$(echo "show cache" | socat -t 5 "${tmpdir}/h1/stats" -)
+    # The initial anchor follows the response's 60s TTL, not the cache's 3600s.
+    expiry=$(printf '%s\n' "$out" | awk '
+        /: my_cache-anchors / { anchors=1; next }
+        /^0x.*: / { anchors=0 }
+        anchors && / hash:0x/ {
+            sub(/.* expire:/, ""); print; exit
+        }')
+    test "$expiry" -gt 45 && test "$expiry" -le 60
+}
+
+client c2 -connect ${h1_fe_sock} {
+    txreq -url "/variants" -hdr "Accept-Encoding: br"
+    rxresp
+    expect resp.bodylen == 13
+    expect resp.http.X-Cache-Hit == 0
+
+    txreq -url "/variants" -hdr "Accept-Encoding: gzip"
+    rxresp
+    expect resp.bodylen == 11
+    expect resp.http.X-Cache-Hit == 1
+
+    txreq -url "/variants" -hdr "Accept-Encoding: br"
+    rxresp
+    expect resp.bodylen == 13
+    expect resp.http.X-Cache-Hit == 1
+
+    txreq -url "/plain"
+    rxresp
+    expect resp.bodylen == 7
+    expect resp.http.X-Cache-Hit == 0
+
+    txreq -url "/plain"
+    rxresp
+    expect resp.bodylen == 7
+    expect resp.http.X-Cache-Hit == 1
+} -run
+
+shell {
+    sleep 0.1
+    out=$(echo "show cache" | socat -t 5 "${tmpdir}/h1/stats" -)
+    counts=$(printf '%s\n' "$out" | awk '
+        /: my_cache \(/ { store="responses"; next }
+        /: my_cache-anchors / { store="anchors"; next }
+        /: my_cache-hints / { store="hints"; next }
+        /^0x.* hash:0x/ { n[store]++ }
+        END { print n["responses"]+0, n["anchors"]+0, n["hints"]+0 }')
+    if [ "$counts" != "3 1 1" ]; then
+        echo "expected three responses, one anchor and one hints record: $counts"
+        echo "$out"
+        exit 1
+    fi
+    anchor=$(printf '%s\n' "$out" | awk '
+        /: my_cache-anchors / { anchors=1; next }
+        /^0x.*: / { anchors=0 }
+        anchors && / hash:0x/ { print; exit }')
+    printf '%s\n' "$anchor" | grep -q ' vary-signature:0x1 generation:0x[0-9a-f]* enc-masks:0x1,0x4 '
+    if printf '%s\n' "$anchor" | grep -q ' vary:0x'; then
+        echo 'anchor unexpectedly listed as an HTTP response'
+        exit 1
+    fi
+    expiry=$(printf '%s\n' "$anchor" | awk '{ sub(/.* expire:/, ""); print }')
+    test "$expiry" -gt 280 && test "$expiry" -le 300
+
+
+}
+
+client c3 -connect ${h1_fe_sock} {
+    txreq -method POST -url "/variants" -body ""
+    rxresp
+    expect resp.status == 200
+
+    txreq -url "/variants" -hdr "Accept-Encoding: gzip"
+    rxresp
+    expect resp.bodylen == 17
+    expect resp.http.X-Cache-Hit == 0
+
+    # Recreating the gzip anchor must not resurrect the old br variant.
+    txreq -url "/variants" -hdr "Accept-Encoding: br"
+    rxresp
+    expect resp.bodylen == 19
+    expect resp.http.X-Cache-Hit == 0
+
+    txreq -url "/variants" -hdr "Accept-Encoding: gzip"
+    rxresp
+    expect resp.bodylen == 17
+    expect resp.http.X-Cache-Hit == 1
+
+    txreq -url "/variants" -hdr "Accept-Encoding: br"
+    rxresp
+    expect resp.bodylen == 19
+    expect resp.http.X-Cache-Hit == 1
+} -run

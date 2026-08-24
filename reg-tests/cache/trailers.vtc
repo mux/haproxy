@@ -1,0 +1,110 @@
+varnishtest "Cache: responses with trailers"
+
+feature ignore_unknown_macro
+
+# Trailers announced with a Trailer header are stored with the response and
+# replayed from the cache. Trailers the response did not announce keep it out
+# of the cache: the second request reaches the server again.
+server s1 {
+    rxreq
+    expect req.url == "/announced"
+    send "HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nTrailer: X-Tlr\r\nTransfer-Encoding: chunked\r\n\r\n"
+    send "5\r\nhello\r\n0\r\nX-Tlr: value\r\n\r\n"
+
+    rxreq
+    expect req.url == "/unannounced"
+    send "HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nTransfer-Encoding: chunked\r\n\r\n"
+    send "5\r\nhello\r\n0\r\nX-Tlr: value\r\n\r\n"
+
+    rxreq
+    expect req.url == "/unannounced"
+    send "HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nTransfer-Encoding: chunked\r\n\r\n"
+    send "5\r\nhello\r\n0\r\nX-Tlr: value\r\n\r\n"
+} -start
+
+haproxy h1 -conf {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
+    defaults
+        mode http
+        timeout connect "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout client  "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout server  "${HAPROXY_TEST_TIMEOUT-5s}"
+
+    frontend fe
+        bind "fd@${fe}" proto h2
+        default_backend test
+
+    backend test
+        http-request cache-use my_cache
+        server www ${s1_addr}:${s1_port}
+        http-response cache-store my_cache
+        http-response set-header X-Cache-Hit %[res.cache_hit]
+
+    cache my_cache
+        total-max-size 1
+        max-age 60
+} -start
+
+# vtest sends no :authority on its own, and a request without a host has no
+# cache key.
+client c1 -connect ${h1_fe_sock} {
+    txpri
+    stream 0 {
+        txsettings
+        rxsettings
+        txsettings -ack
+        rxsettings
+        expect settings.ack == true
+    } -run
+
+    # first fetch, from the server
+    stream 1 {
+        txreq -url "/announced" -hdr ":authority" "127.0.0.1"
+        rxhdrs
+        expect resp.status == 200
+        expect resp.http.x-cache-hit == 0
+        rxdata
+        expect resp.bodylen == 5
+        rxhdrs
+        expect resp.http.x-tlr == "value"
+    } -run
+
+    # second fetch, from the cache, trailers included
+    stream 3 {
+        txreq -url "/announced" -hdr ":authority" "127.0.0.1"
+        rxhdrs
+        expect resp.status == 200
+        expect resp.http.x-cache-hit == 1
+        rxdata
+        expect resp.bodylen == 5
+        rxhdrs
+        expect resp.http.x-tlr == "value"
+    } -run
+
+    # unannounced trailers are forwarded but the response is not stored
+    stream 5 {
+        txreq -url "/unannounced" -hdr ":authority" "127.0.0.1"
+        rxhdrs
+        expect resp.status == 200
+        expect resp.http.x-cache-hit == 0
+        rxdata
+        expect resp.bodylen == 5
+        rxhdrs
+        expect resp.http.x-tlr == "value"
+    } -run
+
+    stream 7 {
+        txreq -url "/unannounced" -hdr ":authority" "127.0.0.1"
+        rxhdrs
+        expect resp.status == 200
+        expect resp.http.x-cache-hit == 0
+        rxdata
+        expect resp.bodylen == 5
+        rxhdrs
+        expect resp.http.x-tlr == "value"
+    } -run
+} -run
