@@ -130,9 +130,10 @@ in the slot itself.
   atomics of pinning. Since most candidates in a well-distributed table do not
   match, this is a large saving.
 
-An all-zero slot means "empty", so a live slot is kept non-zero by construction
--- one always-set bit outside the tag and location fields. This lets the empty
-check be a single comparison against zero.
+An all-zero slot means "empty", so a live slot is kept non-zero by construction:
+its frequency counter (below) starts at 1 and never drops below it, while the
+tag and location fields can all legitimately be 0. This lets the empty check be
+a single comparison against zero.
 
 ## Concurrency & scalability
 
@@ -163,11 +164,13 @@ pin and condemn the segment rather than recycle it, so the check only decides
 whether to serve from a segment on its way out. `cache_delete()` skips it, so
 that a purge cannot miss an entry whose segment is transiently draining.
 
-Segcache keeps a per-item frequency counter in the hash slot, which its eviction
-consults to score entries (below). Eviction here never looks at per-item
-frequency, so the counter is gone from the slot entirely: a read is a pure
-sequence of loads, with no write to shared slot state on the hot path and no
-reader-versus-reader contention.
+The slot also carries Segcache's per-item frequency counter (the ASFC) in
+seven bits between the location and the tag. A served hit bumps it with a
+single compare-and-swap -- exactly for the first sixteen hits, then with
+probability 1/count, so a hot entry soon stops rewriting its slot -- and a
+lost bump is dropped: the counter is approximate. A reader revalidating its
+pin ignores the counter bits, and the compare-and-swaps that clear or replace
+a slot retry while it still names the same record.
 
 One narrow exception keeps the no-lock claim honest: a segment reclaimed while
 readers still hold pins is *condemned* and handed to its last reader, whose
