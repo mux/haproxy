@@ -139,34 +139,42 @@ BUG_ON_STATIC(CACHE_ADMIT_BITS_PER_KEY & (CACHE_ADMIT_BITS_PER_KEY - 1));
 /* Masks/shifts for the 64-bit slot value */
 #define CACHE_SLOT_OFF_BITS     20
 #define CACHE_SLOT_SEG_BITS     24
+#define CACHE_SLOT_FREQ_BITS    7
 #define CACHE_SLOT_TAG_BITS     12
 
 #define CACHE_SLOT_OFF_SHIFT    0
 #define CACHE_SLOT_SEG_SHIFT    (CACHE_SLOT_OFF_SHIFT  + CACHE_SLOT_OFF_BITS)
+#define CACHE_SLOT_FREQ_SHIFT   (CACHE_SLOT_SEG_SHIFT  + CACHE_SLOT_SEG_BITS)
 #define CACHE_SLOT_TAG_SHIFT    (64 - CACHE_SLOT_TAG_BITS)
 
 #define CACHE_SLOT_OFF_MASK     (((1ULL << CACHE_SLOT_OFF_BITS)  - 1) << CACHE_SLOT_OFF_SHIFT)
 #define CACHE_SLOT_SEG_MASK     (((1ULL << CACHE_SLOT_SEG_BITS)  - 1) << CACHE_SLOT_SEG_SHIFT)
+#define CACHE_SLOT_FREQ_MASK    (((1ULL << CACHE_SLOT_FREQ_BITS) - 1) << CACHE_SLOT_FREQ_SHIFT)
 #define CACHE_SLOT_TAG_MASK     (((1ULL << CACHE_SLOT_TAG_BITS)  - 1) << CACHE_SLOT_TAG_SHIFT)
 
-/* One always-set bit in the unused space between the location bits and the
- * tag: it keeps a live slot from ever encoding as all zeroes (the empty
- * value), since tag, seg and off can all legitimately be 0.
+/* The counter saturates at the field's maximum. One bit between the
+ * frequency and the tag is unused.
  */
-#define CACHE_SLOT_LIVE         (1ULL << (CACHE_SLOT_SEG_SHIFT + CACHE_SLOT_SEG_BITS))
+#define CACHE_SLOT_FREQ_MAX     ((1U << CACHE_SLOT_FREQ_BITS) - 1)
+
+BUG_ON_STATIC(CACHE_SLOT_FREQ_SHIFT + CACHE_SLOT_FREQ_BITS > CACHE_SLOT_TAG_SHIFT);
 
 /* Accessor macros */
 #define CACHE_SLOT_OFF(slot)    \
 	((((slot) & CACHE_SLOT_OFF_MASK)  >> CACHE_SLOT_OFF_SHIFT) << CACHE_OFF_SHIFT)
 #define CACHE_SLOT_SEG(slot)    \
 	((((slot) & CACHE_SLOT_SEG_MASK)  >> CACHE_SLOT_SEG_SHIFT))
+#define CACHE_SLOT_FREQ(slot)   \
+	((((slot) & CACHE_SLOT_FREQ_MASK) >> CACHE_SLOT_FREQ_SHIFT))
 #define CACHE_SLOT_TAG(slot)    \
 	((((slot) & CACHE_SLOT_TAG_MASK)  >> CACHE_SLOT_TAG_SHIFT))
 
-/* Creation macro */
-#define CACHE_SLOT_MAKE(tag, seg, off)                                    \
+/* Creation macro. The frequency counter starts at 1 and never drops below
+ * it, so a live slot never encodes as all zeroes (the empty value).
+ */
+#define CACHE_SLOT_MAKE(tag, seg, off, freq)                              \
 	(((uint64_t)(tag)                     << CACHE_SLOT_TAG_SHIFT)  | \
-	CACHE_SLOT_LIVE                                                 | \
+	( (uint64_t)(freq)                    << CACHE_SLOT_FREQ_SHIFT) | \
 	( (uint64_t)(seg)                     << CACHE_SLOT_SEG_SHIFT)  | \
 	(((uint64_t)(off) >> CACHE_OFF_SHIFT) << CACHE_SLOT_OFF_SHIFT))
 
@@ -691,10 +699,12 @@ retry:
 	/* Ensure that nothing changed out from under us. The load must be
 	 * sequentially consistent, like the r_refcount increment above and
 	 * seg_unindex()'s slot-clearing CAS: it is the other half of the
-	 * Dekker pairing with seg_reclaim()'s r_refcount check.
+	 * Dekker pairing with seg_reclaim()'s r_refcount check. A change
+	 * confined to the frequency counter is a concurrent hit, not a
+	 * different slot; an emptied slot always is.
 	 */
 	slot2 = HA_ATOMIC_LOAD_SEQ_CST(slotp);
-	if (slot2 != slot) {
+	if (slot2 == 0 || ((slot2 ^ slot) & ~CACHE_SLOT_FREQ_MASK)) {
 		seg_read_unpin(cache, seg);
 		slot = slot2;
 
@@ -710,6 +720,7 @@ retry:
 
 		return CACHE_RHANDLE_NULL;
 	}
+	slot = slot2;
 
 	/* Refuse the pin if the segment is no longer live. The load must be
 	 * sequentially consistent: with the reference count increment above
@@ -780,12 +791,20 @@ static void seg_unindex(const struct cache *cache, struct seg *seg)
 
 		ht_iter_init(&it, cache);
 		while ((slotp = ht_iter_next_tag(&it, &rec->hash, &slot)) != NULL) {
-			if (CACHE_SLOT_SEG(slot) != h.seg_id ||
-			    CACHE_SLOT_OFF(slot) != h.seg_off)
-				continue;
+			int success = 0;
 
-			HA_ATOMIC_CAS(slotp, &slot, 0);
-			break;
+			/* Retry a CAS lost to a counter bump; stop if the slot
+			 * was replaced.
+			 */
+			do {
+				if (CACHE_SLOT_SEG(slot) != h.seg_id ||
+				    CACHE_SLOT_OFF(slot) != h.seg_off)
+					break;
+				success = HA_ATOMIC_CAS(slotp, &slot, 0);
+			} while (!success);
+
+			if (success)
+				break;
 		}
 
 		off += CACHE_OFF_ALIGN_UP(rec->rec_len);
@@ -1663,7 +1682,8 @@ struct cache_rhandle cache_lookup(struct cache *cache, struct cache_key *k)
 	struct ht_iter it;
 	struct cache_rhandle h;
 	struct cache_record *rec;
-	uint64_t *slotp, slot;
+	uint64_t *slotp, slot, slot2;
+	unsigned int count;
 
 	ht_iter_init(&it, cache);
 	while ((slotp = ht_iter_next_tag(&it, &k->hash, &slot)) != NULL) {
@@ -1684,6 +1704,18 @@ struct cache_rhandle cache_lookup(struct cache *cache, struct cache_key *k)
 			 * expired copy must not shadow it.
 			 */
 			continue;
+		}
+
+		/* Bump the frequency counter: exactly up to 16, then with
+		 * probability 1/count so hot entries stop rewriting their
+		 * slot. A lost CAS is not retried; the counter is approximate.
+		 */
+		count = CACHE_SLOT_FREQ(slot);
+		if (count < CACHE_SLOT_FREQ_MAX &&
+		    (count <= 16 || statistical_prng() % count == 0)) {
+			slot2 = (slot & ~CACHE_SLOT_FREQ_MASK) |
+			        ((uint64_t)(count + 1) << CACHE_SLOT_FREQ_SHIFT);
+			HA_ATOMIC_CAS(slotp, &slot, slot2);
 		}
 
 		return h;
@@ -1890,7 +1922,15 @@ void cache_delete(struct cache *cache, const struct cache_key *key)
 		if (CACHE_HANDLE_ERR(h))
 			continue;
 
-		HA_ATOMIC_CAS(slotp, &slot, 0);
+		/* Retry a CAS lost to a counter bump; stop if the slot was
+		 * replaced or emptied.
+		 */
+		while (!HA_ATOMIC_CAS(slotp, &slot, 0)) {
+			if (CACHE_SLOT_SEG(slot) != h.seg_id ||
+			    CACHE_SLOT_OFF(slot) != h.seg_off)
+				break;
+			__ha_cpu_relax();
+		}
 
 		seg_read_unpin(cache, &cache->segments[h.seg_id]);
 
@@ -2171,16 +2211,17 @@ int cache_publish(struct cache *cache, const struct cache_whandle *h)
 	}
 
 	tag = CACHE_HASH_TAG(rec->hash);
-	slot = CACHE_SLOT_MAKE(tag, h->seg_id, h->seg_off);
+	slot = CACHE_SLOT_MAKE(tag, h->seg_id, h->seg_off, 1);
 
 	/* First look for an existing entry with the same key and replace it
 	 * in place, so that a key only ever has one live slot: a re-store of
 	 * a known key (e.g. refreshing an expired entry) must supersede the
 	 * old copy, not leave it indexed next to the new one. If we lose the
 	 * replacement CAS, we retry the same slot rather than falling through:
-	 * the value can only have changed to a concurrent store of this very
-	 * key (which we must supersede too, one winner), to empty, or to an
-	 * unrelated tag - the latter two let us resume the scan.
+	 * the value can only have changed to the same entry with a bumped
+	 * frequency counter, to a concurrent store of this very key (which we
+	 * must supersede too, one winner), to empty, or to an unrelated tag -
+	 * the latter two let us resume the scan.
 	 */
 	ht_iter_init(&it, cache);
 	while ((slotp = ht_iter_next_tag(&it, &rec->hash, &old)) != NULL) {
