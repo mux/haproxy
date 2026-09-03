@@ -267,6 +267,8 @@ static inline void cache_unlock(spinlock_t *lock)
 struct seg {
 	uint32_t write_off;      /* Current write offset */
 	uint32_t n_chain;        /* Chain length, recorded in the head segment */
+	uint32_t live_bytes;     /* Indexed bytes (shared segments only) */
+	uint32_t n_live;         /* Indexed entries (shared segments only) */
 	uint32_t create_ts;      /* Creation timestamp */
 	uint16_t ttl_bucket;     /* TTL bucket index */
 	uint32_t r_refcount;     /* Read refcounts */
@@ -521,6 +523,8 @@ static inline void seg_reinit(struct seg *seg)
 
 	seg->write_off = 0;
 	seg->n_chain = 1;
+	seg->live_bytes = 0;
+	seg->n_live = 0;
 	seg->create_ts = date.tv_sec;
 	_HA_ATOMIC_STORE(&seg->state_gen, SEG_STATE_MAKE(gen + 1, SEG_S_LIVE));
 	seg->flags = 0;
@@ -765,6 +769,19 @@ static inline void seg_write_pin(struct seg *seg)
 static inline void seg_write_unpin(struct seg *seg)
 {
 	HA_ATOMIC_DEC(&seg->w_refcount);
+}
+
+/* Account for a record of a shared segment gaining or losing its index slot. */
+static inline void seg_live_add(struct seg *seg, const struct cache_record *rec)
+{
+	_HA_ATOMIC_ADD(&seg->live_bytes, CACHE_OFF_ALIGN_UP(rec->rec_len));
+	_HA_ATOMIC_INC(&seg->n_live);
+}
+
+static inline void seg_live_sub(struct seg *seg, const struct cache_record *rec)
+{
+	_HA_ATOMIC_SUB(&seg->live_bytes, CACHE_OFF_ALIGN_UP(rec->rec_len));
+	_HA_ATOMIC_DEC(&seg->n_live);
 }
 
 /* Unlink all the entries in a segment from the hashtable. */
@@ -1915,6 +1932,7 @@ void cache_delete(struct cache *cache, const struct cache_key *key)
 	struct ht_iter it;
 	struct cache_rhandle h;
 	uint64_t *slotp, slot;
+	int removed;
 
 	ht_iter_init(&it, cache);
 	while ((slotp = ht_iter_next_tag(&it, &key->hash, &slot)) != NULL) {
@@ -1925,12 +1943,15 @@ void cache_delete(struct cache *cache, const struct cache_key *key)
 		/* Retry a CAS lost to a counter bump; stop if the slot was
 		 * replaced or emptied.
 		 */
-		while (!HA_ATOMIC_CAS(slotp, &slot, 0)) {
+		while (!(removed = HA_ATOMIC_CAS(slotp, &slot, 0))) {
 			if (CACHE_SLOT_SEG(slot) != h.seg_id ||
 			    CACHE_SLOT_OFF(slot) != h.seg_off)
 				break;
 			__ha_cpu_relax();
 		}
+		if (removed && !(cache->segments[h.seg_id].flags & SEG_F_PRIVATE))
+			seg_live_sub(&cache->segments[h.seg_id],
+			             CACHE_HANDLE_REC(cache, &h));
 
 		seg_read_unpin(cache, &cache->segments[h.seg_id]);
 
@@ -2235,9 +2256,14 @@ int cache_publish(struct cache *cache, const struct cache_whandle *h)
 			 */
 			if (HA_ATOMIC_CAS(slotp, &old, slot)) {
 				struct cache_record *oldrec = CACHE_HANDLE_REC(cache, &rh);
+				struct seg *oldseg = &cache->segments[rh.seg_id];
 
 				if (seg->flags & SEG_F_PRIVATE)
 					cache_publish_private(cache, h->seg_id);
+				else
+					seg_live_add(seg, rec);
+				if (!(oldseg->flags & SEG_F_PRIVATE))
+					seg_live_sub(oldseg, oldrec);
 				if (date.tv_sec < oldrec->expire) {
 					_HA_ATOMIC_INC(&cache->stats.publish_supersedes);
 					_HA_ATOMIC_ADD(&cache->stats.dead_bytes,
@@ -2291,6 +2317,8 @@ int cache_publish(struct cache *cache, const struct cache_whandle *h)
 
 			if (seg->flags & SEG_F_PRIVATE)
 				cache_publish_private(cache, h->seg_id);
+			else
+				seg_live_add(seg, rec);
 			seg_write_unpin(seg);
 			return 0;
 		}
