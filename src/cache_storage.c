@@ -273,7 +273,8 @@ struct seg {
 	uint16_t ttl_bucket;     /* TTL bucket index */
 	uint32_t r_refcount;     /* Read refcounts */
 	uint32_t w_refcount;     /* Write refcounts */
-	seg_id_t next_seg_id;    /* TTL bucket list linkage (seg_list) */
+	seg_id_t next_seg_id;    /* Linkage for next entry in seg_list */
+	seg_id_t prev_seg_id;    /* Linkage for previous entry in seg_list */
 	seg_id_t next_chain_id;  /* Jumbo entries & free-list linkage */
 	uint32_t state_gen;      /* SEG_S_* state + generation */
 	uint8_t flags;           /* SEG_F_* */
@@ -456,6 +457,7 @@ static inline void seg_list_append(const struct cache *cache, struct seg_list *l
 		prev->next_seg_id = seg_id;
 	}
 	seg = &cache->segments[seg_id];
+	seg->prev_seg_id = l->last_seg_id;
 	seg->next_seg_id = CACHE_SEG_NONE;
 	l->last_seg_id = seg_id;
 	if (l->first_seg_id == CACHE_SEG_NONE)
@@ -471,11 +473,57 @@ static inline seg_id_t seg_list_pop(const struct cache *cache, struct seg_list *
 	if (seg_id != CACHE_SEG_NONE) {
 		seg = &cache->segments[seg_id];
 		_HA_ATOMIC_STORE(&l->first_seg_id, seg->next_seg_id);
+		if (seg->next_seg_id != CACHE_SEG_NONE) {
+			seg = &cache->segments[seg->next_seg_id];
+			seg->prev_seg_id = CACHE_SEG_NONE;
+		} else {
+			l->last_seg_id = CACHE_SEG_NONE;
+		}
 	}
-	if (l->last_seg_id == seg_id)
-		l->last_seg_id = CACHE_SEG_NONE;
-
 	return seg_id;
+}
+
+static inline void seg_list_unlink(const struct cache *cache, struct seg_list *l,
+                                   seg_id_t seg_id)
+{
+	struct seg *seg, *prev, *next;
+
+	seg = &cache->segments[seg_id];
+	if (seg->prev_seg_id != CACHE_SEG_NONE) {
+		prev = &cache->segments[seg->prev_seg_id];
+		prev->next_seg_id = seg->next_seg_id;
+	} else {
+		_HA_ATOMIC_STORE(&l->first_seg_id, seg->next_seg_id);
+	}
+	if (seg->next_seg_id != CACHE_SEG_NONE) {
+		next = &cache->segments[seg->next_seg_id];
+		next->prev_seg_id = seg->prev_seg_id;
+	} else {
+		l->last_seg_id = seg->prev_seg_id;
+	}
+}
+
+static inline void seg_list_replace(const struct cache *cache, struct seg_list *l,
+                                    seg_id_t old_id, seg_id_t new_id)
+{
+	struct seg *old, *new, *prev, *next;
+
+	old = &cache->segments[old_id];
+	new = &cache->segments[new_id];
+	new->prev_seg_id = old->prev_seg_id;
+	new->next_seg_id = old->next_seg_id;
+	if (new->prev_seg_id != CACHE_SEG_NONE) {
+		prev = &cache->segments[new->prev_seg_id];
+		prev->next_seg_id = new_id;
+	} else {
+		_HA_ATOMIC_STORE(&l->first_seg_id, new_id);
+	}
+	if (new->next_seg_id != CACHE_SEG_NONE) {
+		next = &cache->segments[new->next_seg_id];
+		next->prev_seg_id = new_id;
+	} else {
+		l->last_seg_id = new_id;
+	}
 }
 
 static inline seg_id_t seg_list_first(struct seg_list *l)
