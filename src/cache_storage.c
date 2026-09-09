@@ -828,6 +828,154 @@ static void seg_unindex(const struct cache *cache, struct seg *seg)
 	}
 }
 
+/* Merge tuning, after Segcache: retain about 1/CACHE_MERGE_TARGET of each
+ * source's bytes, and stop taking sources once the destination is
+ * CACHE_MERGE_STOP_NUM/CACHE_MERGE_STOP_DEN full.
+ */
+#define CACHE_MERGE_TARGET      4
+#define CACHE_MERGE_STOP_NUM    9
+#define CACHE_MERGE_STOP_DEN    10
+
+/* Outcome of a merge, in bytes of source records. */
+struct seg_merge_res {
+	unsigned int merged; /* Sources consumed, from the head onwards */
+	size_t copied;   /* Retained: copied to the destination and re-indexed */
+	size_t dropped;  /* Below the cutoff, or no room left in the destination */
+	size_t dead;     /* Had no index slot */
+	size_t expired;
+	size_t lost;     /* Copied, but re-indexed elsewhere concurrently */
+};
+
+/* Merge shared segments starting at <head_id> in their TTL bucket's list into
+ * <dst>: Segcache's one-pass merge-based eviction. Records worth keeping are
+ * copied to the destination and their slots repointed to it; every other slot
+ * into a consumed source is cleared, so consumed sources come out unindexed.
+ * Sources are consumed in list order until the destination is nearly full or
+ * <n_srcs> is reached; res->merged says how many, the rest are untouched. The
+ * caller holds the bucket's lock throughout, the sources have no writer, and
+ * the destination is a fresh segment it has write-pinned.
+ *
+ * A record is retained when its frequency, scaled by its size relative to the
+ * mean live record of its segment, exceeds the cutoff. The cutoff aims at
+ * keeping 1/CACHE_MERGE_TARGET of the scanned bytes, dead ones included:
+ * after every tenth of a segment it moves by the relative error on that
+ * target whenever it exceeds 50%, and each source starts from the midpoint
+ * between 1 and the previous source's final value. Once the destination is
+ * past its stop mark, the remainder of the current source is kept whole
+ * rather than thinned for a next source that will not come. With
+ * <copy_all>, only a full destination drops a record.
+ */
+static __maybe_unused void seg_merge(struct cache *cache, seg_id_t dst_id,
+                                     seg_id_t head_id, unsigned int n_srcs,
+                                     int copy_all, struct seg_merge_res *res)
+{
+	struct seg *dst = &cache->segments[dst_id];
+	uint32_t stop = cache->cfg.seg_size / CACHE_MERGE_STOP_DEN * CACHE_MERGE_STOP_NUM;
+	double target = 1.0 / MIN(n_srcs, CACHE_MERGE_TARGET);
+	double cutoff = 1.0;
+	size_t scanned = 0, checkpoint;
+	seg_id_t src_id = head_id;
+	struct seg *src;
+
+	memset(res, 0, sizeof(*res));
+	dst->create_ts = cache->segments[head_id].create_ts;
+	dst->ttl_bucket = cache->segments[head_id].ttl_bucket;
+
+	for (; res->merged < n_srcs && dst->write_off < stop;
+	     res->merged++, src_id = src->next_seg_id) {
+		struct cache_whandle h = { .seg_id = src_id };
+		int keep_rest = copy_all;
+		double mean_size;
+		uint32_t off = 0;
+
+		BUG_ON_HOT(src_id == CACHE_SEG_NONE);
+		src = &cache->segments[src_id];
+		BUG_ON_HOT(src->flags & SEG_F_PRIVATE);
+
+		mean_size = src->n_live ? (double)src->live_bytes / src->n_live : 1.0;
+		cutoff = copy_all ? 0.0 : (1.0 + cutoff) / 2.0;
+		checkpoint = scanned + cache->cfg.seg_size / 10;
+
+		while (off < src->write_off) {
+			struct cache_record *rec;
+			struct ht_iter it;
+			uint64_t *slotp, slot, newval;
+			uint32_t stride;
+			int expired, retain, relinked;
+
+			h.seg_off = off;
+			rec = CACHE_HANDLE_REC(cache, &h);
+			stride = CACHE_OFF_ALIGN_UP(rec->rec_len);
+			off += stride;
+			scanned += stride;
+
+			if (scanned >= checkpoint) {
+				double t = ((double)res->copied / scanned - target) / target;
+
+				if (t > 0.5 || t < -0.5)
+					cutoff *= 1.0 + t;
+				checkpoint += cache->cfg.seg_size / 10;
+			}
+			if (!keep_rest && dst->write_off >= stop && off > stop)
+				keep_rest = 1;
+
+			ht_iter_init(&it, cache);
+			while ((slotp = ht_iter_next_tag(&it, &rec->hash, &slot)) != NULL) {
+				if (CACHE_SLOT_SEG(slot) == h.seg_id &&
+				    CACHE_SLOT_OFF(slot) == h.seg_off)
+					break;
+			}
+			if (slotp == NULL) {
+				res->dead += stride;
+				continue;
+			}
+
+			expired = date.tv_sec >= rec->expire;
+			retain = 0;
+			if (!expired) {
+				double score = CACHE_SLOT_FREQ(slot) / (stride / mean_size);
+
+				retain = (keep_rest || score > cutoff) &&
+				         dst->write_off + stride <= cache->cfg.seg_size;
+			}
+
+			if (retain) {
+				memcpy((char *)cache->arena +
+				       CACHE_ARENA_OFF(cache, dst_id, dst->write_off),
+				       rec, stride);
+				newval = CACHE_SLOT_MAKE(CACHE_HASH_TAG(rec->hash),
+				                         dst_id, dst->write_off, 1);
+			}
+			else
+				newval = 0;
+
+			/* Clear or repoint the slot, retrying a CAS lost to a
+			 * counter bump; stop if it no longer names this record.
+			 */
+			relinked = 1;
+			do {
+				if (CACHE_SLOT_SEG(slot) != h.seg_id ||
+				    CACHE_SLOT_OFF(slot) != h.seg_off) {
+					relinked = 0;
+					break;
+				}
+			} while (!HA_ATOMIC_CAS(slotp, &slot, newval));
+
+			if (expired)
+				res->expired += stride;
+			else if (!retain)
+				res->dropped += stride;
+			else if (relinked) {
+				seg_live_add(dst, rec);
+				dst->write_off += stride;
+				res->copied += stride;
+			}
+			else
+				res->lost += stride;
+		}
+	}
+}
+
 /* Reclaim the head segment <seg> of a segment list: unindex it, unlink it from
  * the list, then either free it or condemn it to be freed by its last reader.
  * The whole segment chain is reclaimed with its head; the number of segments
