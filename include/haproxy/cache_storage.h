@@ -75,6 +75,14 @@ struct cache_config {
 	size_t mean_obj_size;
 	uint32_t seg_size;
 	size_t admit_min_size;
+	/* The number of segments reserved for segment merging. We recommend
+	 * having one segment per thread, so it is always possible to run the
+	 * segment merging operation. Any more than that is useless. This number
+	 * may be reduced internally to accommodate some extreme cases with very
+	 * small caches, where the provided number would leave too few free
+	 * segments for the cache to be useful.
+	 */
+	uint n_reserved;
 };
 
 /* Cache activity counters, all monotonic. Read with cache_get_stats(). */

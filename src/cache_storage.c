@@ -354,6 +354,7 @@ struct cache {
 	struct ttl_bucket *ttl_buckets; /* TTL buckets for writes */
 	spinlock_t pool_lock;           /* Lock for the pool of free segments */
 	seg_id_t free_seg_id;           /* Free-list of segments */
+	unsigned int n_free;            /* Number of free segments in the pool */
 
 	struct cache_stats stats;       /* Activity counters */
 };
@@ -483,47 +484,38 @@ static inline seg_id_t seg_list_pop(const struct cache *cache, struct seg_list *
 	return seg_id;
 }
 
-static inline void seg_list_unlink(const struct cache *cache, struct seg_list *l,
-                                   seg_id_t seg_id)
+static inline void seg_list_splice(const struct cache *cache, struct seg_list *l,
+                                   seg_id_t first_id, seg_id_t last_id, seg_id_t new_id)
 {
-	struct seg *seg, *prev, *next;
+	struct seg *first, *last, *new;
+	seg_id_t prev_id, next_id;
+	seg_id_t after_prev, before_next;
 
-	seg = &cache->segments[seg_id];
-	if (seg->prev_seg_id != CACHE_SEG_NONE) {
-		prev = &cache->segments[seg->prev_seg_id];
-		prev->next_seg_id = seg->next_seg_id;
-	} else {
-		_HA_ATOMIC_STORE(&l->first_seg_id, seg->next_seg_id);
-	}
-	if (seg->next_seg_id != CACHE_SEG_NONE) {
-		next = &cache->segments[seg->next_seg_id];
-		next->prev_seg_id = seg->prev_seg_id;
-	} else {
-		l->last_seg_id = seg->prev_seg_id;
-	}
-}
+	first = &cache->segments[first_id];
+	last = &cache->segments[last_id];
+	prev_id = first->prev_seg_id;
+	next_id = last->next_seg_id;
 
-static inline void seg_list_replace(const struct cache *cache, struct seg_list *l,
-                                    seg_id_t old_id, seg_id_t new_id)
-{
-	struct seg *old, *new, *prev, *next;
+	if (new_id != CACHE_SEG_NONE) {
+		new = &cache->segments[new_id];
+		new->prev_seg_id = first->prev_seg_id;
+		new->next_seg_id = last->next_seg_id;
+		after_prev = new_id;
+		before_next = new_id;
+	} else {
+		after_prev = next_id;
+		before_next = prev_id;
+	}
 
-	old = &cache->segments[old_id];
-	new = &cache->segments[new_id];
-	new->prev_seg_id = old->prev_seg_id;
-	new->next_seg_id = old->next_seg_id;
-	if (new->prev_seg_id != CACHE_SEG_NONE) {
-		prev = &cache->segments[new->prev_seg_id];
-		prev->next_seg_id = new_id;
-	} else {
-		_HA_ATOMIC_STORE(&l->first_seg_id, new_id);
-	}
-	if (new->next_seg_id != CACHE_SEG_NONE) {
-		next = &cache->segments[new->next_seg_id];
-		next->prev_seg_id = new_id;
-	} else {
-		l->last_seg_id = new_id;
-	}
+	if (prev_id != CACHE_SEG_NONE)
+		cache->segments[prev_id].next_seg_id = after_prev;
+	else
+		_HA_ATOMIC_STORE(&l->first_seg_id, after_prev);
+
+	if (next_id != CACHE_SEG_NONE)
+		cache->segments[next_id].prev_seg_id = before_next;
+	else
+		l->last_seg_id = before_next;
 }
 
 static inline seg_id_t seg_list_first(struct seg_list *l)
@@ -579,25 +571,32 @@ static inline void seg_reinit(struct seg *seg)
 }
 
 /* Grab <n_segs> segments from the free-list. */
-static inline seg_id_t seg_free_pop(struct cache *cache, unsigned int n_segs)
+static inline seg_id_t seg_free_pop(struct cache *cache, unsigned int n_segs, int reserve)
 {
 	seg_id_t first_seg_id, seg_id;
+	unsigned int n_left;
 	struct seg *seg;
 
 	BUG_ON(n_segs == 0);
 
 	cache_lock(&cache->pool_lock);
-	first_seg_id = cache->free_seg_id;
-	seg_id = first_seg_id;
-	while (seg_id != CACHE_SEG_NONE && n_segs > 0) {
-		seg = &cache->segments[seg_id];
-		seg_id = seg->next_chain_id;
-		n_segs--;
-	}
-	if (n_segs > 0) {
+	if (!reserve && cache->n_free < cache->cfg.n_reserved + n_segs) {
 		cache_unlock(&cache->pool_lock);
 		return CACHE_SEG_NONE;
 	}
+	first_seg_id = cache->free_seg_id;
+	seg_id = first_seg_id;
+	n_left = n_segs;
+	while (seg_id != CACHE_SEG_NONE && n_left > 0) {
+		seg = &cache->segments[seg_id];
+		seg_id = seg->next_chain_id;
+		n_left--;
+	}
+	if (n_left > 0) {
+		cache_unlock(&cache->pool_lock);
+		return CACHE_SEG_NONE;
+	}
+	cache->n_free -= n_segs;
 	cache->free_seg_id = seg->next_chain_id;
 	cache_unlock(&cache->pool_lock);
 	seg->next_chain_id = CACHE_SEG_NONE;
@@ -609,15 +608,18 @@ static inline seg_id_t seg_free_pop(struct cache *cache, unsigned int n_segs)
 static inline void seg_free_push(struct cache *cache, seg_id_t seg_id)
 {
 	seg_id_t first_seg_id, last_seg_id;
+	unsigned int n_segs;
 	struct seg *last;
 
 	BUG_ON(seg_id == CACHE_SEG_NONE);
 
+	n_segs = 0;
 	first_seg_id = seg_id;
 	do {
 		struct seg *seg = &cache->segments[seg_id];
 		uint32_t gen = SEG_STATE_GEN(_HA_ATOMIC_LOAD(&seg->state_gen));
 
+		n_segs++;
 		/* It's not actually required to set the state back to
 		 * SEG_S_FREE for correctness, but it is useful for debugging.
 		 */
@@ -631,6 +633,7 @@ static inline void seg_free_push(struct cache *cache, seg_id_t seg_id)
 	cache_lock(&cache->pool_lock);
 	last->next_chain_id = cache->free_seg_id;
 	cache->free_seg_id = first_seg_id;
+	cache->n_free += n_segs;
 	cache_unlock(&cache->pool_lock);
 }
 
@@ -1266,7 +1269,7 @@ static struct cache_whandle ttl_bucket_reserve(struct cache *cache, struct ttl_b
 			n_segs = 1;
 
 		/* Get free segments if possible. */
-		seg_id = seg_free_pop(cache, n_segs);
+		seg_id = seg_free_pop(cache, n_segs, 0);
 		if (seg_id == CACHE_SEG_NONE) {
 			cache_unlock(&ttlb->lock);
 			return CACHE_WHANDLE_NULL;
@@ -1423,6 +1426,14 @@ struct cache *cache_new(const struct cache_config *ucfg, uint flags,
 		goto out;
 	cache->n_segs = total_size / cfg->seg_size;
 
+	/* Don't let callers configure an overly large number of reserved
+	 * segments. Having more than one per thread is useless. We don't know
+	 * the number of threads here, but since we always have at least 16
+	 * segments, n_segs / 16 is never zero and a decent, best-effort cap.
+	 */
+	if (cache->cfg.n_reserved > cache->n_segs / 16)
+		cache->cfg.n_reserved = cache->n_segs / 16;
+
 	/* Initialize the hashtable index. */
 	if (cache_index_init(cache, total_size) != 0)
 		goto out;
@@ -1468,6 +1479,7 @@ struct cache *cache_new(const struct cache_config *ucfg, uint flags,
 		seg->state_gen = SEG_STATE_MAKE(0, SEG_S_FREE);
 	}
 	cache->free_seg_id = 0;
+	cache->n_free = cache->n_segs;
 	cache->pool_lock = CACHE_LOCK_FREE;
 
 	/* Allocate and initialize the TTL buckets. */
@@ -2294,7 +2306,7 @@ int cache_write(struct cache *cache, struct cache_whandle *h,
 		 * it elects it and comes back empty-handed.
 		 */
 		cache_reclaim_budget_init(&budget, n_segs);
-		while ((seg_id = seg_free_pop(cache, n_segs)) == CACHE_SEG_NONE) {
+		while ((seg_id = seg_free_pop(cache, n_segs, 0)) == CACHE_SEG_NONE) {
 			if (cache_reclaim_try(cache, &budget) != 0)
 				return -1;
 		}
