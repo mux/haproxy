@@ -95,7 +95,8 @@ struct cache_appctx {
 	size_t entry_size;               /* Total size of the entry data */
 	size_t sent;                     /* The number of bytes already sent for this cache entry. */
 	unsigned int send_notmodified:1; /* In case of conditional request, we might want to send a "304 Not Modified" response instead of the stored data. */
-	unsigned int unused:31;
+	unsigned int clen:1;             /* The response has a Content-Length, so its body ends with its last byte. */
+	unsigned int unused:30;
 };
 
 /* cache config for filters */
@@ -1547,13 +1548,23 @@ static size_t http_cache_fastfwd(struct appctx *appctx, struct buffer *buf, size
 		se_fl_clr(appctx->sedesc, SE_FL_MAY_FASTFWD_PROD);
 		applet_fl_clr(appctx, APPCTX_FL_FASTFWD);
 		if (ctx->sent == ctx->entry_size - sizeof(*ctx->entry)) {
-			/* The entry was fully fast-forwarded, but the message
-			 * must be finished through the regular path so that
-			 * HTX_FL_EOM is set: entries without a Content-Length
-			 * are sent chunked and the mux only emits the
-			 * last-chunk when it sees EOM.
-			 */
-			appctx->st0 = HTX_CACHE_EOM;
+			if (ctx->clen) {
+				/* The last body bytes are in this block. Reporting
+				 * the end of the message now lets the mux send them
+				 * without MSG_MORE; otherwise the kernel holds the
+				 * partial segment until the client acknowledges.
+				 */
+				applet_set_eoi(appctx);
+				applet_set_eos(appctx);
+				appctx->st0 = HTX_CACHE_END;
+			}
+			else {
+				/* Without a Content-Length the body is sent chunked
+				 * and the mux only emits the last-chunk when it sees
+				 * HTX_FL_EOM, which the regular path sets.
+				 */
+				appctx->st0 = HTX_CACHE_EOM;
+			}
 		}
 	}
 	return ret;
@@ -1604,6 +1615,8 @@ static void http_cache_io_handler(struct appctx *appctx)
 		if (!ret || (htx_get_tail_type(res_htx) != HTX_BLK_EOH) ||
 		    !htx_cache_add_age_hdr(appctx, res_htx))
 			goto error;
+
+		ctx->clen = !!(http_get_stline(res_htx)->flags & HTX_SL_F_CLEN);
 
 		/* In case of a conditional request, we might want to send a
 		 * "304 Not Modified" response instead of the stored data. */
