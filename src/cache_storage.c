@@ -289,6 +289,8 @@ struct ttl_bucket {
 	struct seg_list segs;
 	struct seg_list prv_segs;
 	uint32_t ttl_approx;
+	seg_id_t merge_next;     /* Where the next merge resumes, or CACHE_SEG_NONE */
+	uint32_t merge_next_gen; /* Generation of merge_next when it was set */
 	uint8_t lock;
 };
 
@@ -685,7 +687,7 @@ static inline void seg_read_unpin(struct cache *cache, struct seg *seg)
 	    HA_ATOMIC_LOAD_SEQ_CST(&seg->r_refcount) == 0) {
 		/* We took the reader count to zero on a condemned segment:
 		 * freeing it is our responsibility. The CONDEMNED -> FREE
-		 * CAS can race seg_reclaim()'s own attempt and guarantees
+		 * CAS can race seg_drain()'s own attempt and guarantees
 		 * that exactly one of us pushes.
 		 *
 		 * The r_refcount recheck is required: <prev> == 1 only says
@@ -754,7 +756,7 @@ retry:
 	/* Ensure that nothing changed out from under us. The load must be
 	 * sequentially consistent, like the r_refcount increment above and
 	 * seg_unindex()'s slot-clearing CAS: it is the other half of the
-	 * Dekker pairing with seg_reclaim()'s r_refcount check. A change
+	 * Dekker pairing with seg_drain()'s r_refcount check. A change
 	 * confined to the frequency counter is a concurrent hit, not a
 	 * different slot; an emptied slot always is.
 	 */
@@ -779,7 +781,7 @@ retry:
 
 	/* Refuse the pin if the segment is no longer live. The load must be
 	 * sequentially consistent: with the reference count increment above
-	 * it forms a Dekker pair against seg_reclaim(), which stores
+	 * it forms a Dekker pair against seg_drain(), which stores
 	 * SEG_S_DRAINING and then reads that count. One side always observes
 	 * the other, so no reader serves from a segment reclaim goes on to
 	 * recycle.
@@ -879,13 +881,19 @@ static void seg_unindex(const struct cache *cache, struct seg *seg)
 	}
 }
 
-/* Merge tuning, after Segcache: retain about 1/CACHE_MERGE_TARGET of each
- * source's bytes, and stop taking sources once the destination is
- * CACHE_MERGE_STOP_NUM/CACHE_MERGE_STOP_DEN full.
+/* Merge tuning, after Segcache. A merge needs a sequence of at least
+ * CACHE_MERGE_MIN evictable segments and takes up to CACHE_MERGE_MAX; a
+ * segment is evictable from CACHE_MERGE_MATURE_TIME seconds of age until
+ * CACHE_MERGE_EXPIRY_GUARD seconds before it expires. Retain about
+ * 1/CACHE_MERGE_TARGET of each source's bytes, and stop taking sources once
+ * the destination is CACHE_MERGE_STOP_PCT percent full.
  */
+#define CACHE_MERGE_MIN          3
+#define CACHE_MERGE_MAX          8
+#define CACHE_MERGE_MATURE_TIME  20
+#define CACHE_MERGE_EXPIRY_GUARD 20
 #define CACHE_MERGE_TARGET      4
-#define CACHE_MERGE_STOP_NUM    9
-#define CACHE_MERGE_STOP_DEN    10
+#define CACHE_MERGE_STOP_PCT    90
 
 /* Outcome of a merge, in bytes of source records. */
 struct seg_merge_res {
@@ -921,7 +929,7 @@ static __maybe_unused void seg_merge(struct cache *cache, seg_id_t dst_id,
                                      int copy_all, struct seg_merge_res *res)
 {
 	struct seg *dst = &cache->segments[dst_id];
-	uint32_t stop = cache->cfg.seg_size / CACHE_MERGE_STOP_DEN * CACHE_MERGE_STOP_NUM;
+	uint32_t stop = (uint64_t)cache->cfg.seg_size * CACHE_MERGE_STOP_PCT / 100;
 	double target = 1.0 / MIN(n_srcs, CACHE_MERGE_TARGET);
 	double cutoff = 1.0;
 	size_t scanned = 0, checkpoint;
@@ -1027,6 +1035,206 @@ static __maybe_unused void seg_merge(struct cache *cache, seg_id_t dst_id,
 	}
 }
 
+/* Tell whether <seg>, in the shared list of <ttlb>, can be evicted now: it has
+ * a successor (the tail is being written to), no writer, is at least
+ * CACHE_MERGE_MATURE_TIME seconds old and more than CACHE_MERGE_EXPIRY_GUARD
+ * seconds from expiry. The caller holds the bucket's lock.
+ */
+static inline int seg_evictable(const struct ttl_bucket *ttlb, const struct seg *seg)
+{
+	uint32_t age = date.tv_sec - seg->create_ts;
+
+	return seg->next_seg_id != CACHE_SEG_NONE &&
+	       HA_ATOMIC_LOAD(&seg->w_refcount) == 0 &&
+	       age >= CACHE_MERGE_MATURE_TIME &&
+	       age + CACHE_MERGE_EXPIRY_GUARD < ttlb->ttl_approx;
+}
+
+/* Find a sequence of CACHE_MERGE_MIN evictable segments in the shared list of
+ * <ttlb>, searching from <seg_id> towards the tail. Returns the first segment
+ * of the sequence, or CACHE_SEG_NONE.
+ */
+static __maybe_unused seg_id_t seg_merge_find(const struct cache *cache,
+                                              const struct ttl_bucket *ttlb,
+                                              seg_id_t seg_id)
+{
+	const struct seg *seg;
+	seg_id_t start = seg_id;
+	unsigned int n = 0;
+
+	while (seg_id != CACHE_SEG_NONE) {
+		seg = &cache->segments[seg_id];
+		if (seg_evictable(ttlb, seg)) {
+			n++;
+			if (n == CACHE_MERGE_MIN)
+				return start;
+		}
+		else {
+			n = 0;
+			start = seg->next_seg_id;
+		}
+		seg_id = seg->next_seg_id;
+	}
+	return CACHE_SEG_NONE;
+}
+
+/* Claim the sequence starting at <head_id> and the evictable segments that
+ * follow it, up to CACHE_MERGE_MAX in all. Returns how many were claimed and
+ * the last of them in <*last_id>. Holding the bucket's lock is the claim:
+ * nothing else evicts from or expires this list meanwhile.
+ */
+static __maybe_unused unsigned int seg_merge_claim(const struct cache *cache,
+                                                   const struct ttl_bucket *ttlb,
+                                                   seg_id_t head_id, seg_id_t *last_id)
+{
+	seg_id_t seg_id = head_id;
+	unsigned int n = 0;
+
+	while (n < CACHE_MERGE_MAX && seg_id != CACHE_SEG_NONE &&
+	       seg_evictable(ttlb, &cache->segments[seg_id])) {
+		*last_id = seg_id;
+		seg_id = cache->segments[seg_id].next_seg_id;
+		n++;
+	}
+	BUG_ON_HOT(n < CACHE_MERGE_MIN);
+	return n;
+}
+
+/* The bucket's resume point for its next merge, or CACHE_SEG_NONE when unset
+ * or when the segment it named has been reclaimed since (its generation moved
+ * on, or it is no longer live).
+ */
+static inline seg_id_t seg_merge_cursor(const struct cache *cache, struct ttl_bucket *ttlb)
+{
+	uint32_t w;
+
+	if (ttlb->merge_next == CACHE_SEG_NONE)
+		return CACHE_SEG_NONE;
+	w = _HA_ATOMIC_LOAD(&cache->segments[ttlb->merge_next].state_gen);
+	if (SEG_STATE(w) != SEG_S_LIVE || SEG_STATE_GEN(w) != ttlb->merge_next_gen)
+		ttlb->merge_next = CACHE_SEG_NONE;
+	return ttlb->merge_next;
+}
+
+static inline void seg_merge_cursor_set(const struct cache *cache, struct ttl_bucket *ttlb,
+                                        seg_id_t seg_id)
+{
+	ttlb->merge_next = seg_id;
+	if (seg_id != CACHE_SEG_NONE) {
+		uint32_t w = _HA_ATOMIC_LOAD(&cache->segments[seg_id].state_gen);
+
+		ttlb->merge_next_gen = SEG_STATE_GEN(w);
+	}
+}
+
+/* Free the unindexed, unlinked segment <seg_id>, or condemn it to be freed by
+ * its last reader. The segment has no writer and the caller holds the lock of
+ * the TTL bucket it came from. Returns SEG_RECLAIM_FREED or
+ * SEG_RECLAIM_CONDEMNED.
+ */
+static inline enum seg_reclaim_status seg_drain(struct cache *cache, seg_id_t seg_id)
+{
+	struct seg *seg = &cache->segments[seg_id];
+	uint32_t expected, gen;
+
+	/* Stop new readers from keeping a pin: they bump r_refcount first and
+	 * only then check the state, so every reader that got past this store
+	 * is counted by the loads below. No CAS is needed since only code
+	 * holding the bucket lock leaves SEG_S_LIVE; a caller that already
+	 * stored SEG_S_DRAINING loses nothing by our storing it again.
+	 */
+	gen = SEG_STATE_GEN(_HA_ATOMIC_LOAD(&seg->state_gen));
+	HA_ATOMIC_STORE_SEQ_CST(&seg->state_gen,
+	                        SEG_STATE_MAKE(gen, SEG_S_DRAINING));
+
+	/* At this point, there are no writers, no new writers or code trying to
+	 * expire/evict this segment can come because it has been unlinked from
+	 * the TTL bucket and we still hold the lock, no new readers can come
+	 * because the hashtable index slots have been cleared, but there might
+	 * still be pre-existing readers, and in-flight readers who have located
+	 * this segment from the hash table before its slots were cleared, but
+	 * have yet to increment the read refcount.
+	 */
+	if (HA_ATOMIC_LOAD_SEQ_CST(&seg->r_refcount) == 0) {
+		/* Relaxed store is fine because of the free-list lock. */
+		_HA_ATOMIC_STORE(&seg->state_gen,
+		                 SEG_STATE_MAKE(gen, SEG_S_FREE));
+		/* We saw that r_refcount is 0 here, so we know that there are
+		 * no pre-existing readers. Only those in-flight readers can get
+		 * to the struct seg, and they will promptly bail because the
+		 * state is not SEG_S_LIVE anymore. However, as soon as we call
+		 * seg_free_push(), it is possible for another writer in another
+		 * TTL bucket to pick it up and reuse it, in which case the
+		 * state will be SEG_S_LIVE again. It is not obvious why this
+		 * ABA situation isn't a problem, so it's worth explaining in
+		 * detail.
+		 *
+		 * Any in-flight readers incrementing r_refcount then verify
+		 * that the hashtable slot they read has not changed. In all
+		 * likelihood, if the segment has been picked up again, it will
+		 * have changed. However, if a new entry was stored, and its tag
+		 * and offset equal the previous ones, the readers will go on.
+		 * They will then check the full hash in the record. This is
+		 * safe, because if the slot has been published, the entry is
+		 * complete and therefore so is the record header. In all
+		 * likelihood, again, the full hash will not match the value the
+		 * readers expect, but it is technically possible. If that
+		 * happens, we are in one of two cases: either this new entry is
+		 * legitimately a fresher version of the entry the readers
+		 * wanted to read - which is fine - or we have a hash collision
+		 * and it is an unrelated entry. That is of course fantastically
+		 * unlikely, but it is possible and something we have already
+		 * accepted by using hash comparison as our identity check.
+		 * However, importantly, it won't cause any sort of corruption;
+		 * the cache remains in a valid state.
+		 */
+		seg_free_push(cache, seg_id);
+		return SEG_RECLAIM_FREED;
+	}
+
+	/* We do not need a CAS here either, for the exact same reason as the
+	 * transition to SEG_S_DRAINING above.
+	 */
+	HA_ATOMIC_STORE_SEQ_CST(&seg->state_gen,
+	                        SEG_STATE_MAKE(gen, SEG_S_CONDEMNED));
+
+	/* We compare r_refcount to 0 again here, to exclude pre-existing
+	 * readers, exactly like the check before transitioning to CONDEMNED.
+	 * This is necessary because since we did that transition, all the
+	 * pre-existing readers may have terminated and we don't know if there
+	 * are in-flight readers or not, but we still need someone to handle
+	 * that push back to the free-list. It can either be us, or the last
+	 * reader calling seg_read_unpin() - it cannot miss the CONDEMNED
+	 * state, by the same SEQ_CST ordering the earlier checks rely on, and
+	 * the CONDEMNED -> FREE CAS guarantees that exactly one of us
+	 * performs the push. Therefore, if we see that r_refcount is 0 here,
+	 * we need to attempt to do the push ourselves.
+	 */
+	if (HA_ATOMIC_LOAD_SEQ_CST(&seg->r_refcount) == 0) {
+		/* And because we still have no way to know if there are
+		 * in-flight readers or not, we need to use a CAS. It carries
+		 * the word we stored above: if we stall here across a full
+		 * free/reuse/re-condemn cycle of this segment, the generation
+		 * mismatch makes our stale CAS fail instead of freeing the
+		 * segment under the new generation's readers.
+		 */
+		expected = SEG_STATE_MAKE(gen, SEG_S_CONDEMNED);
+		if (HA_ATOMIC_CAS(&seg->state_gen, &expected,
+		                  SEG_STATE_MAKE(gen, SEG_S_FREE)))
+			seg_free_push(cache, seg_id);
+		/* Won or lost, the push is done or imminent: the segment is
+		 * freed.
+		 */
+		return SEG_RECLAIM_FREED;
+	}
+
+	/* Pre-existing readers still hold the segment; the last one to unpin
+	 * will free it. It is gone from the index and the TTL chain, but it
+	 * is not supply the caller can pop yet.
+	 */
+	return SEG_RECLAIM_CONDEMNED;
+}
+
 /* Reclaim the head segment <seg> of a segment list: unindex it, unlink it from
  * the list, then either free it or condemn it to be freed by its last reader.
  * The whole segment chain is reclaimed with its head; the number of segments
@@ -1038,7 +1246,7 @@ static inline enum seg_reclaim_status seg_reclaim(struct cache *cache, struct se
 {
 	seg_id_t seg_id = seg_list_first(l);
 	struct seg *seg = &cache->segments[seg_id];
-	uint32_t expected, gen;
+	uint32_t gen;
 
 	/* Setting the state to something other than SEG_S_LIVE stops any new
 	 * reader from keeping a pin - but crucially, they still bump r_refcount
@@ -1087,92 +1295,7 @@ static inline enum seg_reclaim_status seg_reclaim(struct cache *cache, struct se
 	 */
 	seg_list_pop(cache, l);
 
-	/* At this point, there are no writers, no new writers or code trying to
-	 * expire/evict this segment can come because it has been unlinked from
-	 * the TTL bucket and we still hold the lock, no new readers can come
-	 * because the hashtable index slots have been cleared, but there might
-	 * still be pre-existing readers, and in-flight readers who have located
-	 * this segment from the hash table before we called seg_unindex(), but
-	 * have yet to increment the read refcount.
-	 */
-	if (HA_ATOMIC_LOAD_SEQ_CST(&seg->r_refcount) == 0) {
-		/* Relaxed store is fine because of the free-list lock. */
-		_HA_ATOMIC_STORE(&seg->state_gen,
-		                 SEG_STATE_MAKE(gen, SEG_S_FREE));
-		/* We saw that r_refcount is 0 here, so we know that there are
-		 * no pre-existing readers. Only those in-flight readers can get
-		 * to the struct seg, and they will promptly bail because the
-		 * state is not SEG_S_LIVE anymore. However, as soon as we call
-		 * seg_free_push(), it is possible for another writer in another
-		 * TTL bucket to pick it up and reuse it, in which case the
-		 * state will be SEG_S_LIVE again. It is not obvious why this
-		 * ABA situation isn't a problem, so it's worth explaining in
-		 * detail.
-		 *
-		 * Any in-flight readers incrementing r_refcount then verify
-		 * that the hashtable slot they read has not changed. In all
-		 * likelihood, if the segment has been picked up again, it will
-		 * have changed. However, if a new entry was stored, and its tag
-		 * and offset equal the previous ones, the readers will go on.
-		 * They will then check the full hash in the record. This is
-		 * safe, because if the slot has been published, the entry is
-		 * complete and therefore so is the record header. In all
-		 * likelihood, again, the full hash will not match the value the
-		 * readers expect, but it is technically possible. If that
-		 * happens, we are in one of two cases: either this new entry is
-		 * legitimately a fresher version of the entry the readers
-		 * wanted to read - which is fine - or we have a hash collision
-		 * and it is an unrelated entry. That is of course fantastically
-		 * unlikely, but it is possible and something we have already
-		 * accepted by using hash comparison as our identity check.
-		 * However, importantly, it won't cause any sort of corruption;
-		 * the cache remains in a valid state.
-		 */
-		seg_free_push(cache, seg_id);
-		return SEG_RECLAIM_FREED;
-	}
-
-	/* We do not need a CAS here either, for the exact same reason as the
-	 * LIVE -> DRAINING transition at the beginning of this function.
-	 */
-	HA_ATOMIC_STORE_SEQ_CST(&seg->state_gen,
-	                        SEG_STATE_MAKE(gen, SEG_S_CONDEMNED));
-
-	/* We compare r_refcount to 0 again here, to exclude pre-existing
-	 * readers, exactly like the check before transitioning to CONDEMNED.
-	 * This is necessary because since we did that transition, all the
-	 * pre-existing readers may have terminated and we don't know if there
-	 * are in-flight readers or not, but we still need someone to handle
-	 * that push back to the free-list. It can either be us, or the last
-	 * reader calling seg_read_unpin() - it cannot miss the CONDEMNED
-	 * state, by the same SEQ_CST ordering the earlier checks rely on, and
-	 * the CONDEMNED -> FREE CAS guarantees that exactly one of us
-	 * performs the push. Therefore, if we see that r_refcount is 0 here,
-	 * we need to attempt to do the push ourselves.
-	 */
-	if (HA_ATOMIC_LOAD_SEQ_CST(&seg->r_refcount) == 0) {
-		/* And because we still have no way to know if there are
-		 * in-flight readers or not, we need to use a CAS. It carries
-		 * the word we stored above: if we stall here across a full
-		 * free/reuse/re-condemn cycle of this segment, the generation
-		 * mismatch makes our stale CAS fail instead of freeing the
-		 * segment under the new generation's readers.
-		 */
-		expected = SEG_STATE_MAKE(gen, SEG_S_CONDEMNED);
-		if (HA_ATOMIC_CAS(&seg->state_gen, &expected,
-		                  SEG_STATE_MAKE(gen, SEG_S_FREE)))
-			seg_free_push(cache, seg_id);
-		/* Won or lost, the push is done or imminent: the segment is
-		 * freed.
-		 */
-		return SEG_RECLAIM_FREED;
-	}
-
-	/* Pre-existing readers still hold the segment; the last one to unpin
-	 * will free it. It is gone from the index and the TTL chain, but it
-	 * is not supply the caller can pop yet.
-	 */
-	return SEG_RECLAIM_CONDEMNED;
+	return seg_drain(cache, seg_id);
 }
 
 /* Attempt to reclaim all the expired segments at the head of a TTL bucket
@@ -1494,6 +1617,7 @@ struct cache *cache_new(const struct cache_config *ucfg, uint flags,
 		ttlb->ttl_approx = off << (grp * CACHE_TTL_FACTOR_BITS);
 		seg_list_init(&ttlb->segs);
 		seg_list_init(&ttlb->prv_segs);
+		ttlb->merge_next = CACHE_SEG_NONE;
 		ttlb->lock = CACHE_LOCK_FREE;
 	}
 
