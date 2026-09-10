@@ -19,10 +19,9 @@
  *   be a slow client, so a segment can stay pinned for seconds. Nothing here
  *   may busy-loop or wait on such a pin, so the reclaim and store paths fail
  *   and retry later instead.
- * - Eviction is plain FIFO over whole segments, with no per-item frequency
- *   counter and no merging of live entries into compacted segments. An
- *   admission filter that only caches an object on its second sighting keeps
- *   one-hit wonders out of the store instead.
+ * - Merge-based eviction falls back to evicting whole segments when no
+ *   sequence of segments can be merged or no destination is available, so
+ *   a reservation never fails for lack of a merge.
  * - The paper does not concern itself with adversarial traffic, but we do:
  *   the hash is seeded, so an attacker cannot predict placement in the
  *   hashtable, nor forge a key colliding with a victim's.
@@ -357,6 +356,8 @@ struct cache {
 	spinlock_t pool_lock;           /* Lock for the pool of free segments */
 	seg_id_t free_seg_id;           /* Free-list of segments */
 	unsigned int n_free;            /* Number of free segments in the pool */
+	uint64_t merge_empty;           /* Merges that retained nothing */
+	uint64_t merge_success;         /* Merges that retained something */
 
 	struct cache_stats stats;       /* Activity counters */
 };
@@ -465,25 +466,6 @@ static inline void seg_list_append(const struct cache *cache, struct seg_list *l
 	l->last_seg_id = seg_id;
 	if (l->first_seg_id == CACHE_SEG_NONE)
 		_HA_ATOMIC_STORE(&l->first_seg_id, seg_id);
-}
-
-static inline seg_id_t seg_list_pop(const struct cache *cache, struct seg_list *l)
-{
-	struct seg *seg;
-	seg_id_t seg_id;
-
-	seg_id = l->first_seg_id;
-	if (seg_id != CACHE_SEG_NONE) {
-		seg = &cache->segments[seg_id];
-		_HA_ATOMIC_STORE(&l->first_seg_id, seg->next_seg_id);
-		if (seg->next_seg_id != CACHE_SEG_NONE) {
-			seg = &cache->segments[seg->next_seg_id];
-			seg->prev_seg_id = CACHE_SEG_NONE;
-		} else {
-			l->last_seg_id = CACHE_SEG_NONE;
-		}
-	}
-	return seg_id;
 }
 
 static inline void seg_list_splice(const struct cache *cache, struct seg_list *l,
@@ -598,7 +580,7 @@ static inline seg_id_t seg_free_pop(struct cache *cache, unsigned int n_segs, in
 		cache_unlock(&cache->pool_lock);
 		return CACHE_SEG_NONE;
 	}
-	cache->n_free -= n_segs;
+	_HA_ATOMIC_SUB(&cache->n_free, n_segs);
 	cache->free_seg_id = seg->next_chain_id;
 	cache_unlock(&cache->pool_lock);
 	seg->next_chain_id = CACHE_SEG_NONE;
@@ -635,7 +617,7 @@ static inline void seg_free_push(struct cache *cache, seg_id_t seg_id)
 	cache_lock(&cache->pool_lock);
 	last->next_chain_id = cache->free_seg_id;
 	cache->free_seg_id = first_seg_id;
-	cache->n_free += n_segs;
+	_HA_ATOMIC_ADD(&cache->n_free, n_segs);
 	cache_unlock(&cache->pool_lock);
 }
 
@@ -910,50 +892,61 @@ struct seg_merge_res {
  * copied to the destination and their slots repointed to it; every other slot
  * into a consumed source is cleared, so consumed sources come out unindexed.
  * Sources are consumed in list order until the destination is nearly full or
- * <n_srcs> is reached; res->merged says how many, the rest are untouched. The
- * caller holds the bucket's lock throughout, the sources have no writer, and
- * the destination is a fresh segment it has write-pinned.
+ * <n_srcs> is reached, but at least two, so that a merge always frees one
+ * segment net of its destination: a second source met with a full
+ * destination is thinned to what still fits. res->merged says how many were
+ * consumed, the rest are untouched. The caller holds the bucket's lock
+ * throughout, the sources have no writer, and the destination is a fresh
+ * segment linked in no list.
  *
- * A record is retained when its frequency, scaled by its size relative to the
+ * A record is retained when its hit count, scaled by its size relative to the
  * mean live record of its segment, exceeds the cutoff. The cutoff aims at
- * keeping 1/CACHE_MERGE_TARGET of the scanned bytes, dead ones included:
- * after every tenth of a segment it moves by the relative error on that
- * target whenever it exceeds 50%, and each source starts from the midpoint
- * between 1 and the previous source's final value. Once the destination is
- * past its stop mark, the remainder of the current source is kept whole
- * rather than thinned for a next source that will not come. With
- * <copy_all>, only a full destination drops a record.
+ * keeping 1/CACHE_MERGE_TARGET of each source's scanned bytes, dead ones
+ * included: after every tenth of a segment it moves by the relative error on
+ * that target whenever it exceeds 50%, and each source starts from the
+ * midpoint between 1 and the previous source's final value. A source whose
+ * incoming cutoff is zero, the first one under <copy_all> or any one after a
+ * source whose cutoff collapsed to zero, is copied whole. Once the
+ * destination is past its stop mark and so is the scan of the current source,
+ * the remainder of that source is kept whole rather than thinned for a next
+ * source that will not come; only a full destination drops a record then.
  */
-static __maybe_unused void seg_merge(struct cache *cache, seg_id_t dst_id,
-                                     seg_id_t head_id, unsigned int n_srcs,
-                                     int copy_all, struct seg_merge_res *res)
+static void seg_merge(struct cache *cache, seg_id_t dst_id, seg_id_t head_id,
+                      unsigned int n_srcs, int copy_all, struct seg_merge_res *res)
 {
 	struct seg *dst = &cache->segments[dst_id];
 	uint32_t stop = (uint64_t)cache->cfg.seg_size * CACHE_MERGE_STOP_PCT / 100;
+	uint32_t intvl = cache->cfg.seg_size / 10;
 	double target = 1.0 / MIN(n_srcs, CACHE_MERGE_TARGET);
 	double cutoff = 1.0;
-	size_t scanned = 0, checkpoint;
 	seg_id_t src_id = head_id;
 	struct seg *src;
 
 	memset(res, 0, sizeof(*res));
 	dst->create_ts = cache->segments[head_id].create_ts;
 	dst->ttl_bucket = cache->segments[head_id].ttl_bucket;
+	if (copy_all)
+		cutoff = 0.0;
 
-	for (; res->merged < n_srcs && dst->write_off < stop;
+	for (; res->merged < n_srcs && (dst->write_off < stop || res->merged < 2);
 	     res->merged++, src_id = src->next_seg_id) {
 		struct cache_whandle h = { .seg_id = src_id };
-		int keep_rest = copy_all;
+		size_t scanned = 0, copied = 0, checkpoint = intvl;
+		uint32_t n_live, off = 0;
 		double mean_size;
-		uint32_t off = 0;
+		int keep_rest;
 
 		BUG_ON_HOT(src_id == CACHE_SEG_NONE);
 		src = &cache->segments[src_id];
 		BUG_ON_HOT(src->flags & SEG_F_PRIVATE);
+		BUG_ON_HOT(src->write_off > cache->cfg.seg_size);
 
-		mean_size = src->n_live ? (double)src->live_bytes / src->n_live : 1.0;
-		cutoff = copy_all ? 0.0 : (1.0 + cutoff) / 2.0;
-		checkpoint = scanned + cache->cfg.seg_size / 10;
+		n_live = _HA_ATOMIC_LOAD(&src->n_live);
+		mean_size = 1.0;
+		if (n_live)
+			mean_size = (double)_HA_ATOMIC_LOAD(&src->live_bytes) / n_live;
+		keep_rest = cutoff < 0.0001;
+		cutoff = (1.0 + cutoff) / 2.0;
 
 		while (off < src->write_off) {
 			struct cache_record *rec;
@@ -964,18 +957,19 @@ static __maybe_unused void seg_merge(struct cache *cache, seg_id_t dst_id,
 
 			h.seg_off = off;
 			rec = CACHE_HANDLE_REC(cache, &h);
+			BUG_ON_HOT(rec->rec_len <= sizeof(struct cache_record));
 			stride = CACHE_OFF_ALIGN_UP(rec->rec_len);
 			off += stride;
 			scanned += stride;
 
 			if (scanned >= checkpoint) {
-				double t = ((double)res->copied / scanned - target) / target;
+				double t = ((double)copied / scanned - target) / target;
 
 				if (t > 0.5 || t < -0.5)
 					cutoff *= 1.0 + t;
-				checkpoint += cache->cfg.seg_size / 10;
+				checkpoint += intvl;
 			}
-			if (!keep_rest && dst->write_off >= stop && off > stop)
+			if (!keep_rest && dst->write_off >= stop && off - stride > stop)
 				keep_rest = 1;
 
 			ht_iter_init(&it, cache);
@@ -992,7 +986,8 @@ static __maybe_unused void seg_merge(struct cache *cache, seg_id_t dst_id,
 			expired = date.tv_sec >= rec->expire;
 			retain = 0;
 			if (!expired) {
-				double score = CACHE_SLOT_FREQ(slot) / (stride / mean_size);
+				double hits = (double)CACHE_SLOT_FREQ(slot) - 1.0;
+				double score = hits / ((double)stride / mean_size);
 
 				retain = (keep_rest || score > cutoff) &&
 				         dst->write_off + stride <= cache->cfg.seg_size;
@@ -1013,7 +1008,8 @@ static __maybe_unused void seg_merge(struct cache *cache, seg_id_t dst_id,
 			 */
 			relinked = 1;
 			do {
-				if (CACHE_SLOT_SEG(slot) != h.seg_id ||
+				if (slot == 0 ||
+				    CACHE_SLOT_SEG(slot) != h.seg_id ||
 				    CACHE_SLOT_OFF(slot) != h.seg_off) {
 					relinked = 0;
 					break;
@@ -1028,6 +1024,7 @@ static __maybe_unused void seg_merge(struct cache *cache, seg_id_t dst_id,
 				seg_live_add(dst, rec);
 				dst->write_off += stride;
 				res->copied += stride;
+				copied += stride;
 			}
 			else
 				res->lost += stride;
@@ -1054,9 +1051,8 @@ static inline int seg_evictable(const struct ttl_bucket *ttlb, const struct seg 
  * <ttlb>, searching from <seg_id> towards the tail. Returns the first segment
  * of the sequence, or CACHE_SEG_NONE.
  */
-static __maybe_unused seg_id_t seg_merge_find(const struct cache *cache,
-                                              const struct ttl_bucket *ttlb,
-                                              seg_id_t seg_id)
+static seg_id_t seg_merge_find(const struct cache *cache, const struct ttl_bucket *ttlb,
+                               seg_id_t seg_id)
 {
 	const struct seg *seg;
 	seg_id_t start = seg_id;
@@ -1079,20 +1075,18 @@ static __maybe_unused seg_id_t seg_merge_find(const struct cache *cache,
 }
 
 /* Claim the sequence starting at <head_id> and the evictable segments that
- * follow it, up to CACHE_MERGE_MAX in all. Returns how many were claimed and
- * the last of them in <*last_id>. Holding the bucket's lock is the claim:
- * nothing else evicts from or expires this list meanwhile.
+ * follow it, up to CACHE_MERGE_MAX in all; returns how many. Holding the
+ * bucket's lock is the claim: nothing else evicts from or expires this list
+ * meanwhile.
  */
-static __maybe_unused unsigned int seg_merge_claim(const struct cache *cache,
-                                                   const struct ttl_bucket *ttlb,
-                                                   seg_id_t head_id, seg_id_t *last_id)
+static unsigned int seg_merge_claim(const struct cache *cache, const struct ttl_bucket *ttlb,
+                                    seg_id_t head_id)
 {
 	seg_id_t seg_id = head_id;
 	unsigned int n = 0;
 
 	while (n < CACHE_MERGE_MAX && seg_id != CACHE_SEG_NONE &&
 	       seg_evictable(ttlb, &cache->segments[seg_id])) {
-		*last_id = seg_id;
 		seg_id = cache->segments[seg_id].next_seg_id;
 		n++;
 	}
@@ -1235,16 +1229,15 @@ static inline enum seg_reclaim_status seg_drain(struct cache *cache, seg_id_t se
 	return SEG_RECLAIM_CONDEMNED;
 }
 
-/* Reclaim the head segment <seg> of a segment list: unindex it, unlink it from
- * the list, then either free it or condemn it to be freed by its last reader.
+/* Reclaim segment <seg_id> of segment list <l>: unindex it, unlink it from the
+ * list, then either free it or condemn it to be freed by its last reader.
  * The whole segment chain is reclaimed with its head; the number of segments
  * it counts is stored in <n_segs> (except when blocked). The caller needs to
  * hold the TTL bucket lock where the segment list lives.
  */
 static inline enum seg_reclaim_status seg_reclaim(struct cache *cache, struct seg_list *l,
-                                                  uint32_t *n_segs)
+                                                  seg_id_t seg_id, uint32_t *n_segs)
 {
-	seg_id_t seg_id = seg_list_first(l);
 	struct seg *seg = &cache->segments[seg_id];
 	uint32_t gen;
 
@@ -1293,7 +1286,7 @@ static inline enum seg_reclaim_status seg_reclaim(struct cache *cache, struct se
 	 * candidate for expiration or eviction anymore. If this segment was
 	 * also the active one, no new writers will be able to find it as well.
 	 */
-	seg_list_pop(cache, l);
+	seg_list_splice(cache, l, seg_id, seg_id, CACHE_SEG_NONE);
 
 	return seg_drain(cache, seg_id);
 }
@@ -1313,7 +1306,7 @@ static inline int seg_list_expire(struct cache *cache, struct ttl_bucket *ttlb, 
 		seg = &cache->segments[seg_id];
 		if (!seg_expired(ttlb, seg))
 			break;
-		status = seg_reclaim(cache, l, &n_segs);
+		status = seg_reclaim(cache, l, seg_id, &n_segs);
 		if (status == SEG_RECLAIM_BLOCKED)
 			break;
 		if (status == SEG_RECLAIM_FREED)
@@ -1743,6 +1736,121 @@ void cache_expire(struct cache *cache)
 	}
 }
 
+/* Evict segment <seg_id> of list <l> whole, the caller holding the bucket's
+ * lock, and account for it: segments that reached the free pool are added to
+ * <freed>. Returns the status of the reclaim round. Unlike a merge, this does
+ * not consult seg_evictable(): it is the fallback when merging cannot run.
+ */
+static enum cache_reclaim_status seg_evict(struct cache *cache, struct seg_list *l,
+                                           seg_id_t seg_id, unsigned int *freed)
+{
+	enum seg_reclaim_status status;
+	uint32_t n_segs;
+
+	status = seg_reclaim(cache, l, seg_id, &n_segs);
+	if (status == SEG_RECLAIM_BLOCKED) {
+		_HA_ATOMIC_INC(&cache->stats.reclaim_blocked);
+		return CACHE_RECLAIM_RETRY;
+	}
+	_HA_ATOMIC_ADD(&cache->stats.segs_evicted, n_segs);
+	if (status == SEG_RECLAIM_FREED) {
+		*freed += n_segs;
+		return CACHE_RECLAIM_PROGRESS;
+	}
+	return CACHE_RECLAIM_RETRY;
+}
+
+/* Merge-based eviction in the shared list of <ttlb>, whose lock the caller
+ * holds. <needed> is the number of segments the caller still waits for and
+ * <freed> accumulates the segments that reached the free pool. Returns the
+ * status of the reclaim round.
+ *
+ * Expired segments at the head go first, as they cost nothing. Otherwise a
+ * sequence of evictable segments is searched from the bucket's cursor, then
+ * from its head, and merged into a destination taken from the reserve, which
+ * takes the sequence's place in the list; the consumed sources are drained.
+ * A merge that retained nothing returns its destination to the pool, and once
+ * such merges outnumber the successful ones, later merges start out copying
+ * every live record. Without a destination the sequence's first segment is
+ * evicted whole; without a sequence, the list's head is.
+ */
+static enum cache_reclaim_status ttl_bucket_merge(struct cache *cache, struct ttl_bucket *ttlb,
+                                                  unsigned int needed, unsigned int *freed)
+{
+	struct seg_list *l = &ttlb->segs;
+	seg_id_t srcs[CACHE_MERGE_MAX];
+	struct seg_merge_res res;
+	seg_id_t head_id, dst_id, seg_id;
+	uint64_t empty, success;
+	unsigned int n, i;
+	int supply;
+
+	*freed += seg_list_expire(cache, ttlb, l);
+	if (*freed >= needed)
+		return CACHE_RECLAIM_PROGRESS;
+	if (seg_list_first(l) == CACHE_SEG_NONE)
+		return CACHE_RECLAIM_RETRY;
+
+	head_id = seg_merge_find(cache, ttlb, seg_merge_cursor(cache, ttlb));
+	if (head_id == CACHE_SEG_NONE)
+		head_id = seg_merge_find(cache, ttlb, seg_list_first(l));
+	if (head_id == CACHE_SEG_NONE) {
+		seg_merge_cursor_set(cache, ttlb, CACHE_SEG_NONE);
+		return seg_evict(cache, l, seg_list_first(l), freed);
+	}
+
+	dst_id = seg_free_pop(cache, 1, 1);
+	if (dst_id == CACHE_SEG_NONE)
+		return seg_evict(cache, l, head_id, freed);
+	seg_reinit(&cache->segments[dst_id]);
+
+	n = seg_merge_claim(cache, ttlb, head_id);
+	empty = _HA_ATOMIC_LOAD(&cache->merge_empty);
+	success = _HA_ATOMIC_LOAD(&cache->merge_success);
+	seg_merge(cache, dst_id, head_id, n, empty > 2 && empty > success, &res);
+
+	/* A spliced-out segment's links are not to be read: collect the
+	 * consumed sources first, ending on their successor, where the cursor
+	 * resumes.
+	 */
+	seg_id = head_id;
+	for (i = 0; i < res.merged; i++) {
+		srcs[i] = seg_id;
+		seg_id = cache->segments[seg_id].next_seg_id;
+	}
+
+	if (res.copied > 0) {
+		seg_list_splice(cache, l, head_id, srcs[res.merged - 1], dst_id);
+		_HA_ATOMIC_INC(&cache->merge_success);
+		supply = -1;
+	}
+	else {
+		seg_list_splice(cache, l, head_id, srcs[res.merged - 1], CACHE_SEG_NONE);
+		seg_free_push(cache, dst_id);
+		_HA_ATOMIC_INC(&cache->merge_empty);
+		supply = 0;
+	}
+	seg_merge_cursor_set(cache, ttlb, seg_id);
+
+	for (i = 0; i < res.merged; i++) {
+		if (seg_drain(cache, srcs[i]) == SEG_RECLAIM_FREED)
+			supply++;
+	}
+	_HA_ATOMIC_ADD(&cache->stats.segs_evicted, res.merged);
+
+	/* The destination came out of the pool: only what the sources put back
+	 * beyond it is supply the caller can pop, and with none put back the
+	 * pool is one short of what the scan's expiries counted.
+	 */
+	if (supply <= 0) {
+		if (supply < 0 && *freed > 0)
+			(*freed)--;
+		return CACHE_RECLAIM_RETRY;
+	}
+	*freed += supply;
+	return CACHE_RECLAIM_PROGRESS;
+}
+
 /* Attempt to reclaim a segment for a new reservation. We always attempt to
  * reclaim an expired segment before evicting a live one.
  *
@@ -1757,9 +1865,12 @@ void cache_expire(struct cache *cache)
  *
  * <needed> is the number of segments the caller is waiting for: expired
  * segments freed during the scan count towards it and the scan stops as soon
- * as it is covered, while at most one victim is evicted per call. The number
- * of segments that measurably reached the free pool is returned in <freed>;
- * it can exceed <needed> since segments are freed whole chains at a time.
+ * as it is covered, while at most one eviction or merge runs per call.
+ * <reserving> is the size of the reservation the caller will retry: once the
+ * victim is locked, a pool that can already serve it ends the round. The
+ * number of segments that measurably reached the free pool is returned in
+ * <freed>; it can exceed <needed> since segments are freed whole chains at a
+ * time.
  *
  * If we observed no in-use segment, return CACHE_RECLAIM_GIVEUP. This should
  * hardly ever happen in practice. If a segment actually reached the free
@@ -1772,15 +1883,16 @@ void cache_expire(struct cache *cache)
  */
 static enum cache_reclaim_status cache_reclaim(struct cache *cache,
                                                unsigned int needed,
+                                               unsigned int reserving,
                                                unsigned int *freed)
 {
 	struct ttl_bucket *ttlb, *best;
 	struct seg_list *best_list;
 	struct seg *seg;
-	enum seg_reclaim_status status;
+	enum cache_reclaim_status status;
 	uint32_t oldest_ts, best_gen;
 	seg_id_t seg_id, best_seg_id;
-	uint32_t n_segs, scan_off;
+	uint32_t scan_off;
 	int i, j, seen, vanished;
 
 	*freed = 0;
@@ -1897,8 +2009,8 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 		return CACHE_RECLAIM_GIVEUP;
 	}
 
-	/* Expiration did not cover the need: evict the elected victim rather
-	 * than throw away the scan we paid for.
+	/* Expiration did not cover the need: merge or evict in the elected
+	 * bucket rather than throw away the scan we paid for.
 	 */
 	cache_lock(&best->lock);
 	seg_id = seg_list_first(best_list);
@@ -1921,20 +2033,22 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 		return CACHE_RECLAIM_PROGRESS;
 	}
 
-	status = seg_reclaim(cache, best_list, &n_segs);
-	if (status == SEG_RECLAIM_BLOCKED)
-		_HA_ATOMIC_INC(&cache->stats.reclaim_blocked);
-	else
-		_HA_ATOMIC_ADD(&cache->stats.segs_evicted, n_segs);
-	if (status == SEG_RECLAIM_FREED) {
-		*freed += n_segs;
+	/* Another reclaimer may have refilled the pool since the election. */
+	if (_HA_ATOMIC_LOAD(&cache->n_free) >= cache->cfg.n_reserved + reserving) {
 		cache_unlock(&best->lock);
 		return CACHE_RECLAIM_PROGRESS;
 	}
 
+	if (best_list == &best->segs)
+		status = ttl_bucket_merge(cache, best, needed, freed);
+	else
+		status = seg_evict(cache, best_list, best_seg_id, freed);
 	cache_unlock(&best->lock);
 
-	/* The victim was only condemned (its free deferred to its last
+	if (status == CACHE_RECLAIM_PROGRESS)
+		return CACHE_RECLAIM_PROGRESS;
+
+	/* The victims were only condemned (their free deferred to their last
 	 * reader) or blocked by a writer - not supply. Expired segments
 	 * freed during the scan still are.
 	 */
@@ -1972,8 +2086,8 @@ static inline void cache_reclaim_budget_init(struct cache_reclaim_budget *b,
  * The budget is spent on three conditions. A few consecutive attempts with
  * no progress at all mean reclaim cannot help right now. The total number of
  * attempts is capped to bound the time spent on a single reservation. And an
- * attempt must remain plausible to be worth continuing: eviction supplies
- * segments roughly one victim per attempt, so when the shortfall exceeds the
+ * attempt must remain plausible to be worth continuing: reclaim supplies at
+ * least one segment per productive attempt, so when the shortfall exceeds the
  * attempts remaining, the reservation cannot be satisfied in time and going
  * on would only evict entries for nothing.
  */
@@ -1988,7 +2102,7 @@ static int cache_reclaim_try(struct cache *cache, struct cache_reclaim_budget *b
 	 * let the attempts cap bound the losses.
 	 */
 	shortfall = b->needed > b->freed ? b->needed - b->freed : 1;
-	status = cache_reclaim(cache, shortfall, &freed);
+	status = cache_reclaim(cache, shortfall, b->needed, &freed);
 	if (status == CACHE_RECLAIM_GIVEUP) {
 		_HA_ATOMIC_INC(&cache->stats.reserve_fail_giveup);
 		goto fail;
@@ -2268,24 +2382,33 @@ void cache_delete(struct cache *cache, const struct cache_key *key)
 
 	ht_iter_init(&it, cache);
 	while ((slotp = ht_iter_next_tag(&it, &key->hash, &slot)) != NULL) {
-		h = seg_read_pin(cache, &key->hash, slotp, &slot, 0);
-		if (CACHE_HANDLE_ERR(h))
-			continue;
-
-		/* Retry a CAS lost to a counter bump; stop if the slot was
-		 * replaced or emptied.
+		/* A slot that changed under us to another location of the same
+		 * key was moved by a merge or superseded by a concurrent store:
+		 * pin the new location and purge it too. Stop on an emptied slot
+		 * or another key.
 		 */
-		while (!(removed = HA_ATOMIC_CAS(slotp, &slot, 0))) {
-			if (CACHE_SLOT_SEG(slot) != h.seg_id ||
-			    CACHE_SLOT_OFF(slot) != h.seg_off)
+		do {
+			h = seg_read_pin(cache, &key->hash, slotp, &slot, 0);
+			if (CACHE_HANDLE_ERR(h))
 				break;
-			__ha_cpu_relax();
-		}
-		if (removed && !(cache->segments[h.seg_id].flags & SEG_F_PRIVATE))
-			seg_live_sub(&cache->segments[h.seg_id],
-			             CACHE_HANDLE_REC(cache, &h));
 
-		seg_read_unpin(cache, &cache->segments[h.seg_id]);
+			/* Retry a CAS lost to a counter bump; stop if the slot
+			 * no longer names this record.
+			 */
+			while (!(removed = HA_ATOMIC_CAS(slotp, &slot, 0))) {
+				if (slot == 0 ||
+				    CACHE_SLOT_SEG(slot) != h.seg_id ||
+				    CACHE_SLOT_OFF(slot) != h.seg_off)
+					break;
+				__ha_cpu_relax();
+			}
+			if (removed && !(cache->segments[h.seg_id].flags & SEG_F_PRIVATE))
+				seg_live_sub(&cache->segments[h.seg_id],
+				             CACHE_HANDLE_REC(cache, &h));
+
+			seg_read_unpin(cache, &cache->segments[h.seg_id]);
+		} while (!removed && slot != 0 &&
+		         CACHE_SLOT_TAG(slot) == CACHE_HASH_TAG(key->hash));
 
 		/* Keep scanning: racing first-time stores of the same key can
 		 * leave more than one live slot for it, and a purge must be

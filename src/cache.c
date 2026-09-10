@@ -2490,6 +2490,7 @@ int post_check_cache()
 		if (!(cache->flags & CACHE_CF_EARLY_HINTS_ONLY)) {
 			uint flags = (cache->flags & CACHE_CF_NO_ADMISSION) ? CACHE_F_NO_ADM_FILTER : 0;
 
+			cache->store_cfg.n_reserved = global.nbthread;
 			cache->store = cache_new(&cache->store_cfg, flags,
 			                         cache->total_size,
 			                         cache_hash_seed, cache->id);
