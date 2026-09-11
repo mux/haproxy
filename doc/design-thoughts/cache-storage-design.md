@@ -131,9 +131,9 @@ in the slot itself.
   match, this is a large saving.
 
 An all-zero slot means "empty", so a live slot is kept non-zero by construction:
-its frequency counter (below) starts at 1 and never drops below it, while the
-tag and location fields can all legitimately be 0. This lets the empty check be
-a single comparison against zero.
+the bit between the frequency counter (below) and the tag is always set, while
+the tag, location and counter fields can all legitimately be 0. This lets the
+empty check be a single comparison against zero.
 
 ## Concurrency & scalability
 
@@ -165,8 +165,9 @@ whether to serve from a segment on its way out. `cache_delete()` skips it, so
 that a purge cannot miss an entry whose segment is transiently draining.
 
 The slot also carries Segcache's per-item frequency counter (the ASFC) in
-seven bits between the location and the tag. A served hit bumps it with a
-single compare-and-swap -- exactly for the first sixteen hits, then with
+seven bits between the location and the tag. It counts hits, so it starts at 0
+when a record is published or relocated by a merge. A served hit bumps it with
+a single compare-and-swap -- exactly for the first sixteen hits, then with
 probability 1/count, so a hot entry soon stops rewriting its slot -- and a
 lost bump is dropped: the counter is approximate. A reader revalidating its
 pin ignores the counter bits, and the compare-and-swaps that clear or replace

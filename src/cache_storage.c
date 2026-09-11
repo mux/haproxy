@@ -151,12 +151,14 @@ BUG_ON_STATIC(CACHE_ADMIT_BITS_PER_KEY & (CACHE_ADMIT_BITS_PER_KEY - 1));
 #define CACHE_SLOT_FREQ_MASK    (((1ULL << CACHE_SLOT_FREQ_BITS) - 1) << CACHE_SLOT_FREQ_SHIFT)
 #define CACHE_SLOT_TAG_MASK     (((1ULL << CACHE_SLOT_TAG_BITS)  - 1) << CACHE_SLOT_TAG_SHIFT)
 
-/* The counter saturates at the field's maximum. One bit between the
- * frequency and the tag is unused.
+/* The counter saturates at the field's maximum. The bit between the
+ * frequency and the tag is always set in a live slot, so that one never
+ * encodes as all zeroes (the empty value) whatever its other fields hold.
  */
 #define CACHE_SLOT_FREQ_MAX     ((1U << CACHE_SLOT_FREQ_BITS) - 1)
+#define CACHE_SLOT_LIVE         (1ULL << (CACHE_SLOT_FREQ_SHIFT + CACHE_SLOT_FREQ_BITS))
 
-BUG_ON_STATIC(CACHE_SLOT_FREQ_SHIFT + CACHE_SLOT_FREQ_BITS > CACHE_SLOT_TAG_SHIFT);
+BUG_ON_STATIC(CACHE_SLOT_FREQ_SHIFT + CACHE_SLOT_FREQ_BITS >= CACHE_SLOT_TAG_SHIFT);
 
 /* Accessor macros */
 #define CACHE_SLOT_OFF(slot)    \
@@ -168,11 +170,12 @@ BUG_ON_STATIC(CACHE_SLOT_FREQ_SHIFT + CACHE_SLOT_FREQ_BITS > CACHE_SLOT_TAG_SHIF
 #define CACHE_SLOT_TAG(slot)    \
 	((((slot) & CACHE_SLOT_TAG_MASK)  >> CACHE_SLOT_TAG_SHIFT))
 
-/* Creation macro. The frequency counter starts at 1 and never drops below
- * it, so a live slot never encodes as all zeroes (the empty value).
+/* Creation macro. The frequency counter counts hits, so a fresh slot
+ * carries 0.
  */
 #define CACHE_SLOT_MAKE(tag, seg, off, freq)                              \
 	(((uint64_t)(tag)                     << CACHE_SLOT_TAG_SHIFT)  | \
+	CACHE_SLOT_LIVE                                                 | \
 	( (uint64_t)(freq)                    << CACHE_SLOT_FREQ_SHIFT) | \
 	( (uint64_t)(seg)                     << CACHE_SLOT_SEG_SHIFT)  | \
 	(((uint64_t)(off) >> CACHE_OFF_SHIFT) << CACHE_SLOT_OFF_SHIFT))
@@ -986,7 +989,7 @@ static void seg_merge(struct cache *cache, seg_id_t dst_id, seg_id_t head_id,
 			expired = date.tv_sec >= rec->expire;
 			retain = 0;
 			if (!expired) {
-				double hits = (double)CACHE_SLOT_FREQ(slot) - 1.0;
+				double hits = (double)CACHE_SLOT_FREQ(slot);
 				double score = hits / ((double)stride / mean_size);
 
 				retain = (keep_rest || score > cutoff) &&
@@ -998,7 +1001,7 @@ static void seg_merge(struct cache *cache, seg_id_t dst_id, seg_id_t head_id,
 				       CACHE_ARENA_OFF(cache, dst_id, dst->write_off),
 				       rec, stride);
 				newval = CACHE_SLOT_MAKE(CACHE_HASH_TAG(rec->hash),
-				                         dst_id, dst->write_off, 1);
+				                         dst_id, dst->write_off, 0);
 			}
 			else
 				newval = 0;
@@ -2687,7 +2690,7 @@ int cache_publish(struct cache *cache, const struct cache_whandle *h)
 	}
 
 	tag = CACHE_HASH_TAG(rec->hash);
-	slot = CACHE_SLOT_MAKE(tag, h->seg_id, h->seg_off, 1);
+	slot = CACHE_SLOT_MAKE(tag, h->seg_id, h->seg_off, 0);
 
 	/* First look for an existing entry with the same key and replace it
 	 * in place, so that a key only ever has one live slot: a re-store of
