@@ -371,6 +371,17 @@ have no such freedom, which is why the two kinds do not mix: each TTL bucket
 keeps two segment queues, shared and private, and reclamation visits both in
 creation order.
 
+Most such entries turn out small once complete -- compressed pages and API
+responses are the typical case -- and leaving each in a segment of its own would
+cap the cache at one such entry per segment. So when an unknown-length entry is
+published and its record fits in half a segment, it is relocated into the
+bucket's shared list, reserved there exactly as a sized store would have been,
+and its private segment returns to the pool at once. Larger entries stay
+private: the copy grows with the record while the space it recovers shrinks, and
+a record near a segment in size would strand the shared tail's remainder on top.
+The copy is a single memcpy on the writer's thread, of bytes written once
+already, and a copy that finds no room simply leaves the entry where it is.
+
 Private segments are also what makes entries larger than a segment possible.
 When a write runs past the end of a private entry's reservation, the engine
 takes more segments from the free pool and splices them onto the tail of the

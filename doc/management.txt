@@ -3115,6 +3115,9 @@ show cache [stats]
                                superseded live copies, plus aborted or failed
                                stores in shared segments (a private chain is
                                returned to the pool at once instead)
+     segs_relocated            Private segments freed at publish because their
+                               object, of unknown length until then, was small
+                               enough to be relocated into a shared segment
      read_pin_fails            Lookups that gave up reading an object because
                                stores or deletes of the same key kept replacing
                                its index entry

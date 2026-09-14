@@ -309,6 +309,15 @@ BUG_ON_STATIC(sizeof(struct ht_bucket) != 64);
  */
 #define CACHE_RESERVE_MAX_BUSY  4
 
+/* An unknown-length entry whose record ends up at most this share of a
+ * segment is relocated into its bucket's shared list when published, so that
+ * its private segment goes back to the pool instead of holding that single
+ * entry. Larger records stay private: the copy grows with the record while the
+ * space it recovers shrinks, and a record near a segment in size strands the
+ * shared tail's remainder on top.
+ */
+#define CACHE_RELOCATE_MAX_PCT  50
+
 enum cache_reclaim_status {
 	CACHE_RECLAIM_PROGRESS,
 	CACHE_RECLAIM_RETRY,
@@ -2136,6 +2145,41 @@ fail:
 	return -1;
 }
 
+/* Relocate a finished unknown-length entry out of its private segment <h>
+ * into the shared list of its TTL bucket: reserve its exact size there, as a
+ * sized store would have, and copy the record over. Returns the shared
+ * reservation, or an error handle when no room could be made, in which case
+ * the entry is left where it is. Either way the private segment stays the
+ * caller's.
+ *
+ * Room is made by the same reclaim a store uses, but a failure here only keeps
+ * the entry in its private segment, so it is not a reserve failure and the
+ * reserve_fail counters are left alone.
+ */
+static struct cache_whandle seg_relocate(struct cache *cache, const struct cache_whandle *h)
+{
+	struct cache_record *rec = CACHE_HANDLE_REC(cache, h);
+	struct seg *seg = &cache->segments[h->seg_id];
+	struct ttl_bucket *ttlb = &cache->ttl_buckets[seg->ttl_bucket];
+	struct cache_whandle nh;
+	size_t total_len = CACHE_OFF_ALIGN_UP(rec->rec_len);
+	unsigned int freed;
+	int attempts = 0;
+
+	while (1) {
+		nh = ttl_bucket_reserve(cache, ttlb, total_len);
+		if (!CACHE_HANDLE_ERR(nh))
+			break;
+		if (attempts++ >= CACHE_RESERVE_ATTEMPTS ||
+		    cache_reclaim(cache, 1, 1, &freed) == CACHE_RECLAIM_GIVEUP)
+			return CACHE_WHANDLE_NULL;
+	}
+
+	memcpy(CACHE_HANDLE_REC(cache, &nh), rec, rec->rec_len);
+	nh.data_off = h->data_off;
+	return nh;
+}
+
 void cache_hash(const struct cache *cache, const void *key, uint32_t key_len,
                 struct cache_key *key_hash)
 {
@@ -2625,6 +2669,7 @@ int cache_publish(struct cache *cache, const struct cache_whandle *h)
 {
 	struct ht_iter it;
 	struct cache_rhandle rh;
+	struct cache_whandle moved;
 	struct cache_record *rec;
 	struct ht_bucket *b[2];
 	struct seg *seg;
@@ -2645,14 +2690,33 @@ int cache_publish(struct cache *cache, const struct cache_whandle *h)
 		if (h->data_off == 0)
 			goto fail;
 		rec->rec_len = sizeof(struct cache_record) + h->data_off;
-		/* Shrink write_off to the end of what was written so
-		 * seg_unindex() stops there, clamped because a grown entry
-		 * spans several segments while write_off is a within-segment
-		 * offset. Such a segment holds one record, so any non-zero
-		 * bound visits it.
+
+		/* An entry that turned out small enough moves to the shared
+		 * list, and its private segment returns to the pool at once
+		 * instead of holding this single entry until reclaim.
 		 */
-		seg->write_off = MIN(CACHE_OFF_ALIGN_UP(rec->rec_len),
-		                     cache->cfg.seg_size);
+		CACHE_HANDLE_INIT(moved);
+		if (CACHE_OFF_ALIGN_UP(rec->rec_len) <=
+		    (uint64_t)cache->cfg.seg_size * CACHE_RELOCATE_MAX_PCT / 100)
+			moved = seg_relocate(cache, h);
+		if (!CACHE_HANDLE_ERR(moved)) {
+			seg_write_unpin(seg);
+			seg_free_push(cache, h->seg_id);
+			_HA_ATOMIC_INC(&cache->stats.segs_relocated);
+			h = &moved;
+			rec = CACHE_HANDLE_REC(cache, h);
+			seg = &cache->segments[h->seg_id];
+		}
+		else {
+			/* Shrink write_off to the end of what was written so
+			 * seg_unindex() stops there, clamped because a grown
+			 * entry spans several segments while write_off is a
+			 * within-segment offset. Such a segment holds one
+			 * record, so any non-zero bound visits it.
+			 */
+			seg->write_off = MIN(CACHE_OFF_ALIGN_UP(rec->rec_len),
+			                     cache->cfg.seg_size);
+		}
 	}
 
 	/* Since cache_write() correctly protects against out-of-bounds writes,
@@ -2809,6 +2873,7 @@ void cache_get_stats(const struct cache *cache, struct cache_stats *stats)
 	stats->publish_supersedes = _HA_ATOMIC_LOAD(&cache->stats.publish_supersedes);
 	stats->aborts = _HA_ATOMIC_LOAD(&cache->stats.aborts);
 	stats->dead_bytes = _HA_ATOMIC_LOAD(&cache->stats.dead_bytes);
+	stats->segs_relocated = _HA_ATOMIC_LOAD(&cache->stats.segs_relocated);
 }
 
 size_t cache_entry_size(const struct cache *cache, const struct cache_rhandle *h)

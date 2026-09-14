@@ -3054,6 +3054,8 @@ static void show_cache_stats(struct buffer *buf, const char *tag,
 	              (unsigned long long)st.aborts);
 	chunk_appendf(buf, "%s.dead_bytes: %llu\n", tag,
 	              (unsigned long long)st.dead_bytes);
+	chunk_appendf(buf, "%s.segs_relocated: %llu\n", tag,
+	              (unsigned long long)st.segs_relocated);
 	chunk_appendf(buf, "%s.reserve_fails: %llu\n", tag,
 	              (unsigned long long)st.reserve_fails);
 	chunk_appendf(buf, "%s.reserve_fail_giveup: %llu\n", tag,
