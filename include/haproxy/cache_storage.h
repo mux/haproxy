@@ -106,7 +106,7 @@ struct cache_stats {
 	uint64_t publish_supersedes; /* Publishes that replaced a live entry of the same key */
 	uint64_t aborts;             /* Reservations abandoned unpublished */
 	uint64_t dead_bytes;         /* Bytes left dead in segments until reclaim */
-	uint64_t segs_relocated;     /* Private segments emptied into a shared one at publish */
+	uint64_t segs_emptied;       /* Dead segments reclaimed at once, ahead of expiry or eviction */
 	uint64_t segs_expired;    /* Segments reclaimed at expiry */
 	uint64_t segs_evicted;    /* Live segments evicted to make room */
 };

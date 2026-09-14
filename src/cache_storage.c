@@ -309,15 +309,6 @@ BUG_ON_STATIC(sizeof(struct ht_bucket) != 64);
  */
 #define CACHE_RESERVE_MAX_BUSY  4
 
-/* An unknown-length entry whose record ends up at most this share of a
- * segment is relocated into its bucket's shared list when published, so that
- * its private segment goes back to the pool instead of holding that single
- * entry. Larger records stay private: the copy grows with the record while the
- * space it recovers shrinks, and a record near a segment in size strands the
- * shared tail's remainder on top.
- */
-#define CACHE_RELOCATE_MAX_PCT  50
-
 enum cache_reclaim_status {
 	CACHE_RECLAIM_PROGRESS,
 	CACHE_RECLAIM_RETRY,
@@ -1303,6 +1294,44 @@ static inline enum seg_reclaim_status seg_reclaim(struct cache *cache, struct se
 	return seg_drain(cache, seg_id);
 }
 
+/* Reclaim shared segment <seg_id> of bucket <ttlb> if no writer and no indexed
+ * record are left in it: nothing can reach it any more. The writer count is
+ * read first, since a publish bumps n_live before dropping its pin. The caller
+ * holds the bucket lock.
+ */
+static void seg_reclaim_dead(struct cache *cache, struct ttl_bucket *ttlb, seg_id_t seg_id)
+{
+	struct seg *seg = &cache->segments[seg_id];
+	uint32_t n_segs;
+
+	if (HA_ATOMIC_LOAD(&seg->w_refcount) != 0 || HA_ATOMIC_LOAD(&seg->n_live) != 0)
+		return;
+	if (seg_reclaim(cache, &ttlb->segs, seg_id, &n_segs) != SEG_RECLAIM_BLOCKED)
+		_HA_ATOMIC_ADD(&cache->stats.segs_emptied, n_segs);
+}
+
+/* Reclaim shared segment <seg_id> at once if an abort, delete or supersede
+ * just left it dead, unless it is its bucket's tail, which still takes new
+ * reservations. <ttl_bucket> and <state_gen> were read while the caller still
+ * pinned the segment: a different state or generation under the lock means it
+ * was reclaimed, and possibly reused, meanwhile.
+ */
+static void seg_check_dead(struct cache *cache, seg_id_t seg_id,
+                           unsigned int ttl_bucket, uint32_t state_gen)
+{
+	struct seg *seg = &cache->segments[seg_id];
+	struct ttl_bucket *ttlb = &cache->ttl_buckets[ttl_bucket];
+
+	if (SEG_STATE(state_gen) != SEG_S_LIVE || HA_ATOMIC_LOAD(&seg->n_live) != 0)
+		return;
+
+	cache_lock(&ttlb->lock);
+	if (_HA_ATOMIC_LOAD(&seg->state_gen) == state_gen &&
+	    seg_list_last(&ttlb->segs) != seg_id)
+		seg_reclaim_dead(cache, ttlb, seg_id);
+	cache_unlock(&ttlb->lock);
+}
+
 /* Attempt to reclaim all the expired segments at the head of a TTL bucket
  * segment list. Returns the number of segments that were successfully freed.
  */
@@ -1389,6 +1418,12 @@ static struct cache_whandle ttl_bucket_reserve(struct cache *cache, struct ttl_b
 	if (seg_id == CACHE_SEG_NONE ||
 	    cache->segments[seg_id].write_off + size > cache->cfg.seg_size) {
 		unsigned int n_segs;
+
+		/* A dead tail is recycled rather than left to eviction: the
+		 * pool hands it straight back.
+		 */
+		if (seg_id != CACHE_SEG_NONE)
+			seg_reclaim_dead(cache, ttlb, seg_id);
 
 		/* See if this entry requires more than one segment. */
 		if (size > cache->cfg.seg_size)
@@ -2145,39 +2180,51 @@ fail:
 	return -1;
 }
 
-/* Relocate a finished unknown-length entry out of its private segment <h>
- * into the shared list of its TTL bucket: reserve its exact size there, as a
- * sized store would have, and copy the record over. Returns the shared
- * reservation, or an error handle when no room could be made, in which case
- * the entry is left where it is. Either way the private segment stays the
- * caller's.
- *
- * Room is made by the same reclaim a store uses, but a failure here only keeps
- * the entry in its private segment, so it is not a reserve failure and the
- * reserve_fail counters are left alone.
+/* Move a finished unknown-length entry that fits in one segment, <h>, out of
+ * its private segment and into the shared list of its TTL bucket. When the
+ * record fits in the free space of the shared tail it is copied there and the
+ * private segment goes back to the pool; otherwise the private segment itself
+ * becomes the new tail, its free space open to the stores that follow, and the
+ * old tail is closed as a rollover would close it. Neither case takes a segment
+ * from the pool. Entries spanning several segments stay private, see
+ * cache_publish_private(). Returns the handle to publish.
  */
 static struct cache_whandle seg_relocate(struct cache *cache, const struct cache_whandle *h)
 {
 	struct cache_record *rec = CACHE_HANDLE_REC(cache, h);
 	struct seg *seg = &cache->segments[h->seg_id];
 	struct ttl_bucket *ttlb = &cache->ttl_buckets[seg->ttl_bucket];
-	struct cache_whandle nh;
 	size_t total_len = CACHE_OFF_ALIGN_UP(rec->rec_len);
-	unsigned int freed;
-	int attempts = 0;
+	struct cache_whandle nh;
+	seg_id_t tail_id;
+	struct seg *tail;
 
-	while (1) {
-		nh = ttl_bucket_reserve(cache, ttlb, total_len);
-		if (!CACHE_HANDLE_ERR(nh))
-			break;
-		if (attempts++ >= CACHE_RESERVE_ATTEMPTS ||
-		    cache_reclaim(cache, 1, 1, &freed) == CACHE_RECLAIM_GIVEUP)
-			return CACHE_WHANDLE_NULL;
+	cache_lock(&ttlb->lock);
+	tail_id = seg_list_last(&ttlb->segs);
+	if (tail_id != CACHE_SEG_NONE) {
+		tail = &cache->segments[tail_id];
+		if (tail->write_off + total_len <= cache->cfg.seg_size) {
+			nh.seg_id = tail_id;
+			nh.cur_seg_id = tail_id;
+			nh.seg_off = tail->write_off;
+			nh.data_off = h->data_off;
+			tail->write_off += total_len;
+			seg_write_pin(tail);
+			cache_unlock(&ttlb->lock);
+
+			memcpy(CACHE_HANDLE_REC(cache, &nh), rec, rec->rec_len);
+			seg_write_unpin(seg);
+			seg_free_push(cache, h->seg_id);
+			return nh;
+		}
 	}
 
-	memcpy(CACHE_HANDLE_REC(cache, &nh), rec, rec->rec_len);
-	nh.data_off = h->data_off;
-	return nh;
+	seg->flags &= ~(SEG_F_PRIVATE | SEG_F_NO_LEN);
+	seg_list_append(cache, &ttlb->segs, h->seg_id);
+	if (tail_id != CACHE_SEG_NONE)
+		seg_reclaim_dead(cache, ttlb, tail_id);
+	cache_unlock(&ttlb->lock);
+	return *h;
 }
 
 void cache_hash(const struct cache *cache, const void *key, uint32_t key_len,
@@ -2437,11 +2484,17 @@ void cache_delete(struct cache *cache, const struct cache_key *key)
 					break;
 				__ha_cpu_relax();
 			}
-			if (removed && !(cache->segments[h.seg_id].flags & SEG_F_PRIVATE))
-				seg_live_sub(&cache->segments[h.seg_id],
-				             CACHE_HANDLE_REC(cache, &h));
+			if (removed && !(cache->segments[h.seg_id].flags & SEG_F_PRIVATE)) {
+				struct seg *seg = &cache->segments[h.seg_id];
+				unsigned int ttl_bucket = seg->ttl_bucket;
+				uint32_t state_gen = _HA_ATOMIC_LOAD(&seg->state_gen);
 
-			seg_read_unpin(cache, &cache->segments[h.seg_id]);
+				seg_live_sub(seg, CACHE_HANDLE_REC(cache, &h));
+				seg_read_unpin(cache, seg);
+				seg_check_dead(cache, h.seg_id, ttl_bucket, state_gen);
+			}
+			else
+				seg_read_unpin(cache, &cache->segments[h.seg_id]);
 		} while (!removed && slot != 0 &&
 		         CACHE_SLOT_TAG(slot) == CACHE_HASH_TAG(key->hash));
 
@@ -2630,6 +2683,8 @@ int cache_write(struct cache *cache, struct cache_whandle *h,
 void cache_abort(struct cache *cache, const struct cache_whandle *h)
 {
 	struct seg *seg = &cache->segments[h->seg_id];
+	unsigned int ttl_bucket;
+	uint32_t state_gen;
 
 	BUG_ON_BAD_HANDLE(cache, h);
 
@@ -2643,7 +2698,10 @@ void cache_abort(struct cache *cache, const struct cache_whandle *h)
 
 	_HA_ATOMIC_ADD(&cache->stats.dead_bytes,
 	               CACHE_OFF_ALIGN_UP(CACHE_HANDLE_REC(cache, h)->rec_len));
+	ttl_bucket = seg->ttl_bucket;
+	state_gen = _HA_ATOMIC_LOAD(&seg->state_gen);
 	seg_write_unpin(seg);
+	seg_check_dead(cache, h->seg_id, ttl_bucket, state_gen);
 }
 
 /* Link a just-published private chain into its bucket's list, where expiry
@@ -2675,7 +2733,8 @@ int cache_publish(struct cache *cache, const struct cache_whandle *h)
 	struct seg *seg;
 	uint64_t *slotp, slot;
 	uint64_t old;
-	uint32_t mask;
+	uint32_t mask, state_gen;
+	unsigned int ttl_bucket;
 	uint16_t tag;
 	int nfree[2];
 	int i, j;
@@ -2690,32 +2749,23 @@ int cache_publish(struct cache *cache, const struct cache_whandle *h)
 		if (h->data_off == 0)
 			goto fail;
 		rec->rec_len = sizeof(struct cache_record) + h->data_off;
-
-		/* An entry that turned out small enough moves to the shared
-		 * list, and its private segment returns to the pool at once
-		 * instead of holding this single entry until reclaim.
+		/* Shrink write_off to the end of what was written so
+		 * seg_unindex() stops there, clamped because a grown entry
+		 * spans several segments while write_off is a within-segment
+		 * offset. Such a segment holds one record, so any non-zero
+		 * bound visits it.
 		 */
-		CACHE_HANDLE_INIT(moved);
-		if (CACHE_OFF_ALIGN_UP(rec->rec_len) <=
-		    (uint64_t)cache->cfg.seg_size * CACHE_RELOCATE_MAX_PCT / 100)
+		seg->write_off = MIN(CACHE_OFF_ALIGN_UP(rec->rec_len),
+		                     cache->cfg.seg_size);
+
+		/* A single segment does not stay private to this one entry:
+		 * the record joins the shared list, see seg_relocate().
+		 */
+		if (seg->n_chain == 1) {
 			moved = seg_relocate(cache, h);
-		if (!CACHE_HANDLE_ERR(moved)) {
-			seg_write_unpin(seg);
-			seg_free_push(cache, h->seg_id);
-			_HA_ATOMIC_INC(&cache->stats.segs_relocated);
 			h = &moved;
 			rec = CACHE_HANDLE_REC(cache, h);
 			seg = &cache->segments[h->seg_id];
-		}
-		else {
-			/* Shrink write_off to the end of what was written so
-			 * seg_unindex() stops there, clamped because a grown
-			 * entry spans several segments while write_off is a
-			 * within-segment offset. Such a segment holds one
-			 * record, so any non-zero bound visits it.
-			 */
-			seg->write_off = MIN(CACHE_OFF_ALIGN_UP(rec->rec_len),
-			                     cache->cfg.seg_size);
 		}
 	}
 
@@ -2779,8 +2829,12 @@ int cache_publish(struct cache *cache, const struct cache_whandle *h)
 					_HA_ATOMIC_ADD(&cache->stats.dead_bytes,
 					               CACHE_OFF_ALIGN_UP(oldrec->rec_len));
 				}
-				seg_read_unpin(cache, &cache->segments[rh.seg_id]);
+				ttl_bucket = oldseg->ttl_bucket;
+				state_gen = _HA_ATOMIC_LOAD(&oldseg->state_gen);
+				seg_read_unpin(cache, oldseg);
 				seg_write_unpin(seg);
+				if (!(oldseg->flags & SEG_F_PRIVATE))
+					seg_check_dead(cache, rh.seg_id, ttl_bucket, state_gen);
 				return 0;
 			}
 			seg_read_unpin(cache, &cache->segments[rh.seg_id]);
@@ -2848,7 +2902,10 @@ fail:
 	}
 	_HA_ATOMIC_ADD(&cache->stats.dead_bytes,
 	               CACHE_OFF_ALIGN_UP(rec->rec_len));
+	ttl_bucket = seg->ttl_bucket;
+	state_gen = _HA_ATOMIC_LOAD(&seg->state_gen);
 	seg_write_unpin(seg);
+	seg_check_dead(cache, h->seg_id, ttl_bucket, state_gen);
 	return -1;
 }
 
@@ -2873,7 +2930,7 @@ void cache_get_stats(const struct cache *cache, struct cache_stats *stats)
 	stats->publish_supersedes = _HA_ATOMIC_LOAD(&cache->stats.publish_supersedes);
 	stats->aborts = _HA_ATOMIC_LOAD(&cache->stats.aborts);
 	stats->dead_bytes = _HA_ATOMIC_LOAD(&cache->stats.dead_bytes);
-	stats->segs_relocated = _HA_ATOMIC_LOAD(&cache->stats.segs_relocated);
+	stats->segs_emptied = _HA_ATOMIC_LOAD(&cache->stats.segs_emptied);
 }
 
 size_t cache_entry_size(const struct cache *cache, const struct cache_rhandle *h)

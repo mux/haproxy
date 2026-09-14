@@ -285,6 +285,16 @@ A reservation that finds no free segment frees one in two steps, tried in order:
   reader. We pick the true oldest rather than sampling a few candidates for an
   approximate one.
 
+Dead segments do not wait for either step. A shared segment whose stores were
+all aborted, or whose last indexed object was deleted or replaced, can never be
+read again, so it is reclaimed as soon as it is neither the bucket's tail nor
+being written: at the abort, delete or supersede that emptied it, or, for a full
+tail, when the next reservation rolls over to a new one, which then gets the
+same segment straight back from the pool. Without this, a client that keeps
+aborting a large download -- a health check fetching a big file every second is
+the real-world case -- fills the cache with dead segments at its own pace and
+pushes live ones out ahead of them.
+
 ## Admission: keeping one-hit wonders out
 
 The filter's rule is simple: an object is not cached on its first sighting, only
@@ -373,14 +383,14 @@ creation order.
 
 Most such entries turn out small once complete -- compressed pages and API
 responses are the typical case -- and leaving each in a segment of its own would
-cap the cache at one such entry per segment. So when an unknown-length entry is
-published and its record fits in half a segment, it is relocated into the
-bucket's shared list, reserved there exactly as a sized store would have been,
-and its private segment returns to the pool at once. Larger entries stay
-private: the copy grows with the record while the space it recovers shrinks, and
-a record near a segment in size would strand the shared tail's remainder on top.
-The copy is a single memcpy on the writer's thread, of bytes written once
-already, and a copy that finds no room simply leaves the entry where it is.
+cap the cache at one such entry per segment. So an entry that fits one segment
+does not keep it once published. If its record fits in the free space of the
+bucket's shared tail, it is copied there and its segment returns to the pool at
+once; otherwise the segment itself becomes the new tail, its free space open to
+the stores that follow, and the old tail is closed exactly as a rollover would
+have closed it. Neither case takes a segment from the pool or evicts anything,
+and the copy, when it happens, is a single memcpy on the writer's thread of
+bytes written once already. Only chains stay private.
 
 Private segments are also what makes entries larger than a segment possible.
 When a write runs past the end of a private entry's reservation, the engine
