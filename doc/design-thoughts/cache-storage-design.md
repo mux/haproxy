@@ -451,16 +451,18 @@ decode. To keep that containment matching over an exact-match index, the anchor
 carries a small, fixed **directory** of the coding masks of the variants stored
 so far (its occupancy bounded by `max-secondary-entries`), and a lookup probes
 one derived key per directory mask the client fully accepts -- one or two probes
-in practice. Directory slots are written once and claimed by CAS inside the
-*published* anchor: the single place the design relaxes entry immutability, done
-through an explicitly writable accessor so the exception stays visible in the
-code. Apache Traffic Server's per-URL alternate vectors are the one peer
+in practice. A published anchor is never modified: a new mask is added by
+publishing a copy of the anchor with the mask appended, which supersedes the
+original under the primary key and keeps its generation, so the variants already
+stored stay reachable. Two threads adding different masks at once may each
+publish a copy lacking the other's; the losing variant then misses once and its
+store re-adds the mask, one extra origin fetch that is not worth a conditional
+publish. Apache Traffic Server's per-URL alternate vectors are the one peer
 precedent for this shape.
 
 The engine's entire contribution to all of the above: a per-reservation flag to
 bypass the admission filter -- an anchor must never be turned away, since no
-variant can be stored without it -- and the writable peek. Everything else is
-composition.
+variant can be stored without it. Everything else is composition.
 
 ## Early hints
 

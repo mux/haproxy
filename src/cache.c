@@ -219,9 +219,9 @@ struct cache_anchor {
 	struct cache_entry entry;    /* flags contains CACHE_EF_ANCHOR */
 	uint64_t generation;
 	/* Coding masks of the variants stored so far, capped by
-	 * max-secondary-entries. Slots go from 0 to their final value once,
-	 * are never modified afterwards, and are only accessed with atomic
-	 * operations once the anchor is published. */
+	 * max-secondary-entries. A published anchor is never modified: adding
+	 * a mask publishes a copy with the mask appended, keeping the
+	 * generation so that the existing variants stay reachable. */
 	uint32_t enc_masks[DEFAULT_MAX_SECONDARY_ENTRY];
 };
 
@@ -919,29 +919,49 @@ static void cache_variant_key(struct cache *store, const struct cache_key *pkey,
 }
 
 /*
- * Record <enc_mask> in a published anchor's coding-mask directory. Since the
- * slots only ever go from 0 to their final value, one CAS per empty slot is
- * enough: on failure the slot just needs to be re-checked against the mask
- * being inserted.
- * Returns 0 if the mask is present on return, -1 if the directory is full.
+ * Make sure <enc_mask> is listed in the directory of <live>, the anchor read
+ * through the pinned handle <rh>. A published anchor is never modified in
+ * place: a missing mask is added by publishing a copy of the anchor with the
+ * mask appended, which supersedes it under the primary key and keeps its
+ * generation and expiry, so the variants already stored stay reachable.
+ *
+ * Two threads adding different masks at once may each publish a copy lacking
+ * the other's mask. The losing variant then misses once, and storing it again
+ * re-adds its mask: one extra origin fetch, in a race that needs two encodings
+ * of one resource to be seen for the first time within microseconds. That is
+ * not worth a conditional publish.
+ * Returns 0 if the mask is present on return, -1 if the directory is full or
+ * the copy could not be stored.
  */
-static int cache_anchor_record_mask(struct cache_anchor *anchor, uint32_t enc_mask,
-                                    unsigned int limit)
+static int cache_anchor_add_mask(struct http_cache *cache, const struct cache_key *pkey,
+                                 const struct cache_anchor *live,
+                                 const struct cache_rhandle *rh, uint32_t enc_mask)
 {
+	struct cache_anchor anchor;
+	struct cache_whandle wh;
 	unsigned int i;
 
 	if (!enc_mask)
 		return 0;
 
-	for (i = 0; i < limit; i++) {
-		uint32_t cur = HA_ATOMIC_LOAD(&anchor->enc_masks[i]);
-
-		if (cur == 0 && HA_ATOMIC_CAS(&anchor->enc_masks[i], &cur, enc_mask))
+	for (i = 0; i < cache->max_secondary_entries; i++) {
+		if (live->enc_masks[i] == enc_mask)
 			return 0;
-		if (cur == enc_mask)
-			return 0;
+		if (live->enc_masks[i] == 0)
+			break;
 	}
-	return -1;
+	if (i == cache->max_secondary_entries)
+		return -1;
+
+	anchor = *live;
+	anchor.enc_masks[i] = enc_mask;
+
+	wh = cache_reserve(cache->store, pkey, sizeof(anchor),
+	                   cache_entry_expire(cache->store, rh), CACHE_RESERVE_ALWAYS);
+	if (CACHE_HANDLE_ERR(wh))
+		return -1;
+	cache_write(cache->store, &wh, &anchor, sizeof(anchor));
+	return cache_publish(cache->store, &wh);
 }
 
 /*
@@ -951,7 +971,7 @@ static int cache_anchor_record_mask(struct cache_anchor *anchor, uint32_t enc_ma
  * currently holding the primary key), a new one supersedes whatever owned the
  * primary key, and its fresh random generation orphans every variant of the
  * previous anchor at once.
- * Returns 0 on success, -1 if the anchor could not be created or the
+ * Returns 0 on success, -1 if the anchor could not be stored or the
  * directory is full.
  */
 static int cache_vary_anchor(struct http_cache *cache, struct cache_key *pkey,
@@ -970,15 +990,15 @@ static int cache_vary_anchor(struct http_cache *cache, struct cache_key *pkey,
 	for (tries = 0; tries < 2; tries++) {
 		rh = cache_lookup(cache->store, pkey);
 		if (!CACHE_HANDLE_ERR(rh)) {
-			struct cache_anchor *live;
+			const struct cache_anchor *live;
 			size_t sz;
 
-			live = cache_peek_mut(cache->store, &rh, &sz);
+			live = cache_peek(cache->store, &rh, &sz);
 			if (live && sz >= sizeof(*live) &&
 			    (live->entry.flags & CACHE_EF_ANCHOR) &&
 			    live->entry.secondary_key_signature == vary_signature) {
-				int ret = cache_anchor_record_mask(live, enc_mask,
-				                                   cache->max_secondary_entries);
+				int ret = cache_anchor_add_mask(cache, pkey, live, &rh,
+				                                enc_mask);
 
 				*generation = live->generation;
 				cache_release(cache->store, &rh);
@@ -1046,7 +1066,7 @@ static struct cache_rhandle cache_lookup_variant(struct http_cache *cache,
 	generation = anchor->generation;
 	if (sig & VARY_ACCEPT_ENCODING) {
 		for (i = 0; i < cache->max_secondary_entries; i++)
-			masks[i] = HA_ATOMIC_LOAD(&anchor->enc_masks[i]);
+			masks[i] = anchor->enc_masks[i];
 	}
 	cache_release(cache->store, ah);
 

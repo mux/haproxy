@@ -524,10 +524,10 @@ static inline seg_id_t seg_get_id(const struct cache *cache, const struct seg *s
 
 /* Find the segment at position <seg_idx> in a chain. This is only used for
  * jumbo entries, and only for the functions reading at arbitrary offsets such
- * as cache_read_at(), cache_peek_at(), cache_peek_at_mut() and also when moving
- * the offset with cache_seek() - although for cache_seek(), it will only walk
- * the chain from the current segment if possible. Other functions can just use
- * the cached current segment in the handle.
+ * as cache_read_at() and cache_peek_at(), and also when moving the offset with
+ * cache_seek() - although for cache_seek(), it will only walk the chain from
+ * the current segment if possible. Other functions can just use the cached
+ * current segment in the handle.
  */
 static inline seg_id_t seg_chain_nth(const struct cache *cache, seg_id_t seg_id,
                                      unsigned int seg_idx)
@@ -2308,8 +2308,8 @@ size_t cache_seek(const struct cache *cache, struct cache_rhandle *h,
 	return h->data_off;
 }
 
-void *cache_peek_at_mut(const struct cache *cache, const struct cache_rhandle *h,
-                        size_t off, size_t *len)
+const void *cache_peek_at(const struct cache *cache, const struct cache_rhandle *h,
+                          size_t off, size_t *len)
 {
 	struct cache_record *rec;
 	unsigned int seg_idx;
@@ -2333,11 +2333,11 @@ void *cache_peek_at_mut(const struct cache *cache, const struct cache_rhandle *h
 	return (char *)cache->arena + CACHE_ARENA_OFF(cache, seg_id, seg_off);
 }
 
-/* This one doesn't call into cache_peek_at_mut() to avoid walking the segment
+/* This one doesn't call into cache_peek_at() to avoid walking the segment
  * chain with seg_chain_nth() when dealing with jumbo entries.
  */
-void *cache_peek_mut(const struct cache *cache, const struct cache_rhandle *h,
-                     size_t *len)
+const void *cache_peek(const struct cache *cache, const struct cache_rhandle *h,
+                       size_t *len)
 {
 	struct cache_record *rec;
 	uint32_t seg_off;
@@ -2355,18 +2355,6 @@ void *cache_peek_mut(const struct cache *cache, const struct cache_rhandle *h,
 	*len = MIN(CACHE_REC_CAPACITY(rec) - h->data_off,
 	           (size_t)(cache->cfg.seg_size - seg_off));
 	return (char *)cache->arena + CACHE_ARENA_OFF(cache, h->cur_seg_id, seg_off);
-}
-
-const void *cache_peek_at(const struct cache *cache, const struct cache_rhandle *h,
-                          size_t off, size_t *len)
-{
-	return cache_peek_at_mut(cache, h, off, len);
-}
-
-const void *cache_peek(const struct cache *cache, const struct cache_rhandle *h,
-                       size_t *len)
-{
-	return cache_peek_mut(cache, h, len);
 }
 
 void cache_release(struct cache *cache, const struct cache_rhandle *h)

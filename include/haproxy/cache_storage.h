@@ -186,19 +186,6 @@ const void *cache_peek(const struct cache *c, const struct cache_rhandle *h,
 const void *cache_peek_at(const struct cache *c, const struct cache_rhandle *h,
                           size_t off, size_t *len);
 
-/* Variants of the cache_peek functions that return a non-const pointer. These
- * exist for the rare cases where the caller needs to change the contents of
- * live entries. Callers are entirely responsible for thread-safety when using
- * these functions, since there can be multiple concurrent readers. Misusing
- * these functions can also easily cause corruption, for instance if data is
- * written out of the bounds of the entry. Do not use these unless you are
- * absolutely sure you need them.
- */
-void *cache_peek_mut(const struct cache *c, const struct cache_rhandle *h,
-                     size_t *len);
-void *cache_peek_at_mut(const struct cache *c, const struct cache_rhandle *h,
-                        size_t off, size_t *len);
-
 /* Release the handle once done reading an entry. The handle is not valid
  * anymore once this function has been called, and should not be reused.
  */
