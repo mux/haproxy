@@ -51,7 +51,6 @@ haproxy h1 -conf {
         http-response cache-store my_cache
 
     cache my_cache
-        admission-filter off
         total-max-size 1
         max-age 300
         max-object-size 4096
@@ -61,7 +60,7 @@ haproxy h1 -conf {
 
 client c1 -connect ${h1_fe_sock} {
     # Populate: both responses and their hint entries are stored on the
-    # first sighting (admission filter off); no 103 on a fresh store.
+    # first sighting; no 103 on a fresh store.
     txreq -url "/reval"
     rxresp
     expect resp.status == 200

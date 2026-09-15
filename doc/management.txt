@@ -3078,19 +3078,13 @@ show cache [stats]
   belongs to. All counters are cumulative since startup.
 
   $ echo 'show cache stats' | socat stdio /tmp/sock1
-  foobar.admit_rejects: 1204
-  foobar.admit_inserts: 1310
-  foobar.admit_rotations: 0
-  foobar.reserve_fails: 0
+  foobar.publish_supersedes: 12
+  foobar.aborts: 3
   (...)
   foobar.segs_evicted: 3773
-  foobar-hints.admit_rejects: 0
+  foobar-hints.publish_supersedes: 0
   (...)
 
-     admit_rejects             Objects not stored because the admission filter
-                               had never seen their key; not an error
-     admit_inserts             Keys recorded by the admission filter
-     admit_rotations           Times the filter forgot its oldest keys
      reserve_fails             Objects not stored because no space could be
                                reclaimed in time
      reserve_fail_giveup       Of those, the ones finding nothing left to

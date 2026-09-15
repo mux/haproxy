@@ -244,30 +244,30 @@ correctness mechanism, which is why it can be lazy and needs no per-object
 timers (there would be far too many). The engine exposes it as `cache_expire()`
 for a caller that wants to spend an idle moment on it.
 
-## Eviction: FIFO over whole segments
+## Eviction: merging segments by frequency
 
-When the cache is full and nothing has expired, eviction reclaims a live segment
-to make room. The policy is plain FIFO -- reclaim in creation order -- chosen
-deliberately over cleverer schemes.
+When the cache is full and nothing has expired, eviction must free live
+segments. The engine does what [Segcache][seg] does: it merges a run of
+neighbouring segments into one, copying the records worth keeping and dropping
+the rest. Space is still freed a whole segment at a time, but the choice of what
+survives is made per record.
 
-The justification is the [S3-FIFO][s3] result (SOSP '23): across thousands of
-production traces, including the web and CDN workloads closest to ours, the
-decisive factor in eviction quality is not a smart recency or frequency policy
-but the prompt removal of **one-hit wonders** -- objects requested once and
-never again. A plain FIFO paired with a small admission filter (next section)
-matches far more elaborate policies at this. FIFO's blindness to per-item value
-costs little once the one-hit wonders are kept out, and it buys a reclaim path
-that amounts to clearing a segment's index slots and dropping it.
-
-We deliberately do **not** use Segcache's merge-based eviction, nor an
-S3-FIFO-style promotion between queues -- Segcache scores entries with a
-per-item frequency counter (the ASFC) and merges the hot ones into compacted
-segments, dropping the cold. Both relocate live items between segments,
-reintroducing exactly the copying and drain-and-wait coordination this design
-avoids -- and their benefit is concentrated in the many-tiny-items-per-segment
-regime, the opposite of HTTP's large, variable objects. Whole-segment FIFO is
-also what production HTTP caches converge on (for example Apache Traffic
-Server's circular storage), so this is a well-trodden path, not a shortcut.
+Each record carries the hit counter kept in its index slot (see *The hash
+index*). Its score is its hits divided by its size relative to the segment's
+mean record size: a record earns its place by being read again, and a large one
+must be read more often than a small one to earn the same. A merge takes from
+two to eight consecutive segments, walks their records in order and copies into
+the destination those whose score exceeds a cutoff, adjusted as the copy
+proceeds so that a quarter to a third of each source's bytes survive, until the
+destination is nine-tenths full. A record that was never read again scores zero
+and goes first. That is what keeps **one-hit wonders** -- objects requested once
+and never again -- out of the cache, and the [S3-FIFO][s3] study of thousands of
+production traces found their prompt removal to be the decisive factor in
+eviction quality, ahead of any recency or frequency subtlety. The destination
+takes the sources' place in the bucket's list and inherits their age, and each
+copied record's counter is halved, so a record that stopped being popular loses
+its standing over a few merges while one still being read stays ahead of
+newcomers.
 
 A reservation that finds no free segment frees one in two steps, tried in order:
 
@@ -276,15 +276,26 @@ A reservation that finds no free segment frees one in two steps, tried in order:
   path first walks the chain heads for expired segments to reclaim, draining a
   chain's whole expired prefix when it finds one so the extra segments feed
   other reservations.
-- **Then evict the oldest.** With nothing expired, a live segment goes. Because
-  each chain ages head-first, the globally oldest segment is always one of the
-  chain heads -- 2048 of them, a shared and a private queue for each of the 1024
-  TTL buckets. The scan takes the oldest head that is not write-pinned:
+- **Then merge around the oldest.** With nothing expired, a live segment goes.
+  Because each chain ages head-first, the globally oldest segment is always one
+  of the chain heads -- 2048 of them, a shared and a private queue for each of
+  the 1024 TTL buckets. The scan takes the oldest head that is not write-pinned:
   unindexing has to parse a segment's record headers to walk it, and a write pin
-  means one of those headers is still being written. Read pins are no obstacle
-  at all; a segment reclaimed under them is condemned and handed to its last
-  reader. We pick the true oldest rather than sampling a few candidates for an
-  approximate one.
+  means one of those headers is still being written. A private head is a chain
+  owned by a single entry and is evicted whole. A shared head hands its bucket
+  to the merge, which looks, from where the previous merge stopped or else from
+  the head, for at least three consecutive segments that qualify -- neither the
+  write tail nor being written, at least twenty seconds old and more than twenty
+  seconds from expiry -- and merges them into a destination taken from a small
+  reserve of segments, one per thread, that ordinary reservations leave alone so
+  a merge can always run. The sources return to the pool. Without such a run the
+  head is evicted whole, as plain FIFO would. Read pins are no obstacle at all;
+  a segment reclaimed under them is condemned and handed to its last reader.
+
+A merge that retains nothing hands its destination back, and once such merges
+outnumber the successful ones, later merges copy every live record: on a cache
+whose segments are mostly dead, scoring would only drop the little that is still
+alive.
 
 Dead segments do not wait for either step. A shared segment whose stores were
 all aborted, or whose last indexed object was deleted or replaced, can never be
@@ -296,78 +307,21 @@ aborting a large download -- a health check fetching a big file every second is
 the real-world case -- fills the cache with dead segments at its own pace and
 pushes live ones out ahead of them.
 
-## Admission: keeping one-hit wonders out
+### Why not an admission filter
 
-The filter's rule is simple: an object is not cached on its first sighting, only
-on its second, so one-hit wonders never occupy a segment at all.
-
-This is standard practice for HTTP and CDN caches, not an invention:
-
-- [Akamai][ak] caches an object only on its second request, detecting the repeat
-  with a Bloom filter; they report that about three-quarters of objects are
-  one-hit wonders and that filtering them freed a comparable fraction of cache.
-- [nginx][ng] exposes exactly this as `proxy_cache_min_uses` -- cache only after
-  N requests -- commonly set to 2.
-- [TinyLFU][tlfu] is the sophisticated end of the same idea: a frequency sketch
-  admits a newcomer only if it looks more valuable than the entry it would
-  evict.
-
-We use the simple Akamai/nginx form: a binary "seen once before".
-
-### A pair of rotating Bloom filters
-
-The filter is a classic Bloom filter in two generations, the same construction
-[Akamai][ak] describes. A cacheable miss probes both: found in either, the key
-is admitted; found in neither, it is recorded in the current generation and
-rejected. The generations rotate by insertion count -- when the current one has
-absorbed its capacity of keys, the stale one is cleared and the roles swap --
-so a first sighting is remembered for at least one and at most two generations'
-worth of subsequent recordings, and the filter never saturates. A key found
-only in the previous generation is re-recorded into the current one, so a key
-that keeps being seen keeps being remembered.
-
-Each generation is sized for twice the cache's expected object count, since the
-filter also absorbs sightings of objects that are never stored, at 16 bits and
-eight derived probe positions per key -- a false-positive rate of about 0.06%
-per generation at capacity, and a false positive only admits an object one
-sighting early. The two generations are the halves of a single allocation,
-about 0.1% of the arena.
-
-The structure is monotone between rotations, which makes concurrency cheap:
-probes are relaxed loads, recordings relaxed atomic bit-ORs, and a race costs
-at most an occasional extra reject. Rotation elects a single winner -- the
-thread whose recording reaches the capacity count -- so it cannot double-fire
-and wipe both generations; the ordering details live with the code.
-
-### Validation on real traces
-
-We measured end-to-end FIFO-cache hit ratio on a synthetic Zipfian
-(skewed-popularity) workload and two real traces: a Twitter key-value trace
-from [libCacheSim][lcs] (see also the [Twitter cache
-traces][tw]) and a Wikipedia CDN trace from the [LRB dataset][lrb]. The table
-reports the two real traces.
-
-| Trace (cache size)   | no filter | with filter |
-| -------------------- | --------- | ----------- |
-| Wikipedia CDN (10%)  | 48.2%     | 52.9%       |
-| Twitter KV (5%)      | 72.9%     | 67.0%       |
-
-Two findings:
-
-- **Admission is workload-dependent.** On the Wikipedia CDN trace (one-hit
-  wonders were 21% of requests) it lifts hit ratio by three to five points; on
-  the Twitter key-value trace (one-hit wonders only 6.5% of requests) it *hurts*
-  by about six points, because there the cost of delaying every object's caching
-  outweighs the little junk there is to filter. HTTP and CDN traffic is the
-  former case, which is why the filter is on by default -- but it is a config
-  flag precisely because the value depends on the workload.
-- **Cache-on-second is the hit-ratio optimum.** Sweeping "cache on the Nth
-  request" showed N of 2 best; higher N only helps reduce disk writes, which is
-  irrelevant for an in-memory cache.
-
-Caveats worth knowing: the simulation counts objects, not bytes, so size-aware
-admission would likely help more on CDN traffic than these numbers suggest; the
-real traces are single prefixes.
+Caching an object only on its second request is common practice for HTTP
+caches: [Akamai][ak] does it with a Bloom filter and reports three-quarters of
+its objects as one-hit wonders, and [nginx][ng] exposes it as
+`proxy_cache_min_uses`. A FIFO cache needs it, having no other way to tell a
+one-hit wonder from a popular object. Here the merge already drops a record that
+was never read again at the first merge that reaches its segment, so a one-hit
+wonder costs its space only until then. What a filter would add is its cost:
+every object that does come back pays one extra origin fetch. Under FIFO that
+cost was worth paying on a Wikipedia CDN trace ([LRB][lrb]), where the filter
+gained three to five points of hit ratio, and already a loss of six points on a
+[Twitter][tw] key-value trace with few one-hit wonders. With the frequency
+signal inside the cache, the filter would only spare the space one-hit wonders
+occupy until their first merge, and that does not buy back the delay.
 
 ## Private segments: unknown sizes and jumbo entries
 
@@ -482,25 +436,20 @@ store re-adds the mask, one extra origin fetch that is not worth a conditional
 publish. Apache Traffic Server's per-URL alternate vectors are the one peer
 precedent for this shape.
 
-The engine's entire contribution to all of the above: a per-reservation flag to
-bypass the admission filter -- an anchor must never be turned away, since no
-variant can be stored without it. Everything else is composition.
+None of the above needs anything from the engine: it is all composition.
 
 ## Early hints
 
-103 Early Hints live in a *separate, smaller* cache instance dedicated to hints,
-sized by `early-hints <on|off|only> [size <bytes>]`, defaulting to a tenth of
-the configured total -- or all of it in `only` mode, where nothing else is
-stored. The hints instance is created with no admission filter at all: a hint
-is created deliberately by the store path, never admitted from request traffic,
-so the instance-level opt-out also spares the filter's memory. When a response
-carrying `Link` hints is cached, a hints-only entry is written under the
-request's primary key; on a miss for the main entry the hints are replayed as
-a 103 while the origin is queried, and a hit needs none. Hint entries are
-reserved with the engine's maximum TTL rather than the response's expiry, so
-they deliberately outlive its freshness: a 103 is most valuable exactly when
-the response has expired and an origin round-trip is coming, and a stale hint
-is harmless -- RFC 8297 makes hints advisory.
+103 Early Hints live in a *separate, smaller* cache instance dedicated to
+hints, sized by `early-hints <on|off|only> [size <bytes>]`, defaulting to a
+tenth of the configured total -- or all of it in `only` mode, where nothing
+else is stored. When a response carrying `Link` hints is cached, a hints-only
+entry is written under the request's primary key; on a miss for the main entry
+the hints are replayed as a 103 while the origin is queried, and a hit needs
+none. Hint entries are reserved with the engine's maximum TTL rather than the
+response's expiry, so they deliberately outlive its freshness: a 103 is most
+valuable exactly when the response has expired and an origin round-trip is
+coming, and a stale hint is harmless -- RFC 8297 makes hints advisory.
 
 This matches how CDNs (Cloudflare, Fastly, Akamai) handle cached early hints,
 and gives hints a direct memory budget instead of the old cache's ratio-based
@@ -525,13 +474,13 @@ separate index memory; the tree lives inside the objects.
 Our per-object overhead splits across the two layers and is far leaner: the
 engine's `cache_record` -- digest, expiry, length; about thirty bytes -- plus
 the HTTP layer's `cache_entry` prefix stored as ordinary payload (the Vary key,
-validators, and ETag location; about fifty more). A FIFO cache needs no recency
+validators, and ETag location; about fifty more). The store needs no recency
 links, and the index node is not embedded here. The index is instead a separate
 hash table (the counterpart of those 256 trees), sized as described above,
-alongside the admission filter and one small descriptor per segment; the
-three together come to well under one percent of the arena. The free-space
-bookkeeping -- shctx's list of available blocks versus our free pool and
-per-bucket segment chains -- is negligible on both sides.
+alongside one small descriptor per segment; the two together come to well under
+one percent of the arena. The free-space bookkeeping -- shctx's list of
+available blocks versus our free pool and per-bucket segment chains -- is
+negligible on both sides.
 
 Most of the index now sits outside the arena in compact fixed arrays rather than
 competing with payload for block space.
@@ -610,9 +559,7 @@ Three items are known and deliberately deferred.
 - S3-FIFO (SOSP '23): [dl.acm.org][s3], overview at [s3fifo.com][s3o]
 - Akamai one-hit-wonder filtering (ACM CCR '15): [dl.acm.org][ak]
 - nginx `proxy_cache_min_uses`: [nginx.org][ng]
-- TinyLFU (ACM ToS '17): [dl.acm.org][tlfu]
 - Twitter cache traces: [github.com][tw]
-- libCacheSim: [github.com][lcs]
 - LRB / Wikipedia trace: [github.com][lrb]
 
 [seg]: https://www.usenix.org/conference/nsdi21/presentation/yang-juncheng
@@ -620,7 +567,5 @@ Three items are known and deliberately deferred.
 [s3o]: https://s3fifo.com/
 [ak]: https://dl.acm.org/doi/10.1145/2805789.2805800
 [ng]: https://nginx.org/en/docs/http/ngx_http_proxy_module.html
-[tlfu]: https://dl.acm.org/doi/10.1145/3149371
 [tw]: https://github.com/twitter/cache-trace
-[lcs]: https://github.com/1a1a11a/libCacheSim
 [lrb]: https://github.com/sunnyszy/lrb

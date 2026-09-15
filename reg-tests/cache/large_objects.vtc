@@ -55,15 +55,13 @@ haproxy h1 -conf {
         http-response cache-store my_cache
 
     cache my_cache
-        admission-filter off
         total-max-size 2
         max-age 300
         max-object-size 500000
 } -start
 
 client c1 -connect ${h1_fe_sock} {
-    # Populate: both objects are stored on first sighting (admission
-    # filter off).
+    # Populate: both objects are stored on first sighting.
     txreq -url "/sized"
     rxresp
     expect resp.status == 200

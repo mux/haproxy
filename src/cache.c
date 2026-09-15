@@ -1009,10 +1009,8 @@ static int cache_vary_anchor(struct http_cache *cache, struct cache_key *pkey,
 		if (tries)
 			break;
 
-		/* The anchor must not be turned away by the admission filter
-		 * since no variant can be stored without it. It is given the
-		 * cache's maximum age; variants outliving it become
-		 * unreachable and age out. */
+		/* The anchor is given the cache's maximum age; variants
+		 * outliving it become unreachable and age out. */
 		memset(&anchor, 0, sizeof(anchor));
 		anchor.entry.flags = CACHE_EF_ANCHOR;
 		anchor.entry.secondary_key_signature = vary_signature;
@@ -1308,8 +1306,7 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 		/* The cache serves its copies with a freshly computed Age, so
 		 * the origin's Age header is left out of the stored copy. The
 		 * live response keeps it: it must stay intact on the many
-		 * paths where the response ends up not being stored, the
-		 * admission filter's first sighting above all.
+		 * paths where the response ends up not being stored.
 		 */
 		if (type == HTX_BLK_HDR &&
 		    isteq(htx_get_blk_name(htx, blk), ist("age")))
@@ -2491,7 +2488,6 @@ int post_check_cache()
 				cache->early_hints_size = size;
 			}
 			if (asprintf(&id, "%s-hints", cache->id) > 0) {
-				/* Hints are always stored, so no admission filter. */
 				cache->early_hints = cache_new(&hints_cfg, 0,
 				                               size, cache_hash_seed, id);
 				free(id);

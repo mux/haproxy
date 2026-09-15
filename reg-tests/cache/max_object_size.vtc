@@ -8,9 +8,9 @@ varnishtest "Cache max-object-size: oversized responses are served but never sto
 #    accumulated body exceeds the cap.
 #
 # In both cases the client must receive the complete body byte-exact and
-# the object must never land in the cache: with the admission filter off a
-# cacheable response is stored on first sighting, so a second fetch
-# reaching the origin proves the refusal. The server expects the same
+# the object must never land in the cache: a cacheable response is stored
+# on first sighting, so a second fetch reaching the origin proves the
+# refusal. The server expects the same
 # request sequence on each of its two connections; a cache hit would
 # desynchronize it and fail the test. The 64KB bodies sit well above the
 # 16KB cap, far from any headers-plus-metadata boundary effect.
@@ -63,7 +63,6 @@ haproxy h1 -conf {
         http-response cache-store my_cache
 
     cache my_cache
-        admission-filter off
         total-max-size 1
         max-age 300
         max-object-size 16384
