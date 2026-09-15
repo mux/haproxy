@@ -189,9 +189,6 @@ BUG_ON_STATIC(CACHE_SEG_MAX_SIZE !=
  */
 #define CACHE_HASH_TAG(hash)    ((hash).high64 >> (64 - CACHE_SLOT_TAG_BITS))
 
-#define CACHE_LOCK_FREE         0
-#define CACHE_LOCK_TAKEN        1
-
 /* Pointer to the beginning of the data in a record */
 #define CACHE_REC_DATA(rec)     ((char *)(rec) + sizeof(struct cache_record))
 /* Data capacity of a record */
@@ -209,23 +206,6 @@ BUG_ON_STATIC(CACHE_SEG_MAX_SIZE !=
 #define BUG_ON_BAD_HANDLE(cache, h)    BUG_ON((h)->seg_id >= (cache)->n_segs ||        \
                                               (h)->seg_off >= (cache)->cfg.seg_size || \
                                               (h)->seg_off & (CACHE_OFF_ALIGN - 1))
-
-/* A simple XCHG-based spinlock implementation. */
-typedef uint8_t spinlock_t;
-
-static inline void cache_lock(spinlock_t *lock)
-{
-	while (HA_ATOMIC_XCHG(lock, CACHE_LOCK_TAKEN) != CACHE_LOCK_FREE) {
-		__ha_cpu_relax();
-		while (_HA_ATOMIC_LOAD(lock) != CACHE_LOCK_FREE)
-			__ha_cpu_relax_for_read();
-	}
-}
-
-static inline void cache_unlock(spinlock_t *lock)
-{
-	HA_ATOMIC_STORE(lock, CACHE_LOCK_FREE);
-}
 
 /* Segment states */
 #define SEG_S_FREE              (1 << 0)
@@ -278,7 +258,7 @@ struct ttl_bucket {
 	uint32_t ttl_approx;
 	seg_id_t merge_next;     /* Where the next merge resumes, or CACHE_SEG_NONE */
 	uint32_t merge_next_gen; /* Generation of merge_next when it was set */
-	uint8_t lock;
+	__decl_thread(HA_SPINLOCK_T lock);
 };
 
 struct ht_bucket {
@@ -334,7 +314,7 @@ struct cache {
 
 	struct seg *segments;           /* Segment descriptor table */
 	struct ttl_bucket *ttl_buckets; /* TTL buckets for writes */
-	spinlock_t pool_lock;           /* Lock for the pool of free segments */
+	__decl_thread(HA_SPINLOCK_T pool_lock); /* Lock for the pool of free segments */
 	seg_id_t free_seg_id;           /* Free-list of segments */
 	unsigned int n_free;            /* Number of free segments in the pool */
 	uint64_t merge_empty;           /* Merges that retained nothing */
@@ -544,9 +524,9 @@ static inline seg_id_t seg_free_pop(struct cache *cache, unsigned int n_segs, in
 
 	BUG_ON(n_segs == 0);
 
-	cache_lock(&cache->pool_lock);
+	HA_SPIN_LOCK(CACHE_LOCK, &cache->pool_lock);
 	if (!reserve && cache->n_free < cache->cfg.n_reserved + n_segs) {
-		cache_unlock(&cache->pool_lock);
+		HA_SPIN_UNLOCK(CACHE_LOCK, &cache->pool_lock);
 		return CACHE_SEG_NONE;
 	}
 	first_seg_id = cache->free_seg_id;
@@ -558,12 +538,12 @@ static inline seg_id_t seg_free_pop(struct cache *cache, unsigned int n_segs, in
 		n_left--;
 	}
 	if (n_left > 0) {
-		cache_unlock(&cache->pool_lock);
+		HA_SPIN_UNLOCK(CACHE_LOCK, &cache->pool_lock);
 		return CACHE_SEG_NONE;
 	}
 	_HA_ATOMIC_SUB(&cache->n_free, n_segs);
 	cache->free_seg_id = seg->next_chain_id;
-	cache_unlock(&cache->pool_lock);
+	HA_SPIN_UNLOCK(CACHE_LOCK, &cache->pool_lock);
 	seg->next_chain_id = CACHE_SEG_NONE;
 
 	return first_seg_id;
@@ -595,11 +575,11 @@ static inline void seg_free_push(struct cache *cache, seg_id_t seg_id)
 
 	last = &cache->segments[last_seg_id];
 
-	cache_lock(&cache->pool_lock);
+	HA_SPIN_LOCK(CACHE_LOCK, &cache->pool_lock);
 	last->next_chain_id = cache->free_seg_id;
 	cache->free_seg_id = first_seg_id;
 	_HA_ATOMIC_ADD(&cache->n_free, n_segs);
-	cache_unlock(&cache->pool_lock);
+	HA_SPIN_UNLOCK(CACHE_LOCK, &cache->pool_lock);
 }
 
 /* Given <data_off>, which is an offset into a record's data, set <seg_idx> to
@@ -1311,11 +1291,11 @@ static void seg_check_dead(struct cache *cache, seg_id_t seg_id,
 	if (SEG_STATE(state_gen) != SEG_S_LIVE || HA_ATOMIC_LOAD(&seg->n_live) != 0)
 		return;
 
-	cache_lock(&ttlb->lock);
+	HA_SPIN_LOCK(CACHE_TTLB_LOCK, &ttlb->lock);
 	if (_HA_ATOMIC_LOAD(&seg->state_gen) == state_gen &&
 	    seg_list_last(&ttlb->segs) != seg_id)
 		seg_reclaim_dead(cache, ttlb, seg_id);
-	cache_unlock(&ttlb->lock);
+	HA_SPIN_UNLOCK(CACHE_TTLB_LOCK, &ttlb->lock);
 }
 
 /* Attempt to reclaim all the expired segments at the head of a TTL bucket
@@ -1391,7 +1371,7 @@ static struct cache_whandle ttl_bucket_reserve(struct cache *cache, struct ttl_b
 	BUG_ON((size > 0 && size <= sizeof(struct cache_record)) ||
 	       size & (CACHE_OFF_ALIGN - 1));
 
-	cache_lock(&ttlb->lock);
+	HA_SPIN_LOCK(CACHE_TTLB_LOCK, &ttlb->lock);
 	if (!private)
 		seg_id = seg_list_last(&ttlb->segs);
 	else
@@ -1420,7 +1400,7 @@ static struct cache_whandle ttl_bucket_reserve(struct cache *cache, struct ttl_b
 		/* Get free segments if possible. */
 		seg_id = seg_free_pop(cache, n_segs, 0);
 		if (seg_id == CACHE_SEG_NONE) {
-			cache_unlock(&ttlb->lock);
+			HA_SPIN_UNLOCK(CACHE_TTLB_LOCK, &ttlb->lock);
 			return CACHE_WHANDLE_NULL;
 		}
 
@@ -1446,7 +1426,7 @@ static struct cache_whandle ttl_bucket_reserve(struct cache *cache, struct ttl_b
 	off = seg->write_off;
 	seg->write_off += MIN(cache->cfg.seg_size - off, size);
 	seg_write_pin(seg);
-	cache_unlock(&ttlb->lock);
+	HA_SPIN_UNLOCK(CACHE_TTLB_LOCK, &ttlb->lock);
 
 	h.seg_id = seg_id;
 	h.cur_seg_id = seg_id;
@@ -1608,7 +1588,7 @@ struct cache *cache_new(const struct cache_config *ucfg, uint flags,
 	}
 	cache->free_seg_id = 0;
 	cache->n_free = cache->n_segs;
-	cache->pool_lock = CACHE_LOCK_FREE;
+	HA_SPIN_INIT(&cache->pool_lock);
 
 	/* Allocate and initialize the TTL buckets. */
 	cache->ttl_buckets = calloc(CACHE_TTL_N_BUCKETS, sizeof(struct ttl_bucket));
@@ -1623,7 +1603,7 @@ struct cache *cache_new(const struct cache_config *ucfg, uint flags,
 		seg_list_init(&ttlb->segs);
 		seg_list_init(&ttlb->prv_segs);
 		ttlb->merge_next = CACHE_SEG_NONE;
-		ttlb->lock = CACHE_LOCK_FREE;
+		HA_SPIN_INIT(&ttlb->lock);
 	}
 
 	return cache;
@@ -1641,10 +1621,10 @@ void cache_expire(struct cache *cache)
 	for (i = 0; i < CACHE_TTL_N_BUCKETS; i++) {
 		ttlb = &cache->ttl_buckets[i];
 
-		cache_lock(&ttlb->lock);
+		HA_SPIN_LOCK(CACHE_TTLB_LOCK, &ttlb->lock);
 		seg_list_expire(cache, ttlb, &ttlb->segs);
 		seg_list_expire(cache, ttlb, &ttlb->prv_segs);
-		cache_unlock(&ttlb->lock);
+		HA_SPIN_UNLOCK(CACHE_TTLB_LOCK, &ttlb->lock);
 	}
 }
 
@@ -1841,7 +1821,7 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 			continue;
 
 		seen = 1;
-		cache_lock(&ttlb->lock);
+		HA_SPIN_LOCK(CACHE_TTLB_LOCK, &ttlb->lock);
 		for (j = 0; j < 2; j++) {
 			/* Now that we hold the TTL bucket lock, we need to
 			 * re-read segment ID and validate it.
@@ -1873,7 +1853,7 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 			 * what the caller needs.
 			 */
 			if (*freed >= needed) {
-				cache_unlock(&ttlb->lock);
+				HA_SPIN_UNLOCK(CACHE_TTLB_LOCK, &ttlb->lock);
 				return CACHE_RECLAIM_PROGRESS;
 			}
 
@@ -1898,7 +1878,7 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 				}
 			}
 		}
-		cache_unlock(&ttlb->lock);
+		HA_SPIN_UNLOCK(CACHE_TTLB_LOCK, &ttlb->lock);
 	}
 
 	/* We did not see a single segment in use, or all of them were pinned
@@ -1924,13 +1904,13 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 	/* Expiration did not cover the need: merge or evict in the elected
 	 * bucket rather than throw away the scan we paid for.
 	 */
-	cache_lock(&best->lock);
+	HA_SPIN_LOCK(CACHE_TTLB_LOCK, &best->lock);
 	seg_id = seg_list_first(best_list);
 	if (seg_id != best_seg_id) {
 		/* If the head segment changed, someone successfully
 		 * reclaimed it, so we need to retry.
 		 */
-		cache_unlock(&best->lock);
+		HA_SPIN_UNLOCK(CACHE_TTLB_LOCK, &best->lock);
 		_HA_ATOMIC_INC(&cache->stats.reclaim_elect_losses);
 		return CACHE_RECLAIM_PROGRESS;
 	}
@@ -1940,14 +1920,14 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 		/* Like above, there was some kind of progress: the segment
 		 * was reclaimed and reused since we elected it.
 		 */
-		cache_unlock(&best->lock);
+		HA_SPIN_UNLOCK(CACHE_TTLB_LOCK, &best->lock);
 		_HA_ATOMIC_INC(&cache->stats.reclaim_elect_losses);
 		return CACHE_RECLAIM_PROGRESS;
 	}
 
 	/* Another reclaimer may have refilled the pool since the election. */
 	if (_HA_ATOMIC_LOAD(&cache->n_free) >= cache->cfg.n_reserved + reserving) {
-		cache_unlock(&best->lock);
+		HA_SPIN_UNLOCK(CACHE_TTLB_LOCK, &best->lock);
 		return CACHE_RECLAIM_PROGRESS;
 	}
 
@@ -1955,7 +1935,7 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 		status = ttl_bucket_merge(cache, best, needed, freed);
 	else
 		status = seg_evict(cache, best_list, best_seg_id, freed);
-	cache_unlock(&best->lock);
+	HA_SPIN_UNLOCK(CACHE_TTLB_LOCK, &best->lock);
 
 	if (status == CACHE_RECLAIM_PROGRESS)
 		return CACHE_RECLAIM_PROGRESS;
@@ -2064,7 +2044,7 @@ static struct cache_whandle seg_relocate(struct cache *cache, const struct cache
 	seg_id_t tail_id;
 	struct seg *tail;
 
-	cache_lock(&ttlb->lock);
+	HA_SPIN_LOCK(CACHE_TTLB_LOCK, &ttlb->lock);
 	tail_id = seg_list_last(&ttlb->segs);
 	if (tail_id != CACHE_SEG_NONE) {
 		tail = &cache->segments[tail_id];
@@ -2075,7 +2055,7 @@ static struct cache_whandle seg_relocate(struct cache *cache, const struct cache
 			nh.data_off = h->data_off;
 			tail->write_off += total_len;
 			seg_write_pin(tail);
-			cache_unlock(&ttlb->lock);
+			HA_SPIN_UNLOCK(CACHE_TTLB_LOCK, &ttlb->lock);
 
 			memcpy(CACHE_HANDLE_REC(cache, &nh), rec, rec->rec_len);
 			seg_write_unpin(seg);
@@ -2088,7 +2068,7 @@ static struct cache_whandle seg_relocate(struct cache *cache, const struct cache
 	seg_list_append(cache, &ttlb->segs, h->seg_id);
 	if (tail_id != CACHE_SEG_NONE)
 		seg_reclaim_dead(cache, ttlb, tail_id);
-	cache_unlock(&ttlb->lock);
+	HA_SPIN_UNLOCK(CACHE_TTLB_LOCK, &ttlb->lock);
 	return *h;
 }
 
@@ -2570,9 +2550,9 @@ static void cache_publish_private(struct cache *cache, seg_id_t seg_id)
 	BUG_ON_HOT(!(seg->flags & SEG_F_PRIVATE));
 
 	ttlb = &cache->ttl_buckets[seg->ttl_bucket];
-	cache_lock(&ttlb->lock);
+	HA_SPIN_LOCK(CACHE_TTLB_LOCK, &ttlb->lock);
 	seg_list_append(cache, &ttlb->prv_segs, seg_id);
-	cache_unlock(&ttlb->lock);
+	HA_SPIN_UNLOCK(CACHE_TTLB_LOCK, &ttlb->lock);
 }
 
 /* Finalize a write by publishing it. */
