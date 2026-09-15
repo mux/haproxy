@@ -164,14 +164,15 @@ pin and condemn the segment rather than recycle it, so the check only decides
 whether to serve from a segment on its way out. `cache_delete()` skips it, so
 that a purge cannot miss an entry whose segment is transiently draining.
 
-The slot also carries Segcache's per-item frequency counter (the ASFC) in
-seven bits between the location and the tag. It counts hits, so it starts at 0
-when a record is published or relocated by a merge. A served hit bumps it with
-a single compare-and-swap -- exactly for the first sixteen hits, then with
-probability 1/count, so a hot entry soon stops rewriting its slot -- and a
-lost bump is dropped: the counter is approximate. A reader revalidating its
-pin ignores the counter bits, and the compare-and-swaps that clear or replace
-a slot retry while it still names the same record.
+The slot also carries Segcache's per-item frequency counter (the ASFC) in seven
+bits between the location and the tag. It counts hits, so it starts at 0 when a
+record is published, and a merge halves it when relocating a record, so that a
+record which stopped being hot loses its standing within a few merges. A served
+hit bumps it with a single compare-and-swap -- exactly for the first sixteen
+hits, then with probability 1/count, so a hot entry soon stops rewriting its
+slot -- and a lost bump is dropped: the counter is approximate. A reader
+revalidating its pin ignores the counter bits, and the compare-and-swaps that
+clear or replace a slot retry while it still names the same record.
 
 One narrow exception keeps the no-lock claim honest: a segment reclaimed while
 readers still hold pins is *condemned* and handed to its last reader, whose
