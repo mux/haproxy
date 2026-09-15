@@ -8,7 +8,6 @@
 /* Cache configuration flags */
 #define CACHE_F_NO_JUMBO        (1 << 0)	/* Disable jumbo entries */
 #define CACHE_F_REQUIRE_LEN     (1 << 1)	/* Require length for reservations */
-#define CACHE_F_NO_ADM_FILTER   (1 << 2)	/* No admission filter */
 
 /* Upper bound on entry TTLs: the engine clamps larger TTLs down to this
  * (about 12 days). Reserving with an expire this far ahead means the entry
@@ -21,14 +20,6 @@
 
 /* Largest segment a slot's offset field can address. */
 #define CACHE_SEG_MAX_SIZE      (8ULL * 1024 * 1024)
-
-/* Flags for cache_reserve() */
-
-/* Bypass admission filter, only meaningful if the cache was created without the
- * CACHE_F_NO_ADM_FILTER flag, in which case it allows us to decide whether to
- * use the admission filter on a per-entry basis.
- */
-#define CACHE_RESERVE_ALWAYS    (1 << 0)
 
 /* These are only defined here for the sake of the handle definitions. */
 #define CACHE_SEG_NONE          (-1)
@@ -74,7 +65,6 @@ struct cache_config {
 	size_t max_obj_size;
 	size_t mean_obj_size;
 	uint32_t seg_size;
-	size_t admit_min_size;
 	/* The number of segments reserved for segment merging. We recommend
 	 * having one segment per thread, so it is always possible to run the
 	 * segment merging operation. Any more than that is useless. This number
@@ -87,9 +77,6 @@ struct cache_config {
 
 /* Cache activity counters, all monotonic. Read with cache_get_stats(). */
 struct cache_stats {
-	uint64_t admit_rejects;   /* Stores refused by the admission filter */
-	uint64_t admit_inserts;   /* Keys recorded by the admission filter */
-	uint64_t admit_rotations; /* Admission filter generation rotations */
 	uint64_t reserve_fails;   /* Reservations abandoned: reclaim found no room in time */
 	uint64_t reserve_fail_giveup;     /* ... because no listed segment was left:
 	                                   * all free, unpublished or condemned */
@@ -204,11 +191,10 @@ void cache_release(struct cache *c, const struct cache_rhandle *h);
  * in advance, unless the cache was created with the CACHE_F_REQUIRE_LEN flag.
  *
  * <expire> is the entry's absolute expiry in wall-clock seconds and must be in
- * the future. <flags> accepts CACHE_RESERVE_ALWAYS to bypass the admission
- * filter, without which a key is only admitted on its second sighting.
+ * the future.
  */
 struct cache_whandle cache_reserve(struct cache *c, const struct cache_key *key,
-                                   size_t data_len, time_t expire, uint flags);
+                                   size_t data_len, time_t expire);
 
 /* Write (append) data to an entry after a successful reservation. Returns 0 on
  * success, or -1 in case of an out-of-bounds write. The error is mostly useful

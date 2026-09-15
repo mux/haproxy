@@ -45,7 +45,6 @@
 #define CACHE_CF_VARY_PROCESSING   0x00000001 /* manage Vary header (disabled by default) */
 #define CACHE_CF_EARLY_HINTS       0x00000002 /* enable HTTP 103 Early Hints (disabled by default) */
 #define CACHE_CF_EARLY_HINTS_ONLY  0x00000004 /* skip body storage; implies CACHE_CF_EARLY_HINTS */
-#define CACHE_CF_NO_ADMISSION      0x00000008 /* store on first sighting (admission filter disabled) */
 
 #define CACHE_INC_STAT(px, s, stat)								\
 do {												\
@@ -957,7 +956,7 @@ static int cache_anchor_add_mask(struct http_cache *cache, const struct cache_ke
 	anchor.enc_masks[i] = enc_mask;
 
 	wh = cache_reserve(cache->store, pkey, sizeof(anchor),
-	                   cache_entry_expire(cache->store, rh), CACHE_RESERVE_ALWAYS);
+	                   cache_entry_expire(cache->store, rh));
 	if (CACHE_HANDLE_ERR(wh))
 		return -1;
 	cache_write(cache->store, &wh, &anchor, sizeof(anchor));
@@ -1022,7 +1021,7 @@ static int cache_vary_anchor(struct http_cache *cache, struct cache_key *pkey,
 		anchor.enc_masks[0] = enc_mask;
 
 		wh = cache_reserve(cache->store, pkey, sizeof(anchor),
-		                   date.tv_sec + cache->maxage, CACHE_RESERVE_ALWAYS);
+		                   date.tv_sec + cache->maxage);
 		if (CACHE_HANDLE_ERR(wh))
 			return -1;
 		cache_write(cache->store, &wh, &anchor, sizeof(anchor));
@@ -1288,7 +1287,7 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 			struct cache_whandle h;
 
 			h = cache_reserve(cache->early_hints, key, b_data(hint_buf),
-			                  date.tv_sec + CACHE_TTL_MAX, 0);
+			                  date.tv_sec + CACHE_TTL_MAX);
 			if (!CACHE_HANDLE_ERR(h)) {
 				cache_write(cache->early_hints, &h, b_orig(hint_buf),
 				            b_data(hint_buf));
@@ -1371,7 +1370,7 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 	/* store latest value */
 	object.latest_validation = date.tv_sec;
 
-	cache_ctx->handle = cache_reserve(cache->store, key, len, expire, 0);
+	cache_ctx->handle = cache_reserve(cache->store, key, len, expire);
 	if (CACHE_HANDLE_ERR(cache_ctx->handle))
 		goto out;
 	if (cache_write(cache->store, &cache_ctx->handle, &object, sizeof(object))) {
@@ -2295,52 +2294,6 @@ int cfg_parse_cache(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 		tmp_cache_config->store_cfg.mean_obj_size = meansz;
-	} else if (strcmp(args[0], "admission-filter") == 0) {
-		if (alertif_too_many_args(3, file, linenum, args, &err_code)) {
-			err_code |= ERR_ABORT;
-			goto out;
-		}
-
-		if (!*args[1]) {
-			ha_warning("parsing [%s:%d]: '%s' expects \"on\" or \"off\" (enable or disable the admission filter).\n",
-				   file, linenum, args[0]);
-			err_code |= ERR_WARN;
-		}
-		if (strcmp(args[1], "on") == 0)
-			tmp_cache_config->flags &= ~CACHE_CF_NO_ADMISSION;
-		else if (strcmp(args[1], "off") == 0)
-			tmp_cache_config->flags |= CACHE_CF_NO_ADMISSION;
-		else {
-			ha_warning("parsing [%s:%d]: '%s' expects \"on\" or \"off\" (enable or disable the admission filter).\n",
-				   file, linenum, args[0]);
-			err_code |= ERR_WARN;
-		}
-		if (*args[2]) {
-			unsigned long long size;
-			char *err;
-
-			if (strcmp(args[2], "min-size") != 0) {
-				ha_alert("parsing [%s:%d]: '%s' unexpected argument '%s', expected 'min-size'.\n",
-					 file, linenum, args[0], args[2]);
-				err_code |= ERR_ALERT | ERR_FATAL;
-				goto out;
-			}
-			if (!*args[3]) {
-				ha_alert("parsing [%s:%d]: '%s min-size' expects a size in bytes.\n",
-					 file, linenum, args[0]);
-				err_code |= ERR_ALERT | ERR_FATAL;
-				goto out;
-			}
-			size = strtoull(args[3], &err, 10);
-			if (err == args[3] || *err != '\0' || size == 0 ||
-			    size != (unsigned long long)(size_t)size) {
-				ha_alert("parsing [%s:%d]: '%s min-size' expects a size in bytes, got '%s'.\n",
-					 file, linenum, args[0], args[3]);
-				err_code |= ERR_ALERT | ERR_FATAL;
-				goto out;
-			}
-			tmp_cache_config->store_cfg.admit_min_size = (size_t)size;
-		}
 	} else if (strcmp(args[0], "process-vary") == 0) {
 		if (alertif_too_many_args(1, file, linenum, args, &err_code)) {
 			err_code |= ERR_ABORT;
@@ -2508,10 +2461,8 @@ int post_check_cache()
 
 	list_for_each_entry_safe(cache, back, &caches_config, list) {
 		if (!(cache->flags & CACHE_CF_EARLY_HINTS_ONLY)) {
-			uint flags = (cache->flags & CACHE_CF_NO_ADMISSION) ? CACHE_F_NO_ADM_FILTER : 0;
-
 			cache->store_cfg.n_reserved = global.nbthread;
-			cache->store = cache_new(&cache->store_cfg, flags,
+			cache->store = cache_new(&cache->store_cfg, 0,
 			                         cache->total_size,
 			                         cache_hash_seed, cache->id);
 			if (cache->store == NULL) {
@@ -2541,7 +2492,7 @@ int post_check_cache()
 			}
 			if (asprintf(&id, "%s-hints", cache->id) > 0) {
 				/* Hints are always stored, so no admission filter. */
-				cache->early_hints = cache_new(&hints_cfg, CACHE_F_NO_ADM_FILTER,
+				cache->early_hints = cache_new(&hints_cfg, 0,
 				                               size, cache_hash_seed, id);
 				free(id);
 			}
@@ -3042,12 +2993,6 @@ static void show_cache_stats(struct buffer *buf, const char *tag,
 	struct cache_stats st;
 
 	cache_get_stats(store, &st);
-	chunk_appendf(buf, "%s.admit_rejects: %llu\n", tag,
-	              (unsigned long long)st.admit_rejects);
-	chunk_appendf(buf, "%s.admit_inserts: %llu\n", tag,
-	              (unsigned long long)st.admit_inserts);
-	chunk_appendf(buf, "%s.admit_rotations: %llu\n", tag,
-	              (unsigned long long)st.admit_rotations);
 	chunk_appendf(buf, "%s.publish_supersedes: %llu\n", tag,
 	              (unsigned long long)st.publish_supersedes);
 	chunk_appendf(buf, "%s.aborts: %llu\n", tag,

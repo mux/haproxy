@@ -79,21 +79,6 @@ BUG_ON_STATIC(CACHE_TTL_MAX !=
  */
 #define CACHE_IDX_MEAN_SIZE     (4 * 1024)
 
-/* Admission filter sizing: ~0.05% false positives per full generation. */
-#define CACHE_ADMIT_BITS_PER_KEY 16
-#define CACHE_ADMIT_PROBES       8
-
-/* Entries smaller than this many mean objects bypass the admission filter:
- * what a never-reused entry wastes is its size, so only entries far above
- * the workload's typical size must prove reuse before being stored.
- */
-#define CACHE_ADMIT_MIN_OBJS     16
-
-/* The filter is addressed with a bit mask, so its size must be a power of two.
- * The key count is one already, leaving the per-key bits to check.
- */
-BUG_ON_STATIC(CACHE_ADMIT_BITS_PER_KEY & (CACHE_ADMIT_BITS_PER_KEY - 1));
-
 /* Maximum number of times seg_read_pin() re-validates after losing a race
  * with a rewrite of its slot. Each retry requires a store or delete of the
  * same key to have rewritten the slot within the few nanoseconds between
@@ -341,13 +326,6 @@ struct cache {
 	struct {
 		struct ht_bucket *buckets;
 		uint32_t n_buckets;
-
-		/* Admission filtering (see cache_admit) */
-		ulong *admit_bloom;     /* Both generations, halves of one allocation */
-		uint64_t admit_mask;    /* Bits per generation - 1 */
-		uint32_t admit_cap;     /* Keys per generation before rotation */
-		uint32_t admit_count;   /* Keys recorded in the current generation */
-		uint32_t admit_phase;   /* Low bit selects the current half */
 	} index;
 
 	uint32_t n_segs;                /* Number of segments */
@@ -873,12 +851,12 @@ static void seg_unindex(const struct cache *cache, struct seg *seg)
  * 1/CACHE_MERGE_TARGET of each source's bytes, and stop taking sources once
  * the destination is CACHE_MERGE_STOP_PCT percent full.
  */
-#define CACHE_MERGE_MIN          3
-#define CACHE_MERGE_MAX          8
-#define CACHE_MERGE_MATURE_TIME  20
-#define CACHE_MERGE_EXPIRY_GUARD 20
-#define CACHE_MERGE_TARGET      4
-#define CACHE_MERGE_STOP_PCT    90
+#define CACHE_MERGE_MIN           3
+#define CACHE_MERGE_MAX           8
+#define CACHE_MERGE_MATURE_TIME   20
+#define CACHE_MERGE_EXPIRY_GUARD  20
+#define CACHE_MERGE_TARGET        4
+#define CACHE_MERGE_STOP_PCT      90
 
 /* Outcome of a merge, in bytes of source records. */
 struct seg_merge_res {
@@ -1499,20 +1477,6 @@ static int cache_index_init(struct cache *cache, uint64_t total_size)
 	if (!cache->index.buckets)
 		return -1;
 	memset(cache->index.buckets, 0, size);
-
-	if (!(cache->flags & CACHE_F_NO_ADM_FILTER)) {
-		uint64_t bits;
-
-		/* Twice the expected object count: the filter also absorbs
-		 * sightings of objects that are never stored.
-		 */
-		cache->index.admit_cap = n_buckets * 4;
-		bits = (uint64_t)cache->index.admit_cap * CACHE_ADMIT_BITS_PER_KEY;
-		cache->index.admit_bloom = calloc(2, bits / 8);
-		if (cache->index.admit_bloom == NULL)
-			return -1;
-		cache->index.admit_mask = bits - 1;
-	}
 	return 0;
 }
 
@@ -1522,7 +1486,6 @@ void cache_destroy(struct cache *cache)
 		return;
 
 	ha_aligned_free(cache->index.buckets);
-	free(cache->index.admit_bloom);
 	if (cache->arena != NULL && cache->arena != MAP_FAILED)
 		munmap(cache->arena, cache->arena_len);
 	free(cache->segments);
@@ -1556,12 +1519,6 @@ struct cache *cache_new(const struct cache_config *ucfg, uint flags,
 
 	if (cfg->mean_obj_size == 0)
 		cfg->mean_obj_size = CACHE_IDX_MEAN_SIZE;
-
-	if (cfg->admit_min_size == 0) {
-		uint64_t sz = (uint64_t)cfg->mean_obj_size * CACHE_ADMIT_MIN_OBJS;
-
-		cfg->admit_min_size = sz > SIZE_MAX ? SIZE_MAX : sz;
-	}
 
 	if (cfg->seg_size == 0) {
 		uint64_t sz = total_size / CACHE_SEG_AUTO_TARGET;
@@ -1674,106 +1631,6 @@ struct cache *cache_new(const struct cache_config *ucfg, uint flags,
 out:
 	cache_destroy(cache);
 	return NULL;
-}
-
-/* The admission filter is a pair of Bloom filter generations queried as a
- * union and rotated by insertion count, so a first sighting is remembered for
- * the next <admit_cap> to 2*<admit_cap> recorded keys. See the design
- * document for more information.
- */
-static inline int admit_bits_test(const ulong *gen, uint64_t mask, uint64_t h1, uint64_t h2)
-{
-	uint64_t pos;
-	int i;
-
-	for (i = 0; i < CACHE_ADMIT_PROBES; i++) {
-		pos = (h1 + i * h2) & mask;
-		if (!(_HA_ATOMIC_LOAD(&gen[pos / (8 * sizeof(ulong))]) &
-		      ((ulong)1 << (pos % (8 * sizeof(ulong))))))
-			return 0;
-	}
-	return 1;
-}
-
-static inline void admit_bits_set(ulong *gen, uint64_t mask, uint64_t h1, uint64_t h2)
-{
-	uint64_t pos;
-	int i;
-
-	for (i = 0; i < CACHE_ADMIT_PROBES; i++) {
-		pos = (h1 + i * h2) & mask;
-		_HA_ATOMIC_OR(&gen[pos / (8 * sizeof(ulong))],
-		              (ulong)1 << (pos % (8 * sizeof(ulong))));
-	}
-}
-
-/* Rotate the generations: clear the previous one and make it current. Only
- * the single thread whose key made the count reach <admit_cap> gets here, so
- * rotations cannot double-fire and wipe both generations. Probes and records
- * racing the clear cost at most a bounded number of extra rejects.
- */
-static void admit_rotate(struct cache *cache)
-{
-	size_t words = (cache->index.admit_mask + 1) / (8 * sizeof(ulong));
-	uint32_t phase = _HA_ATOMIC_LOAD(&cache->index.admit_phase);
-	ulong *stale = cache->index.admit_bloom + ((phase & 1) ^ 1) * words;
-	size_t i;
-
-	/* Word-wide atomic stores: concurrent probes read these words. */
-	for (i = 0; i < words; i++)
-		_HA_ATOMIC_STORE(&stale[i], 0);
-
-	/* The count reset must be a release store: the next winner's
-	 * fetch-and-add acquires it, ordering this rotation before the next.
-	 */
-	HA_ATOMIC_STORE(&cache->index.admit_phase, phase ^ 1);
-	HA_ATOMIC_STORE(&cache->index.admit_count, 0);
-	_HA_ATOMIC_INC(&cache->stats.admit_rotations);
-}
-
-/* Record a key. The fetch-and-add hands out unique counts, so exactly one
- * thread observes the cap and rotates.
- */
-static void admit_record(struct cache *cache, ulong *cur, uint64_t h1, uint64_t h2)
-{
-	admit_bits_set(cur, cache->index.admit_mask, h1, h2);
-	_HA_ATOMIC_INC(&cache->stats.admit_inserts);
-	if (HA_ATOMIC_ADD_FETCH(&cache->index.admit_count, 1) == cache->index.admit_cap)
-		admit_rotate(cache);
-}
-
-/* Decide whether to admit entry: only a key seen before is admitted. */
-static int cache_admit(struct cache *cache, const struct cache_key *k)
-{
-	size_t words;
-	uint64_t h1 = k->hash.low64;
-	uint64_t h2 = k->hash.high64 | 1;   /* odd probe stride */
-	ulong *cur, *prev;
-	uint32_t phase;
-
-	if (cache->index.admit_bloom == NULL)
-		return 1;
-
-	words = (cache->index.admit_mask + 1) / (8 * sizeof(ulong));
-
-	/* A single phase load keeps the current/previous pair coherent. */
-	phase = _HA_ATOMIC_LOAD(&cache->index.admit_phase);
-	cur  = cache->index.admit_bloom + (phase & 1) * words;
-	prev = cache->index.admit_bloom + ((phase & 1) ^ 1) * words;
-
-	if (admit_bits_test(cur, cache->index.admit_mask, h1, h2))
-		return 1;
-
-	if (admit_bits_test(prev, cache->index.admit_mask, h1, h2)) {
-		/* Re-record so the key survives the next rotation even if
-		 * the store it just earned fails.
-		 */
-		admit_record(cache, cur, h1, h2);
-		return 1;
-	}
-
-	admit_record(cache, cur, h1, h2);
-	return 0;
 }
 
 void cache_expire(struct cache *cache)
@@ -2514,14 +2371,13 @@ void cache_delete(struct cache *cache, const struct cache_key *key)
 }
 
 struct cache_whandle cache_reserve(struct cache *cache, const struct cache_key *key,
-                                   size_t data_len, time_t expire, uint flags)
+                                   size_t data_len, time_t expire)
 {
 	struct cache_whandle h;
 	struct cache_record *rec;
 	struct cache_reclaim_budget budget;
 	struct ttl_bucket *ttlb;
 	size_t total_len;
-	size_t req_len = data_len;
 	unsigned int n_segs;
 	uint32_t ttl;
 
@@ -2552,17 +2408,6 @@ struct cache_whandle cache_reserve(struct cache *cache, const struct cache_key *
 		 * previous size checks make overflow impossible at this point.
 		 */
 		total_len = CACHE_OFF_ALIGN_UP(data_len);
-	}
-
-	/* Small entries are always admitted, and never enter the filter, whose
-	 * window then covers only the keys it arbitrates. Unknown-length
-	 * entries cost at least a private segment, so they face it too.
-	 */
-	if (!(flags & CACHE_RESERVE_ALWAYS) &&
-	    (req_len == 0 || req_len >= cache->cfg.admit_min_size) &&
-	    !cache_admit(cache, key)) {
-		_HA_ATOMIC_INC(&cache->stats.admit_rejects);
-		return CACHE_WHANDLE_NULL;
 	}
 
 	ttl = expire - date.tv_sec;
@@ -2919,9 +2764,6 @@ fail:
 
 void cache_get_stats(const struct cache *cache, struct cache_stats *stats)
 {
-	stats->admit_rejects = _HA_ATOMIC_LOAD(&cache->stats.admit_rejects);
-	stats->admit_inserts = _HA_ATOMIC_LOAD(&cache->stats.admit_inserts);
-	stats->admit_rotations = _HA_ATOMIC_LOAD(&cache->stats.admit_rotations);
 	stats->reserve_fails = _HA_ATOMIC_LOAD(&cache->stats.reserve_fails);
 	stats->reserve_fail_giveup = _HA_ATOMIC_LOAD(&cache->stats.reserve_fail_giveup);
 	stats->reserve_fail_attempts = _HA_ATOMIC_LOAD(&cache->stats.reserve_fail_attempts);
