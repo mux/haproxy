@@ -508,11 +508,11 @@ static inline void seg_reinit(struct seg *seg)
 
 	seg->write_off = 0;
 	seg->n_chain = 1;
-	seg->live_bytes = 0;
-	seg->n_live = 0;
 	seg->create_ts = date.tv_sec;
-	_HA_ATOMIC_STORE(&seg->state_gen, SEG_STATE_MAKE(gen + 1, SEG_S_LIVE));
 	seg->flags = 0;
+	_HA_ATOMIC_STORE(&seg->live_bytes, 0);
+	_HA_ATOMIC_STORE(&seg->n_live, 0);
+	_HA_ATOMIC_STORE(&seg->state_gen, SEG_STATE_MAKE(gen + 1, SEG_S_LIVE));
 }
 
 /* Grab <n_segs> segments from the free-list. */
@@ -1029,6 +1029,8 @@ static seg_id_t seg_merge_find(const struct cache *cache, const struct ttl_bucke
 
 	while (seg_id != CACHE_SEG_NONE) {
 		seg = &cache->segments[seg_id];
+		if (date.tv_sec - seg->create_ts < CACHE_MERGE_MATURE_TIME)
+			break;
 		if (seg_evictable(ttlb, seg)) {
 			n++;
 			if (n == CACHE_MERGE_MIN)
@@ -2650,12 +2652,16 @@ int cache_publish(struct cache *cache, const struct cache_whandle *h)
 			if (HA_ATOMIC_CAS(slotp, &old, slot)) {
 				struct cache_record *oldrec = CACHE_HANDLE_REC(cache, &rh);
 				struct seg *oldseg = &cache->segments[rh.seg_id];
+				/* Read while pinned: once unpinned the segment may
+				 * be recycled under a new life.
+				 */
+				int old_private = oldseg->flags & SEG_F_PRIVATE;
 
 				if (seg->flags & SEG_F_PRIVATE)
 					cache_publish_private(cache, h->seg_id);
 				else
 					seg_live_add(seg, rec);
-				if (!(oldseg->flags & SEG_F_PRIVATE))
+				if (!old_private)
 					seg_live_sub(oldseg, oldrec);
 				if (date.tv_sec < oldrec->expire) {
 					_HA_ATOMIC_INC(&cache->stats.publish_supersedes);
@@ -2666,7 +2672,7 @@ int cache_publish(struct cache *cache, const struct cache_whandle *h)
 				state_gen = _HA_ATOMIC_LOAD(&oldseg->state_gen);
 				seg_read_unpin(cache, oldseg);
 				seg_write_unpin(seg);
-				if (!(oldseg->flags & SEG_F_PRIVATE))
+				if (!old_private)
 					seg_check_dead(cache, rh.seg_id, ttl_bucket, state_gen);
 				return 0;
 			}
