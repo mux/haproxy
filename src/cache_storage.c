@@ -958,16 +958,11 @@ static void seg_merge(struct cache *cache, seg_id_t dst_id, seg_id_t head_id,
 				memcpy((char *)cache->arena +
 				       CACHE_ARENA_OFF(cache, dst_id, dst->write_off),
 				       rec, stride);
-				/* Halve the frequency counters: a record keeps enough
-				 * standing to outrank newcomers, but one that is no
-				 * longer hot must not stay forever. Above 16 the
-				 * counter grows like the square root of the hits, so
-				 * the shift divides them by about four there; it's
-				 * inaccurate but acceptable for a ranking.
+				/* The counter starts over, so that a record that was
+				 * once hot does not outlive its popularity.
 				 */
 				newval = CACHE_SLOT_MAKE(CACHE_HASH_TAG(rec->hash),
-				                         dst_id, dst->write_off,
-				                         CACHE_SLOT_FREQ(slot) >> 1);
+				                         dst_id, dst->write_off, 0);
 			}
 			else
 				newval = 0;

@@ -166,11 +166,12 @@ that a purge cannot miss an entry whose segment is transiently draining.
 
 The slot also carries Segcache's per-item frequency counter (the ASFC) in seven
 bits between the location and the tag. It counts hits, so it starts at 0 when a
-record is published, and a merge halves it when relocating a record, so that a
-record which stopped being hot loses its standing within a few merges. A served
-hit bumps it with a single compare-and-swap -- exactly for the first sixteen
-hits, then with probability 1/count, so a hot entry soon stops rewriting its
-slot -- and a lost bump is dropped: the counter is approximate. A reader
+record is published or relocated by a merge: the records of a merged segment
+then compete on the hits they gather from that point, and a record that stopped
+being hot cannot outlive its popularity by several merges. A served hit bumps it
+with a single compare-and-swap -- exactly for the first sixteen hits, then with
+probability 1/count, so a hot entry soon stops rewriting its slot -- and a lost
+bump is dropped: the counter is approximate. A reader
 revalidating its pin ignores the counter bits, and the compare-and-swaps that
 clear or replace a slot retry while it still names the same record.
 
@@ -265,9 +266,10 @@ and never again -- out of the cache, and the [S3-FIFO][s3] study of thousands of
 production traces found their prompt removal to be the decisive factor in
 eviction quality, ahead of any recency or frequency subtlety. The destination
 takes the sources' place in the bucket's list and inherits their age, and each
-copied record's counter is halved, so a record that stopped being popular loses
-its standing over a few merges while one still being read stays ahead of
-newcomers.
+copied record's counter starts again from zero, so the next merge judges it on
+what it earns from now on. Carrying part of the count forward keeps records
+that stopped being popular ahead of newcomers, and retained less on production
+traces.
 
 A reservation that finds no free segment frees one in two steps, tried in order:
 
