@@ -3023,6 +3023,10 @@ static void show_cache_stats(struct buffer *buf, const char *tag,
 	              (unsigned long long)st.segs_expired);
 	chunk_appendf(buf, "%s.segs_evicted: %llu\n", tag,
 	              (unsigned long long)st.segs_evicted);
+	chunk_appendf(buf, "%s.merges: %llu\n", tag,
+	              (unsigned long long)st.merges);
+	chunk_appendf(buf, "%s.merges_empty: %llu\n", tag,
+	              (unsigned long long)st.merges_empty);
 }
 
 static int show_cache_cb(const struct cache *store, const struct cache_rhandle *h, void *data)

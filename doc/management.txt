@@ -3118,6 +3118,10 @@ show cache [stats]
                                its index entry
      segs_expired              Segments reclaimed after their contents expired
      segs_evicted              Live segments evicted to make room
+     merges                    Merges that copied at least one live object
+                               into their destination segment
+     merges_empty              Merges that found nothing left alive and only
+                               freed their sources
 
   Sustained growth of "reserve_fails" or "publish_fails" means objects are
   failing to be cached, the former pointing at reclamation, the latter at

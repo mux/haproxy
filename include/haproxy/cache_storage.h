@@ -96,6 +96,8 @@ struct cache_stats {
 	uint64_t segs_emptied;       /* Dead segments reclaimed at once, ahead of expiry or eviction */
 	uint64_t segs_expired;    /* Segments reclaimed at expiry */
 	uint64_t segs_evicted;    /* Live segments evicted to make room */
+	uint64_t merges;          /* Merges that retained something */
+	uint64_t merges_empty;    /* Merges that retained nothing */
 };
 
 struct cache;

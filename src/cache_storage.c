@@ -2767,6 +2767,8 @@ void cache_get_stats(const struct cache *cache, struct cache_stats *stats)
 	stats->aborts = _HA_ATOMIC_LOAD(&cache->stats.aborts);
 	stats->dead_bytes = _HA_ATOMIC_LOAD(&cache->stats.dead_bytes);
 	stats->segs_emptied = _HA_ATOMIC_LOAD(&cache->stats.segs_emptied);
+	stats->merges = _HA_ATOMIC_LOAD(&cache->merge_success);
+	stats->merges_empty = _HA_ATOMIC_LOAD(&cache->merge_empty);
 }
 
 size_t cache_entry_size(const struct cache *cache, const struct cache_rhandle *h)
