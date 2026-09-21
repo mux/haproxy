@@ -40,6 +40,7 @@
 
 /* Flags for cached entries. */
 #define CACHE_EF_ANCHOR            0x00000001 /* vary anchor: describes a varying resource, holds no response */
+#define CACHE_EF_TRAILERS          0x00000002 /* trailer blocks follow the body, their length closes the entry */
 
 /* Flags for configuration. */
 #define CACHE_CF_VARY_PROCESSING   0x00000001 /* manage Vary header (disabled by default) */
@@ -96,6 +97,7 @@ struct cache_appctx {
 	unsigned int send_notmodified:1; /* In case of conditional request, we might want to send a "304 Not Modified" response instead of the stored data. */
 	unsigned int clen:1;             /* The response has a Content-Length, so its body ends with its last byte. */
 	unsigned int unused:30;
+	uint32_t tlr_len;                /* Bytes of trailer blocks left to send. */
 };
 
 /* cache config for filters */
@@ -182,6 +184,7 @@ const struct vary_hashing_information vary_information[] = {
  */
 struct cache_st {
 	struct cache_whandle handle;
+	uint32_t tlr_len;            /* Trailer section length, 0 when none announced */
 };
 
 #define DEFAULT_MAX_SECONDARY_ENTRY 10
@@ -320,6 +323,7 @@ cache_store_strm_init(struct stream *s, struct filter *filter)
 		return -1;
 
 	CACHE_HANDLE_INIT(st->handle);
+	st->tlr_len = 0;
 	filter->ctx     = st;
 
 	/* Register post-analyzer on AN_RES_WAIT_HTTP */
@@ -421,8 +425,21 @@ cache_store_http_payload(struct stream *s, struct filter *filter, struct http_ms
 
 		switch (type) {
 			case HTX_BLK_TLR:
-				/* Abort caching until we support trailers. */
-				goto no_cache;
+				/* Stored like the headers when the response
+				 * announced trailers; unannounced ones are not
+				 * cached.
+				 */
+				if (!st->tlr_len || offset)
+					goto no_cache;
+				if (sz > len)
+					goto end;
+				if (cache_write(store, &st->handle, &blk->info, sizeof(blk->info)) ||
+				    cache_write(store, &st->handle, htx_get_blk_ptr(htx, blk), sz))
+					goto no_cache;
+				st->tlr_len += sizeof(blk->info) + sz;
+				to_forward += sz;
+				len -= sz;
+				break;
 
 			case HTX_BLK_DATA:
 				v = htx_get_blk_value(htx, blk);
@@ -460,6 +477,21 @@ cache_store_http_payload(struct stream *s, struct filter *filter, struct http_ms
 	return orig_len;
 }
 
+/* Close the trailer section of an entry: an end-of-trailers block, then the
+ * section's length, which the applet reads from the end of the entry to find
+ * where the body stops. Returns 0 on success, -1 when the entry is out of room.
+ */
+static int cache_store_trailers(struct cache *store, struct cache_st *st)
+{
+	uint32_t info = (HTX_BLK_EOT << 28) + 1;
+	char pad = 0;
+
+	if (cache_write(store, &st->handle, &info, sizeof(info)) ||
+	    cache_write(store, &st->handle, &pad, sizeof(pad)))
+		return -1;
+	return cache_write(store, &st->handle, &st->tlr_len, sizeof(st->tlr_len));
+}
+
 static int
 cache_store_http_end(struct stream *s, struct filter *filter,
                      struct http_msg *msg)
@@ -471,8 +503,12 @@ cache_store_http_end(struct stream *s, struct filter *filter,
 	if (!(msg->chn->flags & CF_ISRESP))
 		return 1;
 
-	if (st && !CACHE_HANDLE_ERR(st->handle))
-		cache_publish(cache->store, &st->handle);
+	if (st && !CACHE_HANDLE_ERR(st->handle)) {
+		if (st->tlr_len && cache_store_trailers(cache->store, st) < 0)
+			cache_abort(cache->store, &st->handle);
+		else
+			cache_publish(cache->store, &st->handle);
+	}
 
 	if (st) {
 		pool_free(pool_head_cache_st, st);
@@ -1328,6 +1364,9 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 				                      b_data(&trash) - sz +
 				                      istlen(header_name);
 			}
+			/* Announced trailers are stored after the body. */
+			else if (isteq(header_name, ist("trailer")))
+				object.flags |= CACHE_EF_TRAILERS;
 		}
 		if (type == HTX_BLK_EOH)
 			break;
@@ -1337,6 +1376,11 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 	if (hdrs_len > htx->size - global.tune.maxrewrite)
 		goto out;
 
+	/* With trailers the entry's size is not known in advance even with a
+	 * Content-Length: reserve it like an unknown-length one.
+	 */
+	if (object.flags & CACHE_EF_TRAILERS)
+		len = 0;
 	if (len > 0)
 		len += b_data(&trash);
 
@@ -1370,6 +1414,11 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 	cache_ctx->handle = cache_reserve(cache->store, key, len, expire);
 	if (CACHE_HANDLE_ERR(cache_ctx->handle))
 		goto out;
+	/* The section always ends with the end-of-trailers block written at
+	 * publish time: an info word and its one byte.
+	 */
+	if (object.flags & CACHE_EF_TRAILERS)
+		cache_ctx->tlr_len = sizeof(uint32_t) + 1;
 	if (cache_write(cache->store, &cache_ctx->handle, &object, sizeof(object))) {
 		cache_abort(cache->store, &cache_ctx->handle);
 		CACHE_HANDLE_INIT(cache_ctx->handle);
@@ -1393,8 +1442,9 @@ out:
 #define 	HTX_CACHE_INIT   0  /* Initial state. */
 #define 	HTX_CACHE_HEADER 1  /* Cache entry headers forwarding */
 #define 	HTX_CACHE_DATA   2  /* Cache entry data forwarding */
-#define 	HTX_CACHE_EOM    3  /* Cache entry completely forwarded. Finish the HTX message */
-#define 	HTX_CACHE_END    4  /* Cache entry treatment terminated */
+#define 	HTX_CACHE_TRAILERS 3 /* Cache entry trailers forwarding */
+#define 	HTX_CACHE_EOM    4  /* Cache entry completely forwarded. Finish the HTX message */
+#define 	HTX_CACHE_END    5  /* Cache entry treatment terminated */
 
 static void http_cache_applet_release(struct appctx *appctx)
 {
@@ -1563,7 +1613,9 @@ static size_t http_cache_fastfwd(struct appctx *appctx, struct buffer *buf, size
 	if (!appctx->to_forward) {
 		se_fl_clr(appctx->sedesc, SE_FL_MAY_FASTFWD_PROD);
 		applet_fl_clr(appctx, APPCTX_FL_FASTFWD);
-		if (ctx->sent == ctx->entry_size - sizeof(*ctx->entry)) {
+		if (ctx->tlr_len)
+			appctx->st0 = HTX_CACHE_TRAILERS;
+		else if (ctx->sent == ctx->entry_size - sizeof(*ctx->entry)) {
 			if (ctx->clen) {
 				/* The last body bytes are in this block. Reporting
 				 * the end of the message now lets the mux send them
@@ -1649,25 +1701,49 @@ static void http_cache_io_handler(struct appctx *appctx)
 		if (find_http_meth(istptr(meth), istlen(meth)) == HTTP_METH_HEAD || ctx->send_notmodified)
 			appctx->st0 = HTX_CACHE_EOM;
 		else {
+			size_t body = ctx->entry_size -
+			              cache_seek(cache->store, &ctx->handle, 0, SEEK_CUR);
+
+			/* Announced trailers follow the body as blocks, and
+			 * the section's length closes the entry.
+			 */
+			if (ctx->entry->flags & CACHE_EF_TRAILERS) {
+				if (cache_read_at(cache->store, &ctx->handle,
+				                  ctx->entry_size - sizeof(ctx->tlr_len),
+				                  &ctx->tlr_len, sizeof(ctx->tlr_len)) != sizeof(ctx->tlr_len) ||
+				    ctx->tlr_len + sizeof(ctx->tlr_len) > body)
+					goto error;
+				body -= ctx->tlr_len + sizeof(ctx->tlr_len);
+			}
+
 			if (!(global.tune.no_zero_copy_fwd & NO_ZERO_COPY_FWD_APPLET))
 				se_fl_set(appctx->sedesc, SE_FL_MAY_FASTFWD_PROD);
 
-			appctx->to_forward = ctx->entry_size -
-			                     cache_seek(cache->store, &ctx->handle, 0, SEEK_CUR);
-			len = ctx->entry_size - sizeof(*ctx->entry) - ctx->sent;
+			appctx->to_forward = body;
 			appctx->st0 = HTX_CACHE_DATA;
 		}
 	}
 
 	if (appctx->st0 == HTX_CACHE_DATA) {
-		if (len) {
-			ret = htx_cache_dump_data_blk(appctx, res_htx);
-			if (ret < len) {
+		if (appctx->to_forward) {
+			htx_cache_dump_data_blk(appctx, res_htx);
+			if (appctx->to_forward) {
 				applet_fl_set(appctx, APPCTX_FL_OUTBLK_FULL);
 				goto out;
 			}
 		}
-		BUG_ON(appctx->to_forward);
+		if (ctx->tlr_len)
+			appctx->st0 = HTX_CACHE_TRAILERS;
+		else
+			appctx->st0 = HTX_CACHE_EOM;
+	}
+
+	if (appctx->st0 == HTX_CACHE_TRAILERS) {
+		ctx->tlr_len -= htx_cache_dump_msg(appctx, res_htx, ctx->tlr_len, HTX_BLK_EOT);
+		if (ctx->tlr_len) {
+			applet_fl_set(appctx, APPCTX_FL_OUTBLK_FULL);
+			goto out;
+		}
 		appctx->st0 = HTX_CACHE_EOM;
 	}
 
