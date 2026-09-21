@@ -1576,8 +1576,8 @@ static size_t http_cache_fastfwd(struct appctx *appctx, struct buffer *buf, size
 			}
 			else {
 				/* Without a Content-Length the body is sent chunked
-				 * and the mux only emits the last-chunk when it sees
-				 * HTX_FL_EOM, which the regular path sets.
+				 * and the mux only emits the last-chunk once the end
+				 * of the message is set, which the regular path does.
 				 */
 				appctx->st0 = HTX_CACHE_EOM;
 			}
@@ -1672,18 +1672,14 @@ static void http_cache_io_handler(struct appctx *appctx)
 	}
 
 	if (appctx->st0 == HTX_CACHE_EOM) {
-		/* No more data are expected. If the response buffer is empty
-		 * (e.g. after a fast-forwarded body), add an EOT block: with
-		 * no block to send, the EOM flag would be lost when the empty
-		 * HTX message is released back to the buffer.
+		/* No more data are expected. htx_set_eom() adds an EOT block
+		 * itself when the response buffer is empty, e.g. after a
+		 * fast-forwarded body.
 		 */
-		if (htx_is_empty(res_htx)) {
-			if (!htx_add_endof(res_htx, HTX_BLK_EOT)) {
-				applet_fl_set(appctx, APPCTX_FL_OUTBLK_FULL);
-				goto out;
-			}
+		if (!htx_set_eom(res_htx)) {
+			applet_fl_set(appctx, APPCTX_FL_OUTBLK_FULL);
+			goto out;
 		}
-		res_htx->flags |= HTX_FL_EOM;
 		applet_set_eoi(appctx);
 		se_fl_clr(appctx->sedesc, SE_FL_MAY_FASTFWD_PROD);
 		applet_fl_clr(appctx, APPCTX_FL_FASTFWD);
