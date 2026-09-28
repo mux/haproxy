@@ -20686,6 +20686,25 @@ mean-object-size <bytes>
   small-object workloads work without tuning; large-object workloads may raise
   it to reclaim a fraction of a percent of memory. The minimum is 128.
 
+reserved-segments <number>
+  Define how many segments are kept aside for segment merging, so that a merge
+  operation can always find a destination segment. Ordinary reservations will
+  not consume these segments. The effective default is min(nbthread, 4),
+  additionally capped at roughly a 64th of the cache's segment count (floored at
+  one segment): concurrent merges are bounded by the thread count and in
+  practice well below it, while every reserved segment is capacity withheld from
+  the cache at all times. The extra cap matters because a cache small enough to
+  turn over faster than its segments can reach merge maturity gains nothing from
+  a large reserve. The effective value is reported as "n_reserved" by "show
+  cache stats". Setting it too low makes merges fall back to evicting whole
+  segments, which shows up as a growing "merges_no_dst" counter. A value of 0
+  disables segment merging entirely: reclamation then evicts whole segments
+  instead of merging runs of them. That trades hit ratio for scalability --
+  merging is what keeps frequently read objects and drops one-hit wonders -- and
+  gives the reserved capacity back; it is meant for deployments that prefer
+  plain FIFO under very high thread counts. This setting rarely needs to be
+  changed otherwise.
+
 process-vary <on/off>
   Enable or disable the processing of the Vary header. When disabled, a response
   containing such a header will never be cached. When enabled, we need to calculate

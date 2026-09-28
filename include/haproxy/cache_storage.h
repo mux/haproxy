@@ -65,17 +65,25 @@ struct cache_config {
 	size_t max_obj_size;
 	size_t mean_obj_size;
 	uint32_t seg_size;
-	/* The number of segments reserved for segment merging. We recommend
-	 * having one segment per thread, so it is always possible to run the
-	 * segment merging operation. Any more than that is useless. This number
-	 * may be reduced internally to accommodate some extreme cases with very
-	 * small caches, where the provided number would leave too few free
-	 * segments for the cache to be useful.
+	/* The number of segments reserved for segment merging, so a merge always
+	 * has a destination. The effective default is min(nbthread, 4), further
+	 * capped at max(1, n_segs/64) -- near 1.5% of the segment count -- because
+	 * a cache small enough to turn over faster than its segments can reach
+	 * merge maturity gains nothing from reserving a large fraction of itself.
+	 * Ignored when merge_disabled is set.
 	 */
 	uint n_reserved;
+	/* Segment merging turned off entirely: reclaim evicts whole segments
+	 * instead of merging runs of them, trading hit ratio for scalability.
+	 * Set by "reserved-segments 0". Zero by default, so a zeroed
+	 * cache_config keeps merging enabled.
+	 */
+	int merge_disabled;
 };
 
-/* Cache activity counters, all monotonic. Read with cache_get_stats(). */
+/* Cache activity counters, all monotonic except where noted. Read with
+ * cache_get_stats().
+ */
 struct cache_stats {
 	uint64_t reserve_fails;   /* Reservations abandoned: reclaim found no room in time */
 	uint64_t reserve_fail_giveup;     /* ... because no listed segment was left:
@@ -98,6 +106,20 @@ struct cache_stats {
 	uint64_t segs_evicted;    /* Live segments evicted to make room */
 	uint64_t merges;          /* Merges that retained something */
 	uint64_t merges_empty;    /* Merges that retained nothing */
+	uint64_t merges_no_dst;   /* Merges that found no destination segment and
+	                           * fell back to evicting whole segments */
+	uint64_t merges_inflight_max; /* Most merges holding a destination at once */
+	uint64_t segs_condemned;      /* Segments waiting on their last reader to
+	                               * be freed, right now (a gauge) */
+	uint64_t segs_condemned_max;  /* Most such segments at once */
+
+	/* Instantaneous state, not counters: they give the merge and condemn
+	 * numbers their context. n_reserved is the effective value, after the
+	 * internal cap on very small caches.
+	 */
+	uint64_t n_segs;          /* Segments in the arena */
+	uint64_t n_reserved;      /* Segments reserved for merging (a gauge) */
+	uint64_t n_free;          /* Free segments in the pool (a gauge) */
 };
 
 struct cache;

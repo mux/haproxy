@@ -319,6 +319,8 @@ struct cache {
 	unsigned int n_free;            /* Number of free segments in the pool */
 	uint64_t merge_empty;           /* Merges that retained nothing */
 	uint64_t merge_success;         /* Merges that retained something */
+	unsigned int merges_inflight;   /* Merges holding a destination segment */
+	unsigned int segs_condemned;    /* Segments waiting on their last reader */
 
 	struct cache_stats stats;       /* Activity counters */
 };
@@ -525,7 +527,7 @@ static inline seg_id_t seg_free_pop(struct cache *cache, unsigned int n_segs, in
 	BUG_ON(n_segs == 0);
 
 	HA_SPIN_LOCK(CACHE_LOCK, &cache->pool_lock);
-	if (!reserve && cache->n_free < cache->cfg.n_reserved + n_segs) {
+	if (!reserve && _HA_ATOMIC_LOAD(&cache->n_free) < cache->cfg.n_reserved + n_segs) {
 		HA_SPIN_UNLOCK(CACHE_LOCK, &cache->pool_lock);
 		return CACHE_SEG_NONE;
 	}
@@ -654,8 +656,10 @@ static inline void seg_read_unpin(struct cache *cache, struct seg *seg)
 		 * CAS fail instead of freeing the segment under them.
 		 */
 		if (HA_ATOMIC_CAS(&seg->state_gen, &expected,
-		                  SEG_STATE_MAKE(SEG_STATE_GEN(expected), SEG_S_FREE)))
+		                  SEG_STATE_MAKE(SEG_STATE_GEN(expected), SEG_S_FREE))) {
+			_HA_ATOMIC_DEC(&cache->segs_condemned);
 			seg_free_push(cache, seg_get_id(cache, seg));
+		}
 	}
 }
 
@@ -1153,8 +1157,13 @@ static inline enum seg_reclaim_status seg_drain(struct cache *cache, seg_id_t se
 	}
 
 	/* We do not need a CAS here either, for the exact same reason as the
-	 * transition to SEG_S_DRAINING above.
+	 * transition to SEG_S_DRAINING above. The segment is counted as
+	 * condemned before the store: whoever wins the CONDEMNED -> FREE CAS
+	 * uncounts it, and no reader can observe CONDEMNED before the counter
+	 * is bumped.
 	 */
+	HA_ATOMIC_UPDATE_MAX(&cache->stats.segs_condemned_max,
+	                     _HA_ATOMIC_ADD_FETCH(&cache->segs_condemned, 1));
 	HA_ATOMIC_STORE_SEQ_CST(&seg->state_gen,
 	                        SEG_STATE_MAKE(gen, SEG_S_CONDEMNED));
 
@@ -1180,8 +1189,10 @@ static inline enum seg_reclaim_status seg_drain(struct cache *cache, seg_id_t se
 		 */
 		expected = SEG_STATE_MAKE(gen, SEG_S_CONDEMNED);
 		if (HA_ATOMIC_CAS(&seg->state_gen, &expected,
-		                  SEG_STATE_MAKE(gen, SEG_S_FREE)))
+		                  SEG_STATE_MAKE(gen, SEG_S_FREE))) {
+			_HA_ATOMIC_DEC(&cache->segs_condemned);
 			seg_free_push(cache, seg_id);
+		}
 		/* Won or lost, the push is done or imminent: the segment is
 		 * freed.
 		 */
@@ -1477,6 +1488,7 @@ struct cache *cache_new(const struct cache_config *ucfg, uint flags,
 	struct cache_config *cfg;
 	struct seg *seg;
 	seg_id_t seg_id;
+	unsigned int cap;
 	int mapflags, i;
 
 	/* Validate the parameters and deduce n_segs. */
@@ -1531,13 +1543,23 @@ struct cache *cache_new(const struct cache_config *ucfg, uint flags,
 		goto out;
 	cache->n_segs = total_size / cfg->seg_size;
 
+	/* Merging off means no reserve is used, whatever cfg held. */
+	if (cache->cfg.merge_disabled)
+		cache->cfg.n_reserved = 0;
+
 	/* Don't let callers configure an overly large number of reserved
-	 * segments. Having more than one per thread is useless. We don't know
-	 * the number of threads here, but since we always have at least 16
-	 * segments, n_segs / 16 is never zero and a decent, best-effort cap.
+	 * segments. A merge needs a destination, but segments only become
+	 * mergeable once they are CACHE_MERGE_MATURE_TIME old, and a cache
+	 * small enough to turn over faster than n_segs/20 per second never
+	 * reaches that: reserving a large fraction of it is pure capacity
+	 * loss. n_segs/64 keeps the reserve near 1.5% of the cache, floored
+	 * at one segment so a merge can always find a destination.
 	 */
-	if (cache->cfg.n_reserved > cache->n_segs / 16)
-		cache->cfg.n_reserved = cache->n_segs / 16;
+	cap = cache->n_segs / 64;
+	if (cap < 1)
+		cap = 1;
+	if (cache->cfg.n_reserved > cap)
+		cache->cfg.n_reserved = cap;
 
 	/* Initialize the hashtable index. */
 	if (cache_index_init(cache, total_size) != 0)
@@ -1689,8 +1711,12 @@ static enum cache_reclaim_status ttl_bucket_merge(struct cache *cache, struct tt
 	}
 
 	dst_id = seg_free_pop(cache, 1, 1);
-	if (dst_id == CACHE_SEG_NONE)
+	if (dst_id == CACHE_SEG_NONE) {
+		_HA_ATOMIC_INC(&cache->stats.merges_no_dst);
 		return seg_evict(cache, l, head_id, freed);
+	}
+	HA_ATOMIC_UPDATE_MAX(&cache->stats.merges_inflight_max,
+	                     _HA_ATOMIC_ADD_FETCH(&cache->merges_inflight, 1));
 	seg_reinit(&cache->segments[dst_id]);
 
 	n = seg_merge_claim(cache, ttlb, head_id);
@@ -1725,6 +1751,7 @@ static enum cache_reclaim_status ttl_bucket_merge(struct cache *cache, struct tt
 		if (seg_drain(cache, srcs[i]) == SEG_RECLAIM_FREED)
 			supply++;
 	}
+	_HA_ATOMIC_DEC(&cache->merges_inflight);
 	_HA_ATOMIC_ADD(&cache->stats.segs_evicted, res.merged);
 
 	/* The destination came out of the pool: only what the sources put back
@@ -1928,7 +1955,7 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 		return CACHE_RECLAIM_PROGRESS;
 	}
 
-	if (best_list == &best->segs)
+	if (best_list == &best->segs && !cache->cfg.merge_disabled)
 		status = ttl_bucket_merge(cache, best, needed, freed);
 	else
 		status = seg_evict(cache, best_list, best_seg_id, freed);
@@ -2764,6 +2791,13 @@ void cache_get_stats(const struct cache *cache, struct cache_stats *stats)
 	stats->segs_emptied = _HA_ATOMIC_LOAD(&cache->stats.segs_emptied);
 	stats->merges = _HA_ATOMIC_LOAD(&cache->merge_success);
 	stats->merges_empty = _HA_ATOMIC_LOAD(&cache->merge_empty);
+	stats->merges_no_dst = _HA_ATOMIC_LOAD(&cache->stats.merges_no_dst);
+	stats->merges_inflight_max = _HA_ATOMIC_LOAD(&cache->stats.merges_inflight_max);
+	stats->segs_condemned = _HA_ATOMIC_LOAD(&cache->segs_condemned);
+	stats->segs_condemned_max = _HA_ATOMIC_LOAD(&cache->stats.segs_condemned_max);
+	stats->n_segs = cache->n_segs;
+	stats->n_reserved = cache->cfg.n_reserved;
+	stats->n_free = _HA_ATOMIC_LOAD(&cache->n_free);
 }
 
 size_t cache_entry_size(const struct cache *cache, const struct cache_rhandle *h)

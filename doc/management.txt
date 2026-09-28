@@ -3122,6 +3122,21 @@ show cache [stats]
                                into their destination segment
      merges_empty              Merges that found nothing left alive and only
                                freed their sources
+     merges_no_dst             Merges that found no destination segment and fell
+                               back to evicting whole segments; sustained growth
+                               means "reserved-segments" is too low
+     merges_inflight_max       Most merges holding a destination segment at once
+                               (the demand "reserved-segments" must cover)
+     segs_condemned            Segments waiting on their last reader to be freed
+                               right now (a gauge)
+     segs_condemned_max        Most such segments at once; a large value means
+                               reader pins are slowing the return of merged-out
+                               segments to the free pool
+     n_segs                    Segments in the arena (a gauge)
+     n_reserved                Effective number of segments reserved for merging,
+                               after the internal cap; 0 when merging is disabled
+                               (a gauge)
+     n_free                    Free segments in the pool right now (a gauge)
 
   Sustained growth of "reserve_fails" or "publish_fails" means objects are
   failing to be cached, the former pointing at reclamation, the latter at

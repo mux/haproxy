@@ -289,10 +289,18 @@ A reservation that finds no free segment frees one in two steps, tried in order:
   the head, for at least three consecutive segments that qualify -- neither the
   write tail nor being written, at least twenty seconds old and more than twenty
   seconds from expiry -- and merges them into a destination taken from a small
-  reserve of segments, one per thread, that ordinary reservations leave alone so
-  a merge can always run. The sources return to the pool. Without such a run the
-  head is evicted whole, as plain FIFO would. Read pins are no obstacle at all;
+  reserve of `reserved-segments` segments, defaulting to min(nbthread, 4)
+  further capped at a 64th of the segment count (floored at one), that ordinary
+  reservations leave alone so a merge can always run. The sources return to the
+  pool, unless a reader still pins them, in which case they are condemned and
+  their return is delayed until that reader unpins -- which is why a burst of
+  merges can want more destinations than there are concurrent merges, and why
+  `merges_no_dst` and `segs_condemned` are reported. Without such a run the head
+  is evicted whole, as plain FIFO would. Read pins are no obstacle at all;
   a segment reclaimed under them is condemned and handed to its last reader.
+  Merging can be turned off entirely with `reserved-segments 0`, in which case
+  reclamation always takes that plain-FIFO path: it trades the per-record
+  eviction choice for scalability and gives the reserved capacity back.
 
 A merge that retains nothing hands its destination back, and once such merges
 outnumber the successful ones, later merges copy every live record: on a cache

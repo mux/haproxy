@@ -46,6 +46,7 @@
 #define CACHE_CF_VARY_PROCESSING   0x00000001 /* manage Vary header (disabled by default) */
 #define CACHE_CF_EARLY_HINTS       0x00000002 /* enable HTTP 103 Early Hints (disabled by default) */
 #define CACHE_CF_EARLY_HINTS_ONLY  0x00000004 /* skip body storage; implies CACHE_CF_EARLY_HINTS */
+#define CACHE_CF_RESERVED_SEGMENTS 0x00000008 /* "reserved-segments" was set explicitly */
 
 #define CACHE_INC_STAT(px, s, stat)								\
 do {												\
@@ -2363,6 +2364,32 @@ int cfg_parse_cache(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 		tmp_cache_config->store_cfg.mean_obj_size = meansz;
+	} else if (strcmp(args[0], "reserved-segments") == 0) {
+		unsigned long nres;
+		char *err;
+
+		if (alertif_too_many_args(1, file, linenum, args, &err_code)) {
+			err_code |= ERR_ABORT;
+			goto out;
+		}
+
+		if (!*args[1]) {
+			ha_warning("parsing [%s:%d]: '%s' expects a number of segments.\n",
+			        file, linenum, args[0]);
+			err_code |= ERR_WARN;
+		}
+
+		nres = strtoul(args[1], &err, 10);
+		if (err == args[1] || *err != '\0' || nres > 65535) {
+			ha_warning("parsing [%s:%d]: reserved-segments wrong value '%s' (0 to 65535)\n",
+			           file, linenum, args[1]);
+			err_code |= ERR_ABORT;
+			goto out;
+		}
+		tmp_cache_config->flags |= CACHE_CF_RESERVED_SEGMENTS;
+		tmp_cache_config->store_cfg.n_reserved = nres;
+		/* 0 disables segment merging entirely. */
+		tmp_cache_config->store_cfg.merge_disabled = (nres == 0);
 	} else if (strcmp(args[0], "process-vary") == 0) {
 		if (alertif_too_many_args(1, file, linenum, args, &err_code)) {
 			err_code |= ERR_ABORT;
@@ -2530,7 +2557,18 @@ int post_check_cache()
 
 	list_for_each_entry_safe(cache, back, &caches_config, list) {
 		if (!(cache->flags & CACHE_CF_EARLY_HINTS_ONLY)) {
-			cache->store_cfg.n_reserved = global.nbthread;
+			/* Effective default min(nbthread, 4), further capped at
+			 * max(1, n_segs/64) in cache_new(): a merge needs a
+			 * destination segment, concurrent merges are bounded by
+			 * the thread count -- in practice well below it -- and
+			 * every reserved segment is capacity withheld from the
+			 * cache at all times, so a cache too small to reach merge
+			 * maturity should reserve little. "reserved-segments"
+			 * overrides it, and "reserved-segments 0" disables
+			 * merging outright.
+			 */
+			if (!(cache->flags & CACHE_CF_RESERVED_SEGMENTS))
+				cache->store_cfg.n_reserved = MIN(global.nbthread, 4);
 			cache->store = cache_new(&cache->store_cfg, 0,
 			                         cache->total_size,
 			                         cache_hash_seed, cache->id);
@@ -3099,6 +3137,20 @@ static void show_cache_stats(struct buffer *buf, const char *tag,
 	              (unsigned long long)st.merges);
 	chunk_appendf(buf, "%s.merges_empty: %llu\n", tag,
 	              (unsigned long long)st.merges_empty);
+	chunk_appendf(buf, "%s.merges_no_dst: %llu\n", tag,
+	              (unsigned long long)st.merges_no_dst);
+	chunk_appendf(buf, "%s.merges_inflight_max: %llu\n", tag,
+	              (unsigned long long)st.merges_inflight_max);
+	chunk_appendf(buf, "%s.segs_condemned: %llu\n", tag,
+	              (unsigned long long)st.segs_condemned);
+	chunk_appendf(buf, "%s.segs_condemned_max: %llu\n", tag,
+	              (unsigned long long)st.segs_condemned_max);
+	chunk_appendf(buf, "%s.n_segs: %llu\n", tag,
+	              (unsigned long long)st.n_segs);
+	chunk_appendf(buf, "%s.n_reserved: %llu\n", tag,
+	              (unsigned long long)st.n_reserved);
+	chunk_appendf(buf, "%s.n_free: %llu\n", tag,
+	              (unsigned long long)st.n_free);
 }
 
 static int show_cache_cb(const struct cache *store, const struct cache_rhandle *h, void *data)
