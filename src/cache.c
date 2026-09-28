@@ -45,6 +45,7 @@
 #define CACHE_CF_VARY_PROCESSING   0x00000001 /* manage Vary header (disabled by default) */
 #define CACHE_CF_EARLY_HINTS       0x00000002 /* enable HTTP 103 Early Hints (disabled by default) */
 #define CACHE_CF_EARLY_HINTS_ONLY  0x00000004 /* skip body storage; implies CACHE_CF_EARLY_HINTS */
+#define CACHE_CF_RESERVED_SEGMENTS 0x00000008 /* "reserved-segments" was set explicitly */
 
 /* Increment the http <stat> counter on whichever side of <px> the stream uses. */
 #define CACHE_INC_STAT(px, s, stat)								\
@@ -2475,6 +2476,30 @@ int cfg_parse_cache(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 		tmp_cache_config->store_cfg.mean_obj_size = meansz;
+	} else if (strcmp(args[0], "reserved-segments") == 0) {
+		unsigned long nres;
+		char *err;
+
+		if (alertif_too_many_args(1, file, linenum, args, &err_code)) {
+			err_code |= ERR_ABORT;
+			goto out;
+		}
+
+		if (!*args[1]) {
+			ha_warning("parsing [%s:%d]: '%s' expects a number of segments.\n",
+			        file, linenum, args[0]);
+			err_code |= ERR_WARN;
+		}
+
+		nres = strtoul(args[1], &err, 10);
+		if (err == args[1] || *err != '\0' || nres > 65535) {
+			ha_warning("parsing [%s:%d]: reserved-segments wrong value '%s' (0 to 65535)\n",
+			           file, linenum, args[1]);
+			err_code |= ERR_ABORT;
+			goto out;
+		}
+		tmp_cache_config->flags |= CACHE_CF_RESERVED_SEGMENTS;
+		tmp_cache_config->store_cfg.n_reserved = nres;
 	} else if (strcmp(args[0], "process-vary") == 0) {
 		if (alertif_too_many_args(1, file, linenum, args, &err_code)) {
 			err_code |= ERR_ABORT;
@@ -2689,7 +2714,19 @@ int post_check_cache()
 	list_for_each_entry_safe(cache, back, &caches_config, list) {
 		HA_SPIN_INIT(&cache->vary_lock);
 		if (!(cache->flags & CACHE_CF_EARLY_HINTS_ONLY)) {
-			cache->store_cfg.n_reserved = global.nbthread;
+			/* Effective default min(nbthread, 4), further capped at
+			 * max(1, n_segs/64) in cache_new(): a merge needs a
+			 * destination segment, concurrent merges are bounded by
+			 * the thread count -- in practice well below it -- and
+			 * every reserved segment is capacity withheld from the
+			 * cache at all times, so a cache too small to reach merge
+			 * maturity should reserve little. "reserved-segments"
+			 * overrides it. Zero removes the reserve, not the
+			 * independent ability to merge when a destination is
+			 * available.
+			 */
+			if (!(cache->flags & CACHE_CF_RESERVED_SEGMENTS))
+				cache->store_cfg.n_reserved = MIN(global.nbthread, 4);
 			cache->store = cache_new(&cache->store_cfg, 0,
 			                         cache->total_size,
 			                         cache_hash_seed, cache->id);
@@ -3302,6 +3339,13 @@ static void show_cache_stats(struct buffer *buf, const char *id,
 	SHOW_CACHE_METRIC(segs_evicted);
 	SHOW_CACHE_METRIC(merges);
 	SHOW_CACHE_METRIC(merges_empty);
+	SHOW_CACHE_METRIC(merges_no_dst);
+	SHOW_CACHE_METRIC(merges_inflight_max);
+	SHOW_CACHE_METRIC(segs_condemned);
+	SHOW_CACHE_METRIC(segs_condemned_max);
+	SHOW_CACHE_METRIC(n_segs);
+	SHOW_CACHE_METRIC(n_reserved);
+	SHOW_CACHE_METRIC(n_free);
 
 #undef SHOW_CACHE_METRIC
 }
