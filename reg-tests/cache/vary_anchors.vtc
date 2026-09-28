@@ -153,7 +153,11 @@ shell {
     test "$expiry" -gt 280 && test "$expiry" -le 300
 
     stats=$(echo "show cache stats" | socat -t 5 "${tmpdir}/h1/stats" -)
+    printf '%s\n' "$stats" | grep -q '^my_cache.n_segs: 64$'
+    printf '%s\n' "$stats" | grep -q '^my_cache-anchors.n_segs: 16$'
+    printf '%s\n' "$stats" | grep -q '^my_cache-anchors.n_reserved: 0$'
     printf '%s\n' "$stats" | grep -q '^my_cache-anchors.merges: 0$'
+    printf '%s\n' "$stats" | grep -q '^my_cache-hints.n_segs:'
 }
 
 client c3 -connect ${h1_fe_sock} {
