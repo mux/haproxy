@@ -84,6 +84,8 @@ struct http_cache {
 	unsigned int maxage;       /* max-age */
 	unsigned int max_secondary_entries;  /* maximum number of secondary entries (Vary) */
 	uint8_t flags;             /* configuration flags, see CACHE_CF_* */
+	uint32_t inv_seq;          /* last invalidation sequence number handed out */
+	uint32_t *inv_tab;         /* per primary-key slot: sequence of its last invalidation */
 	char id[33];               /* cache name */
 };
 
@@ -186,7 +188,12 @@ const struct vary_hashing_information vary_information[] = {
 struct cache_st {
 	struct cache_whandle handle;
 	uint32_t tlr_len;            /* Trailer section length, 0 when none announced */
+	uint32_t fill_seq;           /* invalidation sequence when the fill started */
 };
+
+/* Number of slots of the invalidation table, see cache_invalidate(). */
+#define CACHE_INV_BITS              16
+#define CACHE_INV_SIZE              (1U << CACHE_INV_BITS)
 
 #define DEFAULT_MAX_SECONDARY_ENTRY 10
 
@@ -201,6 +208,9 @@ struct cache_entry {
 	unsigned int etag_length; /* Length of the ETag value (if one was found in the response). */
 	unsigned int etag_offset; /* Offset of the ETag value in the data buffer. */
 
+	uint32_t fill_seq;    /* Invalidation sequence when the fill started, see
+	                       * cache_invalidate(). Only checked on variants. */
+
 	time_t last_modified; /* Origin server "Last-Modified" header value converted in
 			       * seconds since epoch. If no "Last-Modified"
 			       * header is found, use "Date" header value,
@@ -212,19 +222,20 @@ struct cache_entry {
 /*
  * With Vary processing, the primary key of a varying resource maps to an
  * anchor entry instead of a response. The anchor records the headers the
- * resource varies on, a random generation number, and the coding masks of the
- * variants stored so far; each variant is stored under a key derived from the
- * primary key, the signature, the generation and the request's secondary key.
- * Deleting or replacing the anchor therefore invalidates every variant at
- * once.
+ * resource varies on and the coding masks of the variants stored so far; each
+ * variant is stored under a key derived from the primary key, the signature
+ * and the request's secondary key only.
+ *
+ * The anchor is thus a mere lookup hint: the variant keys do not depend on it,
+ * so losing it (eviction, expiry) costs a miss until a store recreates it, and
+ * the variants become reachable again. Invalidation is not tied to the anchor
+ * either, see cache_invalidate().
  */
 struct cache_anchor {
 	struct cache_entry entry;    /* flags contains CACHE_EF_ANCHOR */
-	uint64_t generation;
 	/* Coding masks of the variants stored so far, capped by
 	 * max-secondary-entries. A published anchor is never modified: adding
-	 * a mask publishes a copy with the mask appended, keeping the
-	 * generation so that the existing variants stay reachable. */
+	 * a mask publishes a copy with the mask appended. */
 	uint32_t enc_masks[DEFAULT_MAX_SECONDARY_ENTRY];
 };
 
@@ -325,6 +336,10 @@ cache_store_strm_init(struct stream *s, struct filter *filter)
 
 	CACHE_HANDLE_INIT(st->handle);
 	st->tlr_len = 0;
+	/* Stamped before the request is forwarded, so that an invalidation
+	 * racing with this fill is seen as more recent than it.
+	 */
+	st->fill_seq = HA_ATOMIC_LOAD(&((struct cache_flt_conf *)FLT_CONF(filter))->c.cache->inv_seq);
 	filter->ctx     = st;
 
 	/* Register post-analyzer on AN_RES_WAIT_HTTP */
@@ -931,25 +946,60 @@ static int set_secondary_key_encoding(struct htx *htx, unsigned int vary_signatu
 	return 0;
 }
 
+/* Slot of primary key <pkey> in the invalidation table. */
+static inline uint32_t cache_inv_slot(const struct cache_key *pkey)
+{
+	return (uint32_t)(pkey->hash.low64 >> 32) & (CACHE_INV_SIZE - 1);
+}
+
+/*
+ * Tell whether an entry stored under primary key <pkey> by a fill stamped
+ * <fill_seq> was invalidated after that fill started. Signed difference, so
+ * that the sequence may wrap.
+ */
+static inline int cache_entry_invalidated(const struct http_cache *cache,
+                                          const struct cache_key *pkey,
+                                          uint32_t fill_seq)
+{
+	uint32_t inv = HA_ATOMIC_LOAD(&cache->inv_tab[cache_inv_slot(pkey)]);
+
+	return (int32_t)(fill_seq - inv) < 0;
+}
+
+/*
+ * Invalidate everything stored for primary key <pkey>. The plain response or
+ * anchor under <pkey> is deleted. Variants cannot be enumerated, so instead the
+ * key's slot of the invalidation table gets a new sequence number: every entry
+ * is stamped with the sequence current when its fill started, and a variant
+ * stamped before its slot's last invalidation is never served again. That also
+ * covers fills already in flight. Slots are shared, so a collision only costs
+ * other resources a miss, never a stale hit.
+ */
+static void cache_invalidate(struct http_cache *cache, const struct cache_key *pkey)
+{
+	uint32_t seq = HA_ATOMIC_ADD_FETCH(&cache->inv_seq, 1);
+
+	HA_ATOMIC_STORE(&cache->inv_tab[cache_inv_slot(pkey)], seq);
+	cache_delete(cache->store, pkey);
+}
+
 /*
  * Derive the storage key of one variant of a varying resource from the
- * primary key, the anchor's signature and generation, and the request's
- * reduced secondary key.
+ * primary key, the anchor's signature and the request's reduced secondary
+ * key. The key does not depend on the anchor's life: a recreated anchor finds
+ * the variants stored under the previous one, and a re-store replaces them.
  */
 static void cache_variant_key(struct cache *store, const struct cache_key *pkey,
-                              unsigned int vary_signature, uint64_t generation,
+                              unsigned int vary_signature,
                               const char *secondary_key, struct cache_key *vkey)
 {
-	char buf[sizeof(*pkey) + sizeof(vary_signature) + sizeof(generation) +
-	         HTTP_CACHE_SEC_KEY_LEN];
+	char buf[sizeof(*pkey) + sizeof(vary_signature) + HTTP_CACHE_SEC_KEY_LEN];
 	char *p = buf;
 
 	memcpy(p, pkey, sizeof(*pkey));
 	p += sizeof(*pkey);
 	memcpy(p, &vary_signature, sizeof(vary_signature));
 	p += sizeof(vary_signature);
-	memcpy(p, &generation, sizeof(generation));
-	p += sizeof(generation);
 	memcpy(p, secondary_key, HTTP_CACHE_SEC_KEY_LEN);
 	cache_hash(store, buf, sizeof(buf), vkey);
 }
@@ -958,8 +1008,14 @@ static void cache_variant_key(struct cache *store, const struct cache_key *pkey,
  * Make sure <enc_mask> is listed in the directory of <live>, the anchor read
  * through the pinned handle <rh>. A published anchor is never modified in
  * place: a missing mask is added by publishing a copy of the anchor with the
- * mask appended, which supersedes it under the primary key and keeps its
- * generation and expiry, so the variants already stored stay reachable.
+ * mask appended, which supersedes it under the primary key.
+ *
+ * The anchor shares the expiry of the variant being stored, <expire>, so that
+ * it is filed in the same TTL bucket as the variants it leads to: anchors
+ * gathered in segments of their own would be evicted by the thousand at once.
+ * It is extended when the variant outlives it by more than an eighth of its
+ * lifetime, which bounds the rewrites while keeping it roughly as long-lived
+ * as the most recent variant.
  *
  * Two threads adding different masks at once may each publish a copy lacking
  * the other's mask. The losing variant then misses once, and storing it again
@@ -971,29 +1027,38 @@ static void cache_variant_key(struct cache *store, const struct cache_key *pkey,
  */
 static int cache_anchor_add_mask(struct http_cache *cache, const struct cache_key *pkey,
                                  const struct cache_anchor *live,
-                                 const struct cache_rhandle *rh, uint32_t enc_mask)
+                                 const struct cache_rhandle *rh, uint32_t enc_mask,
+                                 unsigned int expire)
 {
 	struct cache_anchor anchor;
 	struct cache_whandle wh;
+	unsigned int live_expire = cache_entry_expire(cache->store, rh);
+	unsigned int slack = expire > date.tv_sec ? (expire - date.tv_sec) / 8 : 0;
 	unsigned int i;
+	int found = 0;
 
-	if (!enc_mask)
-		return 0;
-
-	for (i = 0; i < cache->max_secondary_entries; i++) {
-		if (live->enc_masks[i] == enc_mask)
-			return 0;
+	for (i = 0; enc_mask && i < cache->max_secondary_entries; i++) {
+		if (live->enc_masks[i] == enc_mask) {
+			found = 1;
+			break;
+		}
 		if (live->enc_masks[i] == 0)
 			break;
 	}
-	if (i == cache->max_secondary_entries)
+	if (!enc_mask)
+		found = 1;
+	else if (i == cache->max_secondary_entries)
 		return -1;
 
+	if (found && expire <= live_expire + slack)
+		return 0;
+
 	anchor = *live;
-	anchor.enc_masks[i] = enc_mask;
+	if (!found)
+		anchor.enc_masks[i] = enc_mask;
 
 	wh = cache_reserve(cache->store, pkey, sizeof(anchor),
-	                   cache_entry_expire(cache->store, rh));
+	                   MAX(live_expire, expire));
 	if (CACHE_HANDLE_ERR(wh))
 		return -1;
 	cache_write(cache->store, &wh, &anchor, sizeof(anchor));
@@ -1001,68 +1066,80 @@ static int cache_anchor_add_mask(struct http_cache *cache, const struct cache_ke
 }
 
 /*
- * Find the anchor entry of a varying resource, record <enc_mask> in its
- * directory and return its generation. When the resource has no usable anchor
- * (first varying response, expired anchor, signature change, or a plain entry
+ * Make sure the anchor of a varying resource exists for <vary_signature>,
+ * lists <enc_mask> and lives at least until about <expire>, the expiry of the
+ * variant being stored. When the resource has no usable anchor (first varying
+ * response, evicted or expired anchor, signature change, or a plain entry
  * currently holding the primary key), a new one supersedes whatever owned the
- * primary key, and its fresh random generation orphans every variant of the
- * previous anchor at once.
+ * primary key.
+ *
+ * Variants stored under another signature or before the anchor was lost keep
+ * their keys: a signature change only makes the former unreachable through
+ * this anchor, and a recreated anchor finds the latter again once their masks
+ * are re-added. Invalidation is handled separately, see cache_invalidate().
  * Returns 0 on success, -1 if the anchor could not be stored or the
  * directory is full.
  */
 static int cache_vary_anchor(struct http_cache *cache, struct cache_key *pkey,
                              unsigned int vary_signature, uint32_t enc_mask,
-                             uint64_t *generation)
+                             unsigned int expire)
 {
 	struct cache_anchor anchor;
 	struct cache_whandle wh;
 	struct cache_rhandle rh;
-	int tries;
 
-	/* Two passes: the second one re-reads the anchor, because publishing
-	 * replaces whatever owned the primary key and the generation to use is
-	 * the one live afterwards, not necessarily the one just written.
-	 */
-	for (tries = 0; tries < 2; tries++) {
-		rh = cache_lookup(cache->store, pkey);
-		if (!CACHE_HANDLE_ERR(rh)) {
-			const struct cache_anchor *live;
-			size_t sz;
+	rh = cache_lookup(cache->store, pkey);
+	if (!CACHE_HANDLE_ERR(rh)) {
+		const struct cache_anchor *live;
+		size_t sz;
 
-			live = cache_peek(cache->store, &rh, &sz);
-			if (live && sz >= sizeof(*live) &&
-			    (live->entry.flags & CACHE_EF_ANCHOR) &&
-			    live->entry.secondary_key_signature == vary_signature) {
-				int ret = cache_anchor_add_mask(cache, pkey, live, &rh,
-				                                enc_mask);
+		live = cache_peek(cache->store, &rh, &sz);
+		if (live && sz >= sizeof(*live) &&
+		    (live->entry.flags & CACHE_EF_ANCHOR) &&
+		    live->entry.secondary_key_signature == vary_signature) {
+			int ret = cache_anchor_add_mask(cache, pkey, live, &rh,
+			                                enc_mask, expire);
 
-				*generation = live->generation;
-				cache_release(cache->store, &rh);
-				return ret;
-			}
 			cache_release(cache->store, &rh);
+			return ret;
 		}
-
-		if (tries)
-			break;
-
-		/* The anchor is given the cache's maximum age; variants
-		 * outliving it become unreachable and age out. */
-		memset(&anchor, 0, sizeof(anchor));
-		anchor.entry.flags = CACHE_EF_ANCHOR;
-		anchor.entry.secondary_key_signature = vary_signature;
-		anchor.entry.latest_validation = date.tv_sec;
-		anchor.generation = ha_random64();
-		anchor.enc_masks[0] = enc_mask;
-
-		wh = cache_reserve(cache->store, pkey, sizeof(anchor),
-		                   date.tv_sec + cache->maxage);
-		if (CACHE_HANDLE_ERR(wh))
-			return -1;
-		cache_write(cache->store, &wh, &anchor, sizeof(anchor));
-		cache_publish(cache->store, &wh);
+		cache_release(cache->store, &rh);
 	}
-	return -1;
+
+	memset(&anchor, 0, sizeof(anchor));
+	anchor.entry.flags = CACHE_EF_ANCHOR;
+	anchor.entry.secondary_key_signature = vary_signature;
+	anchor.entry.latest_validation = date.tv_sec;
+	anchor.enc_masks[0] = enc_mask;
+
+	wh = cache_reserve(cache->store, pkey, sizeof(anchor), expire);
+	if (CACHE_HANDLE_ERR(wh))
+		return -1;
+	cache_write(cache->store, &wh, &anchor, sizeof(anchor));
+	return cache_publish(cache->store, &wh);
+}
+
+/*
+ * Look up variant key <vkey> of primary key <pkey>, refusing a variant that was
+ * invalidated after its fill started. Returns a pinned handle or an error one.
+ */
+static struct cache_rhandle cache_lookup_valid_variant(struct http_cache *cache,
+                                                       const struct cache_key *pkey,
+                                                       struct cache_key *vkey)
+{
+	struct cache_rhandle h = cache_lookup(cache->store, vkey);
+	const struct cache_entry *e;
+	size_t sz;
+
+	if (CACHE_HANDLE_ERR(h))
+		return h;
+	e = cache_peek(cache->store, &h, &sz);
+	if (e && sz >= sizeof(*e) &&
+	    !cache_entry_invalidated(cache, pkey, e->fill_seq))
+		return h;
+	cache_release(cache->store, &h);
+	CACHE_HANDLE_INIT(h);
+	return h;
 }
 
 /*
@@ -1083,7 +1160,6 @@ static struct cache_rhandle cache_lookup_variant(struct http_cache *cache,
 	uint32_t masks[DEFAULT_MAX_SECONDARY_ENTRY];
 	struct cache_rhandle h;
 	struct cache_key vkey;
-	uint64_t generation;
 	unsigned int sig;
 	unsigned int i;
 	char *sec;
@@ -1097,7 +1173,6 @@ static struct cache_rhandle cache_lookup_variant(struct http_cache *cache,
 		return h;
 	}
 	sig = anchor->entry.secondary_key_signature;
-	generation = anchor->generation;
 	if (sig & VARY_ACCEPT_ENCODING) {
 		for (i = 0; i < cache->max_secondary_entries; i++)
 			masks[i] = anchor->enc_masks[i];
@@ -1129,17 +1204,16 @@ static struct cache_rhandle cache_lookup_variant(struct http_cache *cache,
 				continue;
 			write_u32(sec + offset, masks[i]);
 			cache_variant_key(cache->store, &txn->cache_hash, sig,
-			                  generation, sec, &vkey);
-			h = cache_lookup(cache->store, &vkey);
+			                  sec, &vkey);
+			h = cache_lookup_valid_variant(cache, &txn->cache_hash, &vkey);
 			if (!CACHE_HANDLE_ERR(h))
 				break;
 		}
 		return h;
 	}
 
-	cache_variant_key(cache->store, &txn->cache_hash, sig,
-	                  generation, sec, &vkey);
-	return cache_lookup(cache->store, &vkey);
+	cache_variant_key(cache->store, &txn->cache_hash, sig, sec, &vkey);
+	return cache_lookup_valid_variant(cache, &txn->cache_hash, &vkey);
 }
 
 
@@ -1201,7 +1275,7 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 				/* Discard any corresponding entries in case of successful
 				 * unsafe request (such as PUT, POST or DELETE). */
 				if (cache->store)
-					cache_delete(cache->store, &txn->cache_hash);
+					cache_invalidate(cache, &txn->cache_hash);
 				if (cache->early_hints)
 					cache_delete(cache->early_hints, &txn->cache_hash);
 			}
@@ -1400,17 +1474,16 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 	 * the anchor, record this variant's coding mask in it, and switch to
 	 * the variant's key. */
 	if (vary_signature) {
-		uint64_t generation;
-
-		if (cache_vary_anchor(cache, key, vary_signature, enc_mask, &generation) < 0)
+		if (cache_vary_anchor(cache, key, vary_signature, enc_mask, expire) < 0)
 			goto out;
-		cache_variant_key(cache->store, key, vary_signature, generation,
+		cache_variant_key(cache->store, key, vary_signature,
 		                  object.secondary_key, &vkey);
 		key = &vkey;
 	}
 
 	/* store latest value */
 	object.latest_validation = date.tv_sec;
+	object.fill_seq = cache_ctx->fill_seq;
 
 	cache_ctx->handle = cache_reserve(cache->store, key, len, expire);
 	if (CACHE_HANDLE_ERR(cache_ctx->handle))
@@ -2572,7 +2645,8 @@ int post_check_cache()
 			cache->store = cache_new(&cache->store_cfg, 0,
 			                         cache->total_size,
 			                         cache_hash_seed, cache->id);
-			if (cache->store == NULL) {
+			cache->inv_tab = calloc(CACHE_INV_SIZE, sizeof(*cache->inv_tab));
+			if (cache->store == NULL || cache->inv_tab == NULL) {
 				ha_alert("Unable to allocate cache.\n");
 
 				err_code |= ERR_FATAL | ERR_ALERT;
