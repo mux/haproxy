@@ -22,6 +22,12 @@
 /* Largest segment a slot's offset field can address. */
 #define CACHE_SEG_MAX_SIZE      (8ULL * 1024 * 1024)
 
+/* Expected-entry ceiling for automatic sizing. The minimum preserves the
+ * lower target of 16 mean-sized objects per segment.
+ */
+#define CACHE_SEG_MIN_ENTRIES          16
+#define CACHE_SEG_DEFAULT_MAX_ENTRIES  256
+
 /* These are only defined here for the sake of the handle definitions. */
 #define CACHE_SEG_NONE          (-1)
 
@@ -66,6 +72,7 @@ struct cache_config {
 	size_t max_obj_size;
 	size_t mean_obj_size;
 	uint32_t seg_size;
+	uint32_t seg_max_entries; /* Expected-entry ceiling for auto sizing; 0 = default */
 	/* The number of segments reserved for segment merging, so a merge always
 	 * has a destination. The effective default is min(nbthread, 4), further
 	 * capped at max(1, n_segs/64) -- near 1.5% of the segment count -- because
