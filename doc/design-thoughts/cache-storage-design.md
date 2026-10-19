@@ -47,7 +47,22 @@ segment, instead get segments of their own; both cases are covered under
 Two different limits bound the segment size. The hard ceiling is 8 MB, set by
 the slot layout: a slot encodes a record's offset within its segment in 20 bits
 of 8-byte units. Below that the engine sizes segments from the configured
-capacity, and `segment-size` overrides it.
+capacity, and `segment-size` overrides it. Automatic sizing targets 64
+segments, with a lower target of 16 mean-sized objects per segment and at
+least 16 segments when possible. It caps size at 2 MiB and at
+`segment-max-entries` (256 by default) times `mean-object-size`, then rounds
+down to a power of two. The 4096-byte minimum and the minimum size needed to
+fit the index's segment-ID field take precedence over the expected-entry
+ceiling. The latter preserves representable large arenas; it does not raise
+the 2 MiB automatic byte ceiling.
+
+This entry target limits dense-segment traversal under a TTL-bucket lock,
+not the actual number of physical records: the configured mean is only an
+estimate, dead records still cost work, and merging can traverse several
+source segments.
+A conservative index estimate can also select smaller-than-desirable segments
+for large responses. Operators can raise the target or set `segment-size`
+explicitly in that case; changing the entry target leaves index sizing alone.
 
 This log-structured shape is the core idea taken from Segcache. Its consequences
 -- no in-place mutation and segment-granularity reclaim and relocation --

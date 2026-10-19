@@ -1,0 +1,152 @@
+varnishtest "Automatic cache segment sizing respects segment-max-entries"
+
+feature ignore_unknown_macro
+feature cmd "command -v socat"
+
+shell {
+    set -e
+    cat << EOF > ${tmpdir}/entry_limit.cfg
+global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
+defaults
+    mode http
+    timeout connect 5s
+    timeout client 5s
+    timeout server 5s
+
+cache check
+    total-max-size 1
+    mean-object-size 128
+    # ENTRY_LIMIT
+EOF
+
+    for n in bogus 0 15 -1 +256 256k 4294967296 18446744073709551616; do
+        sed "s/# ENTRY_LIMIT/segment-max-entries $n/" ${tmpdir}/entry_limit.cfg > ${tmpdir}/invalid.cfg
+        set +e
+        out=$($HAPROXY_PROGRAM -f ${tmpdir}/invalid.cfg -c 2>&1)
+        ret=$?
+        set -e
+        echo "$out"
+        [ "$ret" -ne 0 ]
+        echo "$out" | grep -q 'segment-max-entries wrong value'
+    done
+
+    # Missing argument and extra arguments must also be fatal.
+    for n in '' '256 512'; do
+        sed "s/# ENTRY_LIMIT/segment-max-entries $n/" ${tmpdir}/entry_limit.cfg > ${tmpdir}/invalid.cfg
+        if $HAPROXY_PROGRAM -f ${tmpdir}/invalid.cfg -c; then
+            exit 1
+        fi
+    done
+
+    # Boundaries and non-power-of-two counts are accepted.
+    for n in 16 256 300 512 4294967295; do
+        sed "s/# ENTRY_LIMIT/segment-max-entries $n/" ${tmpdir}/entry_limit.cfg > ${tmpdir}/valid.cfg
+        $HAPROXY_PROGRAM -f ${tmpdir}/valid.cfg -c
+    done
+}
+
+haproxy h1 -conf {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+        stats socket "${tmpdir}/h1/stats" level admin
+
+    defaults
+        mode http
+        timeout connect "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout client "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout server "${HAPROXY_TEST_TIMEOUT-5s}"
+
+    frontend fe
+        bind "fd@${fe}"
+        http-request cache-use small_default
+        http-response cache-store small_default
+        http-request return status 200
+
+    # Default cap: 128 * 256 = 32768 bytes, versus the former 256 KiB.
+    cache small_default
+        total-max-size 16
+        mean-object-size 128
+
+    cache small_override
+        total-max-size 16
+        mean-object-size 128
+        segment-max-entries 512
+
+    # 128 * 300 = 38400, rounded down to 32768.
+    cache non_power
+        total-max-size 16
+        mean-object-size 128
+        segment-max-entries 300
+
+    # 128 * 16 is below the 4096-byte minimum.
+    cache minimum
+        total-max-size 16
+        mean-object-size 128
+        segment-max-entries 16
+
+    # Explicit segment size wins, regardless of directive order.
+    cache explicit_before
+        total-max-size 16
+        mean-object-size 128
+        segment-size 131072
+        segment-max-entries 16
+
+    cache explicit_after
+        total-max-size 16
+        mean-object-size 128
+        segment-max-entries 16
+        segment-size 131072
+
+    # The default 4 KiB mean now caps auto sizing at 1 MiB.
+    cache normal_default
+        total-max-size 128
+
+    cache normal_override
+        total-max-size 128
+        segment-max-entries 512
+
+    # Keep at least 16 segments when the mean-based lower target is large.
+    cache few_objects
+        total-max-size 16
+        mean-object-size 524288
+
+    # An existing smaller capacity-based size is not increased by the cap.
+    cache small_arena
+        total-max-size 1
+        mean-object-size 128
+
+    # Raising the count does not raise the 2 MiB automatic byte ceiling.
+    cache byte_ceiling
+        total-max-size 128
+        mean-object-size 1048576
+        segment-max-entries 4294967295
+} -start
+
+client c1 -connect ${h1_fe_sock} {
+    txreq
+    rxresp
+    expect resp.status == 200
+} -run
+
+shell {
+    set -e
+    out=$(echo 'show cache stats' | socat -t 5 "${tmpdir}/h1/stats" -)
+    echo "$out"
+    echo "$out" | grep -q '^small_default.n_segs: 512$'
+    echo "$out" | grep -q '^small_override.n_segs: 256$'
+    echo "$out" | grep -q '^non_power.n_segs: 512$'
+    echo "$out" | grep -q '^minimum.n_segs: 4096$'
+    echo "$out" | grep -q '^explicit_before.n_segs: 128$'
+    echo "$out" | grep -q '^explicit_after.n_segs: 128$'
+    echo "$out" | grep -q '^normal_default.n_segs: 128$'
+    echo "$out" | grep -q '^normal_override.n_segs: 64$'
+    echo "$out" | grep -q '^few_objects.n_segs: 16$'
+    echo "$out" | grep -q '^small_arena.n_segs: 64$'
+    echo "$out" | grep -q '^byte_ceiling.n_segs: 64$'
+}

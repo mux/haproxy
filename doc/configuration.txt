@@ -21331,6 +21331,9 @@ mean-object-size <bytes>
   default is 4096, deliberately at the small end of real-world means so that
   small-object workloads work without tuning; large-object workloads may raise
   it to reclaim a fraction of a percent of memory. The minimum is 128.
+  This estimate also controls the automatic segment size through
+  "segment-max-entries". Underestimating it can select smaller segments, which
+  can increase private/jumbo allocation and reduce hit ratio for large objects.
 
 reserved-segments <number>
   Define how many segments are kept aside for segment merging, so that a merge
@@ -21375,14 +21378,35 @@ vary-cache-size <bytes>
 
   Anchors are fixed-size records stored in 4096-byte segments. Their index is
   sized independently for these small objects and consumes additional memory.
-  Segment merging is disabled for this store; "segment-size", "mean-object-
-  size" and "reserved-segments" configure only the response store. The anchor
-  cache appears as "<cache-name>-anchors" in "show cache" and "show cache
-  stats".
+  Segment merging is disabled for this store. The "segment-size",
+  "segment-max-entries", "mean-object-size" and "reserved-segments" options
+  configure only the response store. The anchor cache appears as
+  "<cache-name>-anchors" in "show cache" and "show cache stats".
 
   An evicted anchor makes its URL's variants unreachable until new responses
   populate a new family. Increase this budget if the anchor store experiences
   excessive eviction or reservation/publication failures.
+
+segment-max-entries <number>
+  Limit the expected number of entries per automatically sized response-store
+  segment. The default is 256; the accepted range is 16 to 4294967295. This is
+  a sizing estimate, not a runtime limit on the number of physical records.
+
+  Automatic sizing targets 64 segments, with an upper size of the smaller of
+  2 MiB and "segment-max-entries" times "mean-object-size", rounded down to a
+  power of two. The existing small-cache and minimum-size protections still
+  apply. In particular, the 4096-byte minimum and the size needed to stay
+  within the index's representable segment count take precedence over this
+  expected-entry limit. An explicit "segment-size" takes precedence as well.
+
+  Smaller values shorten individual eviction/merge critical sections but make
+  reclamation more frequent and can increase oversized-object chain costs.
+  Dead records also have to be traversed, and a merge can consume several
+  source segments, so this option does not bound the work of a whole merge or
+  guarantee a maximum lock-hold time. Its effectiveness depends on the accuracy
+  of "mean-object-size". For example, with the default 4096-byte estimate, 256
+  limits automatic segments to 1 MiB, while 512 allows the existing 2 MiB
+  ceiling. Raising the value does not raise that byte ceiling.
 
 segment-size <bytes>
   Define the size of the segments the cache's storage is divided into.
@@ -21393,7 +21417,8 @@ segment-size <bytes>
   stored without a known length and every object larger than a segment leave
   behind. The value must be a multiple of 8, no larger than 8388608 (8 MB),
   and must divide "total-max-size" evenly. By default the size is derived
-  from "total-max-size" and this setting rarely needs to be changed.
+  from "total-max-size", "mean-object-size" and "segment-max-entries". Setting
+  it explicitly bypasses the automatic entry-count ceiling.
 
 total-max-size <megabytes>
   Define the size in RAM of the cache in megabytes. Its maximum value is

@@ -91,10 +91,12 @@ BUG_ON_STATIC(CACHE_TTL_MAX !=
 #define CACHE_READ_PIN_TRIES    3
 
 /* Auto segment sizing (cfg.seg_size == 0): the largest power of two yielding at
- * least CACHE_SEG_AUTO_TARGET segments, capped at CACHE_SEG_AUTO_MAX. Smaller
- * segments waste less in per-TTL-class open segments (~seg/2 each) and evict at
- * finer grain; larger segments shorten the chains of oversized entries and
- * amortize reclaim better. At the measured ~35 KB mean web response, a 2 MB
+ * least CACHE_SEG_AUTO_TARGET segments, capped at CACHE_SEG_AUTO_MAX and at
+ * cfg.seg_max_entries mean-sized objects. The latter limits dense-segment
+ * traversal under the TTL bucket lock, but is an estimate, not a record count.
+ * Smaller segments waste less in per-TTL-class open segments (~seg/2 each) and
+ * evict at finer grain; larger segments shorten the chains of oversized entries
+ * and amortize reclaim better. At the measured ~35 KB mean web response, a 2 MB
  * segment already holds ~60 entries, so growing past the cap buys little while
  * coarsening eviction.
  *
@@ -104,11 +106,12 @@ BUG_ON_STATIC(CACHE_TTL_MAX !=
  * floored at CACHE_SEG_AUTO_MIN_OBJS mean objects, while always keeping at
  * least CACHE_SEG_AUTO_MIN_SEGS segments as eviction and expiry units. The
  * floor only engages when the cache holds fewer than TARGET * MIN_OBJS mean
- * objects; larger caches are unaffected by it.
+ * objects. The 4096-byte minimum and representable segment count take precedence
+ * over the expected-entry ceiling.
  */
 #define CACHE_SEG_AUTO_MAX      (2 * 1024 * 1024)
 #define CACHE_SEG_AUTO_TARGET   64
-#define CACHE_SEG_AUTO_MIN_OBJS 16
+#define CACHE_SEG_AUTO_MIN_OBJS CACHE_SEG_MIN_ENTRIES
 #define CACHE_SEG_AUTO_MIN_SEGS 16
 
 /* Number of slots in a hash bucket */
@@ -335,6 +338,40 @@ static uint32_t pow2_up(uint32_t x)
 static uint32_t pow2_down(uint32_t x)
 {
 	return x <= 1 ? 1 : 1U << (31 - __builtin_clz(x));
+}
+
+/* Pick an automatic segment size, before rounding the arena down to whole
+ * segments. <max_entries> is nonzero and at least CACHE_SEG_MIN_ENTRIES.
+ */
+static uint32_t cache_auto_segment_size(size_t total_size, size_t mean_obj_size,
+                                      uint32_t max_entries)
+{
+	uint64_t sz = total_size / CACHE_SEG_AUTO_TARGET;
+	uint64_t cap = total_size / CACHE_SEG_AUTO_MIN_SEGS;
+	/* A larger mean already hits the byte ceiling. Clamping it here also
+	 * keeps both products representable, including for a UINT32_MAX cap.
+	 */
+	uint64_t mean = MIN(mean_obj_size, (size_t)CACHE_SEG_AUTO_MAX);
+
+	if (sz < mean * CACHE_SEG_AUTO_MIN_OBJS)
+		sz = mean * CACHE_SEG_AUTO_MIN_OBJS;
+	if (sz > mean * max_entries)
+		sz = mean * max_entries;
+	if (sz > cap)
+		sz = cap;
+	if (sz > CACHE_SEG_AUTO_MAX)
+		sz = CACHE_SEG_AUTO_MAX;
+	if (sz < 4096)
+		sz = 4096;
+	sz = pow2_down(sz);
+
+	/* Do not make a previously representable arena fail solely because the
+	 * entry ceiling selected more segments than the slot can address. Keep
+	 * the auto byte ceiling; the caller rejects any still-oversized arena.
+	 */
+	while (total_size / sz > CACHE_MAX_N_SEGS && sz < CACHE_SEG_AUTO_MAX)
+		sz <<= 1;
+	return sz;
 }
 
 /* A small iterator API to abstract away the hash table addressing scheme */
@@ -1508,20 +1545,14 @@ struct cache *cache_new(const struct cache_config *ucfg, uint flags,
 
 	if (cfg->mean_obj_size == 0)
 		cfg->mean_obj_size = CACHE_IDX_MEAN_SIZE;
+	if (cfg->seg_max_entries == 0)
+		cfg->seg_max_entries = CACHE_SEG_DEFAULT_MAX_ENTRIES;
+	if (cfg->seg_max_entries < CACHE_SEG_MIN_ENTRIES)
+		goto out;
 
 	if (cfg->seg_size == 0) {
-		uint64_t sz = total_size / CACHE_SEG_AUTO_TARGET;
-		uint64_t cap = total_size / CACHE_SEG_AUTO_MIN_SEGS;
-
-		if (sz < (uint64_t)cfg->mean_obj_size * CACHE_SEG_AUTO_MIN_OBJS)
-			sz = (uint64_t)cfg->mean_obj_size * CACHE_SEG_AUTO_MIN_OBJS;
-		if (sz > cap)
-			sz = cap;
-		if (sz > CACHE_SEG_AUTO_MAX)
-			sz = CACHE_SEG_AUTO_MAX;
-		if (sz < 4096)
-			sz = 4096;
-		cfg->seg_size = pow2_down(sz);
+		cfg->seg_size = cache_auto_segment_size(total_size, cfg->mean_obj_size,
+		                                       cfg->seg_max_entries);
 		/* We picked the size ourselves, so don't demand exact
 		 * divisibility: use as many whole segments as fit.
 		 */

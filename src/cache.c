@@ -2422,6 +2422,25 @@ int cfg_parse_cache(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 		tmp_cache_config->store_cfg.max_obj_size = maxobjsz;
+	} else if (strcmp(args[0], "segment-max-entries") == 0) {
+		unsigned long long maxentries;
+		char *err;
+
+		if (alertif_too_many_args(1, file, linenum, args, &err_code)) {
+			err_code |= ERR_ABORT;
+			goto out;
+		}
+
+		maxentries = strtoull(args[1], &err, 10);
+		if (*args[1] < '0' || *args[1] > '9' || *err != '\0' ||
+		    maxentries < CACHE_SEG_MIN_ENTRIES || maxentries > UINT32_MAX) {
+			ha_warning("parsing [%s:%d]: segment-max-entries wrong value '%s' (%u to %u)\n",
+			           file, linenum, args[1], (unsigned int)CACHE_SEG_MIN_ENTRIES,
+			           (unsigned int)UINT32_MAX);
+			err_code |= ERR_ABORT;
+			goto out;
+		}
+		tmp_cache_config->store_cfg.seg_max_entries = maxentries;
 	} else if (strcmp(args[0], "segment-size") == 0) {
 		unsigned long long segsz;
 		char *err;
