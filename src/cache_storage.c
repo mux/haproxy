@@ -85,8 +85,7 @@ BUG_ON_STATIC(CACHE_TTL_MAX !=
  * the slot read and its post-pin re-read, so only a sustained storm of
  * same-key rewrites can exhaust the cap; this should never happen in
  * practice (exhaustions are counted in the read_pin_fails statistic), and the
- * resulting miss is harmless since the entry is being replaced anyway. The
- * cap is also what makes the read path wait-free.
+ * resulting miss is harmless since the entry is being replaced anyway.
  */
 #define CACHE_READ_PIN_TRIES    3
 
@@ -323,7 +322,7 @@ struct cache {
 	uint64_t merge_empty;           /* Merges that retained nothing */
 	uint64_t merge_success;         /* Merges that retained something */
 	unsigned int merges_inflight;   /* Merges holding a destination segment */
-	unsigned int segs_condemned;    /* Segments waiting on their last reader */
+	unsigned int segs_condemned;    /* Segment/chain heads waiting on readers */
 
 	struct cache_stats stats;       /* Activity counters */
 };
@@ -652,7 +651,7 @@ static uint32_t seg_data_off(const struct cache *cache, uint32_t seg_off,
 /* Tell whether segment <seg> has expired. */
 static inline int seg_expired(struct ttl_bucket *ttlb, const struct seg *seg)
 {
-	return (date.tv_sec - seg->create_ts) >= ttlb->ttl_approx;
+	return (int64_t)date.tv_sec - seg->create_ts >= ttlb->ttl_approx;
 }
 
 /* Unpin a segment that was pinned for reads. */
@@ -821,14 +820,15 @@ static inline void seg_live_sub(struct seg *seg, const struct cache_record *rec)
 	_HA_ATOMIC_DEC(&seg->n_live);
 }
 
-/* Unlink all the entries in a segment from the hashtable. */
-static void seg_unindex(const struct cache *cache, struct seg *seg)
+/* Unlink a segment's entries and return the number of records examined. */
+static unsigned int seg_unindex(const struct cache *cache, struct seg *seg)
 {
 	struct cache_whandle h = { .seg_id = seg_get_id(cache, seg) };
 	struct ht_iter it;
 	struct cache_record *rec;
 	uint64_t *slotp, slot;
 	size_t off = 0;
+	unsigned int records = 0;
 
 	BUG_ON_HOT(seg->write_off > cache->cfg.seg_size);
 
@@ -862,7 +862,9 @@ static void seg_unindex(const struct cache *cache, struct seg *seg)
 		}
 
 		off += CACHE_OFF_ALIGN_UP(rec->rec_len);
+		records++;
 	}
+	return records;
 }
 
 /* Merge tuning, after Segcache. A merge needs a sequence of at least
@@ -1043,7 +1045,7 @@ static void seg_merge(struct cache *cache, seg_id_t dst_id, seg_id_t head_id,
  */
 static inline int seg_evictable(const struct ttl_bucket *ttlb, const struct seg *seg)
 {
-	uint32_t age = date.tv_sec - seg->create_ts;
+	int64_t age = (int64_t)date.tv_sec - seg->create_ts;
 
 	return seg->next_seg_id != CACHE_SEG_NONE &&
 	       HA_ATOMIC_LOAD(&seg->w_refcount) == 0 &&
@@ -1257,13 +1259,17 @@ static inline enum seg_reclaim_status seg_drain(struct cache *cache, seg_id_t se
 /* Reclaim segment <seg_id> of segment list <l>: unindex it, unlink it from the
  * list, then either free it or condemn it to be freed by its last reader.
  * The whole segment chain is reclaimed with its head; the number of segments
- * it counts is stored in <n_segs> (except when blocked). The caller needs to
- * hold the TTL bucket lock where the segment list lives.
+ * it counts is stored in <n_segs> (except when blocked). Examined records are
+ * added to <records> when non-NULL. The caller holds the TTL bucket lock.
  */
-static inline enum seg_reclaim_status seg_reclaim(struct cache *cache, struct seg_list *l,
-                                                  seg_id_t seg_id, uint32_t *n_segs)
+static inline enum seg_reclaim_status seg_reclaim(struct cache *cache,
+                                                  struct seg_list *l,
+                                                  seg_id_t seg_id,
+                                                  uint32_t *n_segs,
+                                                  unsigned int *records)
 {
 	struct seg *seg = &cache->segments[seg_id];
+	unsigned int n_records;
 	uint32_t gen;
 
 	/* Setting the state to something other than SEG_S_LIVE stops any new
@@ -1305,7 +1311,9 @@ static inline enum seg_reclaim_status seg_reclaim(struct cache *cache, struct se
 	/* Now we unindex, which guarantees no new lookups will get to the seg
 	 * structure anymore, since it won't be found in the hashtable.
 	 */
-	seg_unindex(cache, seg);
+	n_records = seg_unindex(cache, seg);
+	if (records)
+		*records += n_records;
 
 	/* Unlink the segment from the TTL bucket. This means it won't be a
 	 * candidate for expiration or eviction anymore. If this segment was
@@ -1328,7 +1336,8 @@ static void seg_reclaim_dead(struct cache *cache, struct ttl_bucket *ttlb, seg_i
 
 	if (HA_ATOMIC_LOAD(&seg->w_refcount) != 0 || HA_ATOMIC_LOAD(&seg->n_live) != 0)
 		return;
-	if (seg_reclaim(cache, &ttlb->segs, seg_id, &n_segs) != SEG_RECLAIM_BLOCKED)
+	if (seg_reclaim(cache, &ttlb->segs, seg_id,
+	                &n_segs, NULL) != SEG_RECLAIM_BLOCKED)
 		_HA_ATOMIC_ADD(&cache->stats.segs_emptied, n_segs);
 }
 
@@ -1354,24 +1363,70 @@ static void seg_check_dead(struct cache *cache, seg_id_t seg_id,
 	HA_SPIN_UNLOCK(CACHE_TTLB_LOCK, &ttlb->lock);
 }
 
-/* Attempt to reclaim all the expired segments at the head of a TTL bucket
- * segment list. Returns the number of segments that were successfully freed.
+/* Expiration thresholds in estimated segmentfuls of records. */
+#define CACHE_EXPIRE_MIN_FACTOR  4
+#define CACHE_EXPIRE_MAX_FACTOR 32
+
+struct cache_expire_budget {
+	unsigned int records;
+	unsigned int min_records;
+	unsigned int max_records;
+};
+
+static void cache_expire_budget_init(const struct cache *cache,
+                                     struct cache_expire_budget *b)
+{
+	uint64_t n_max;
+	size_t max_size;
+	unsigned int entries;
+
+	entries = cache->cfg.seg_size / cache->cfg.mean_obj_size +
+	          !!(cache->cfg.seg_size % cache->cfg.mean_obj_size);
+	max_size = cache->arena_len - sizeof(struct cache_record);
+	if (cache->cfg.max_obj_size)
+		max_size = MIN(max_size, cache->cfg.max_obj_size);
+	n_max = ((uint64_t)max_size + sizeof(struct cache_record) +
+	         cache->cfg.seg_size - 1) / cache->cfg.seg_size;
+	n_max = MIN(CACHE_EXPIRE_MAX_FACTOR,
+	            MAX(CACHE_EXPIRE_MIN_FACTOR, n_max));
+	b->records = 0;
+	b->min_records = CACHE_EXPIRE_MIN_FACTOR * entries;
+	b->max_records = n_max * entries;
+}
+
+/* NULL leaves the expired prefix unbounded, as in cache_expire(). */
+static inline int cache_expire_done(const struct cache_expire_budget *b,
+                                    unsigned int needed, unsigned int freed)
+{
+	return b && (b->records >= b->max_records ||
+	             (freed >= needed && b->records >= b->min_records));
+}
+
+/* Reclaim an expired prefix until <b> stops it. Writer pins are skipped;
+ * condemned segments consume records but supply no free segments. Whole
+ * segments/chains may overrun the record limit. Returns segments freed.
  */
-static inline int seg_list_expire(struct cache *cache, struct ttl_bucket *ttlb, struct seg_list *l)
+static unsigned int seg_list_expire(struct cache *cache,
+                                    struct ttl_bucket *ttlb, struct seg_list *l,
+                                    unsigned int needed,
+                                    struct cache_expire_budget *b)
 {
 	enum seg_reclaim_status status;
 	struct seg *seg;
 	seg_id_t seg_id, next_id;
 	uint32_t n_segs;
-	int freed = 0;
+	unsigned int freed = 0;
 
 	seg_id = seg_list_first(l);
 	while (seg_id != CACHE_SEG_NONE) {
+		if (cache_expire_done(b, needed, freed))
+			break;
 		seg = &cache->segments[seg_id];
 		next_id = seg->next_seg_id;
 		if (!seg_expired(ttlb, seg))
 			break;
-		status = seg_reclaim(cache, l, seg_id, &n_segs);
+		status = seg_reclaim(cache, l, seg_id, &n_segs,
+		                     b ? &b->records : NULL);
 		if (status == SEG_RECLAIM_FREED)
 			freed += n_segs;
 		if (status != SEG_RECLAIM_BLOCKED)
@@ -1451,7 +1506,8 @@ static struct cache_whandle ttl_bucket_reserve(struct cache *cache, struct ttl_b
 
 		/* See if this entry requires more than one segment. */
 		if (size > cache->cfg.seg_size)
-			n_segs = (size + cache->cfg.seg_size - 1) / cache->cfg.seg_size;
+			n_segs = size / cache->cfg.seg_size +
+			         !!(size % cache->cfg.seg_size);
 		else
 			n_segs = 1;
 
@@ -1511,6 +1567,8 @@ static int cache_index_init(struct cache *cache, uint64_t total_size)
 	n_buckets = pow2_up(MIN(1U << 26, MAX(1024, (total_size / cache->cfg.mean_obj_size) / 2)));
 	cache->index.n_buckets = n_buckets;
 	size = n_buckets * sizeof(struct ht_bucket);
+	if (size / sizeof(struct ht_bucket) != n_buckets)
+		return -1;
 	cache->index.buckets = ha_aligned_alloc(64, size);
 	if (!cache->index.buckets)
 		return -1;
@@ -1591,12 +1649,13 @@ struct cache *cache_new(const struct cache_config *ucfg, uint flags,
 	if (flags & CACHE_F_NO_MERGE)
 		cache->cfg.n_reserved = 0;
 
-	/* Keep the reserve small: ordinary reservations cannot use it.
-	 * Allow one reserved segment even when the arena has fewer than 64.
+	/* Keep the reserve small and leave at least one segment for ordinary
+	 * allocations, which cannot consume the reserve.
 	 */
 	cap = cache->n_segs / 64;
 	if (cap < 1)
 		cap = 1;
+	cap = MIN(cap, cache->n_segs - 1);
 	if (cache->cfg.n_reserved > cap)
 		cache->cfg.n_reserved = cap;
 
@@ -1680,8 +1739,8 @@ void cache_expire(struct cache *cache)
 		ttlb = &cache->ttl_buckets[i];
 
 		HA_SPIN_LOCK(CACHE_TTLB_LOCK, &ttlb->lock);
-		seg_list_expire(cache, ttlb, &ttlb->prv_segs);
-		seg_list_expire(cache, ttlb, &ttlb->segs);
+		seg_list_expire(cache, ttlb, &ttlb->prv_segs, 0, NULL);
+		seg_list_expire(cache, ttlb, &ttlb->segs, 0, NULL);
 		HA_SPIN_UNLOCK(CACHE_TTLB_LOCK, &ttlb->lock);
 	}
 }
@@ -1697,7 +1756,7 @@ static enum cache_reclaim_status seg_evict(struct cache *cache, struct seg_list 
 	enum seg_reclaim_status status;
 	uint32_t n_segs;
 
-	status = seg_reclaim(cache, l, seg_id, &n_segs);
+	status = seg_reclaim(cache, l, seg_id, &n_segs, NULL);
 	if (status == SEG_RECLAIM_BLOCKED) {
 		_HA_ATOMIC_INC(&cache->stats.reclaim_blocked);
 		return CACHE_RECLAIM_RETRY;
@@ -1715,7 +1774,7 @@ static enum cache_reclaim_status seg_evict(struct cache *cache, struct seg_list 
  * <freed> accumulates the segments that reached the free pool. Returns the
  * status of the reclaim round.
  *
- * Expired segments at the head go first, as they cost nothing. Otherwise a
+ * Expire first within the caller's record budget. Otherwise a
  * sequence of evictable segments is searched from the bucket's cursor, then
  * from its head, and merged into a destination taken from the reserve, which
  * takes the sequence's place in the list; the consumed sources are drained.
@@ -1724,8 +1783,11 @@ static enum cache_reclaim_status seg_evict(struct cache *cache, struct seg_list 
  * every live record. Without a destination the sequence's first segment is
  * evicted whole; without a sequence, the list's head is.
  */
-static enum cache_reclaim_status ttl_bucket_merge(struct cache *cache, struct ttl_bucket *ttlb,
-                                                  unsigned int needed, unsigned int *freed)
+static enum cache_reclaim_status ttl_bucket_merge(struct cache *cache,
+                                                  struct ttl_bucket *ttlb,
+                                                  unsigned int needed,
+                                                  unsigned int *freed,
+                                                  struct cache_expire_budget *b)
 {
 	struct seg_list *l = &ttlb->segs;
 	seg_id_t srcs[CACHE_MERGE_MAX];
@@ -1735,9 +1797,12 @@ static enum cache_reclaim_status ttl_bucket_merge(struct cache *cache, struct tt
 	unsigned int n, i;
 	int supply;
 
-	*freed += seg_list_expire(cache, ttlb, l);
+	*freed += seg_list_expire(cache, ttlb, l,
+	                          needed > *freed ? needed - *freed : 0, b);
 	if (*freed >= needed)
 		return CACHE_RECLAIM_PROGRESS;
+	if (cache_expire_done(b, needed, *freed))
+		return *freed ? CACHE_RECLAIM_PROGRESS : CACHE_RECLAIM_RETRY;
 	if (seg_list_first(l) == CACHE_SEG_NONE)
 		return CACHE_RECLAIM_RETRY;
 
@@ -1821,18 +1886,14 @@ static enum cache_reclaim_status ttl_bucket_merge(struct cache *cache, struct tt
 /* Attempt to reclaim a segment for a new reservation. We always attempt to
  * reclaim an expired segment before evicting a live one.
  *
- * This function is costly: it scans all the TTL buckets, locking every
- * non-empty one, and it may have to run again when the victim was blocked
- * by writers. Benchmarks showed that this cost is not a problem in
- * practice: even under adversarial in-process load, reservations virtually
- * never fail. The reserve_fail_* counters would reveal it if real traffic
- * proved this wrong. The one known weak spot is when nearly all entries
- * share a single TTL bucket; writers then queue behind evictions on that
- * bucket's lock, which inflates the write tail latency.
+ * The scan locks each non-empty TTL bucket and may repeat after a lost
+ * election or a write-pinned victim. The expiration record budget does not
+ * bound bucket scans, skipped writer pins or time spent waiting for locks.
  *
  * <needed> is the number of segments the caller is waiting for: expired
- * segments freed during the scan count towards it and the scan stops as soon
- * as it is covered, while at most one eviction or merge runs per call.
+ * segments freed during the scan count towards it. Expiration continues to
+ * <b>'s minimum after covering it, but never starts another segment at its
+ * maximum. At most one eviction or merge runs per call.
  * <reserving> is the size of the reservation the caller will retry: once the
  * victim is locked, a pool that can already serve it ends the round. The
  * number of segments that measurably reached the free pool is returned in
@@ -1851,7 +1912,8 @@ static enum cache_reclaim_status ttl_bucket_merge(struct cache *cache, struct tt
 static enum cache_reclaim_status cache_reclaim(struct cache *cache,
                                                unsigned int needed,
                                                unsigned int reserving,
-                                               unsigned int *freed)
+                                               unsigned int *freed,
+                                               struct cache_expire_budget *b)
 {
 	struct ttl_bucket *ttlb, *best;
 	struct seg_list *best_list;
@@ -1864,6 +1926,8 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 
 	*freed = 0;
 	_HA_ATOMIC_INC(&cache->stats.reclaim_calls);
+	if (!needed)
+		return CACHE_RECLAIM_PROGRESS;
 
 	/* Locate the oldest segment which is our best candidate for eviction.
 	 * While here, see if any segments can be expired. Note that the oldest
@@ -1886,8 +1950,8 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 		seg_id_t head[2];
 
 		ttlb = &cache->ttl_buckets[(scan_off + i) & (CACHE_TTL_N_BUCKETS - 1)];
-		lists[0] = &ttlb->segs;
-		lists[1] = &ttlb->prv_segs;
+		lists[0] = &ttlb->prv_segs;
+		lists[1] = &ttlb->segs;
 
 		/* Unlocked read first to avoid taking the lock if possible. */
 		for (j = 0; j < 2; j++)
@@ -1898,6 +1962,8 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 		seen = 1;
 		HA_SPIN_LOCK(CACHE_TTLB_LOCK, &ttlb->lock);
 		for (j = 0; j < 2; j++) {
+			unsigned int remaining;
+
 			/* Now that we hold the TTL bucket lock, we need to
 			 * re-read segment ID and validate it.
 			 */
@@ -1908,28 +1974,13 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 			if (seg_id == CACHE_SEG_NONE)
 				continue;
 
-			/* The chain ages head-first, so consecutive expired
-			 * segments all sit at the head: drain the whole
-			 * expired prefix while we hold the lock, not just one
-			 * segment - the extra ones feed other reservers, which
-			 * then pop free segments without paying for a scan of
-			 * their own. An unlucky reservation can thus absorb a
-			 * large expired backlog, but capping the drain would
-			 * only spread the same work over many more scans, so
-			 * the trade-off is deliberate. Should the latency ever
-			 * become a problem, the better fix is to call
-			 * cache_expire() pro-actively so that big backlogs
-			 * never build up in the first place.
-			 */
-			*freed += seg_list_expire(cache, ttlb, lists[j]);
-
-			/* Expired segments that reached the free pool are
-			 * real supply: stop scanning as soon as it covers
-			 * what the caller needs.
-			 */
-			if (*freed >= needed) {
+			remaining = needed > *freed ? needed - *freed : 0;
+			*freed += seg_list_expire(cache, ttlb, lists[j],
+			                          remaining, b);
+			if (cache_expire_done(b, needed, *freed)) {
 				HA_SPIN_UNLOCK(CACHE_TTLB_LOCK, &ttlb->lock);
-				return CACHE_RECLAIM_PROGRESS;
+				return *freed ? CACHE_RECLAIM_PROGRESS :
+				                CACHE_RECLAIM_RETRY;
 			}
 
 			/* Read the head again after expiration. */
@@ -1955,6 +2006,11 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 		}
 		HA_SPIN_UNLOCK(CACHE_TTLB_LOCK, &ttlb->lock);
 	}
+
+	/* Other reclaimers may have supplied the pool during this scan. */
+	if (*freed >= needed ||
+	    _HA_ATOMIC_LOAD(&cache->n_free) >= cache->cfg.n_reserved + reserving)
+		return CACHE_RECLAIM_PROGRESS;
 
 	/* We did not see a single segment in use, or all of them were pinned
 	 * for writes. In the former case, we need to give up. This should not
@@ -2007,7 +2063,7 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 	}
 
 	if (best_list == &best->segs && !(cache->flags & CACHE_F_NO_MERGE))
-		status = ttl_bucket_merge(cache, best, needed, freed);
+		status = ttl_bucket_merge(cache, best, needed, freed, b);
 	else
 		status = seg_evict(cache, best_list, best_seg_id, freed);
 	HA_SPIN_UNLOCK(CACHE_TTLB_LOCK, &best->lock);
@@ -2024,63 +2080,37 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 	return CACHE_RECLAIM_RETRY;
 }
 
-/* Retry budget for the reclaim rounds of one reservation: <needed> is the
- * number of segments the reservation is waiting for, <freed> accumulates the
- * segments the rounds measurably sent to the free pool, <attempts> counts
- * every round and <busy> the consecutive rounds that made no progress.
+/* One reservation or growth operation shares these limits across its rounds.
+ * <needed> is its segment count; <busy> counts consecutive unproductive rounds.
+ * Expiration thresholds are initialized only when reclaim is first needed.
  */
 struct cache_reclaim_budget {
 	unsigned int needed;
-	unsigned int freed;
 	int attempts;
 	int busy;
+	struct cache_expire_budget expire;
 };
 
 static inline void cache_reclaim_budget_init(struct cache_reclaim_budget *b,
                                              unsigned int needed)
 {
 	b->needed = needed;
-	b->freed = 0;
 	b->attempts = 0;
 	b->busy = 0;
+	b->expire = (struct cache_expire_budget){ 0 };
 }
 
-/* Make one cache_reclaim() attempt on behalf of a reservation that found no
- * free segment, and account for it in budget <b>. Returns 0 if the caller
- * should retry the reservation, or -1, with reserve_fails bumped, when there
- * is nothing left to reclaim or the budget is exhausted.
- *
- * The budget is spent on three conditions. A few consecutive attempts with
- * no progress at all mean reclaim cannot help right now. The total number of
- * attempts is capped to bound the time spent on a single reservation. And an
- * attempt must remain plausible to be worth continuing: reclaim supplies at
- * least one segment per productive attempt, so when the shortfall exceeds the
- * attempts remaining, the reservation cannot be satisfied in time and going
- * on would only evict entries for nothing.
+/* Return 0 to retry allocation after a reclaim round, or -1 when no further
+ * reclaim is allowed. Limits are checked after the caller retries allocation,
+ * so even the last productive round can satisfy it.
  */
 static int cache_reclaim_try(struct cache *cache, struct cache_reclaim_budget *b)
 {
 	enum cache_reclaim_status status;
-	unsigned int shortfall, freed;
+	unsigned int shortfall, freed, n_free;
 
-	/* Freed segments can be consumed by other reservations before ours
-	 * succeeds, so the accumulated total may cover the need while the
-	 * reservation still fails: keep asking for at least one segment and
-	 * let the attempts cap bound the losses.
-	 */
-	shortfall = b->needed > b->freed ? b->needed - b->freed : 1;
-	status = cache_reclaim(cache, shortfall, b->needed, &freed);
-	if (status == CACHE_RECLAIM_GIVEUP) {
-		_HA_ATOMIC_INC(&cache->stats.reserve_fail_giveup);
-		goto fail;
-	}
-
-	b->freed += freed;
-	b->attempts++;
-	if (status == CACHE_RECLAIM_PROGRESS)
-		b->busy = 0;
-	else
-		b->busy++;
+	if (!b->expire.max_records)
+		cache_expire_budget_init(cache, &b->expire);
 	if (b->attempts >= CACHE_RESERVE_ATTEMPTS) {
 		_HA_ATOMIC_INC(&cache->stats.reserve_fail_attempts);
 		goto fail;
@@ -2089,10 +2119,27 @@ static int cache_reclaim_try(struct cache *cache, struct cache_reclaim_budget *b
 		_HA_ATOMIC_INC(&cache->stats.reserve_fail_busy);
 		goto fail;
 	}
-	if (b->needed > b->freed + (CACHE_RESERVE_ATTEMPTS - b->attempts)) {
+	if (b->expire.records >= b->expire.max_records) {
 		_HA_ATOMIC_INC(&cache->stats.reserve_fail_infeasible);
 		goto fail;
 	}
+
+	/* Only currently available supply reduces the shortfall: earlier
+	 * frees may already have been consumed by another reservation.
+	 */
+	n_free = _HA_ATOMIC_LOAD(&cache->n_free);
+	shortfall = cache->cfg.n_reserved + b->needed;
+	shortfall = shortfall > n_free ? shortfall - n_free : 0;
+	status = cache_reclaim(cache, shortfall, b->needed, &freed, &b->expire);
+	if (status == CACHE_RECLAIM_GIVEUP) {
+		_HA_ATOMIC_INC(&cache->stats.reserve_fail_giveup);
+		goto fail;
+	}
+	b->attempts++;
+	if (status == CACHE_RECLAIM_PROGRESS)
+		b->busy = 0;
+	else
+		b->busy++;
 	return 0;
 
 fail:
@@ -2450,7 +2497,7 @@ struct cache_whandle cache_reserve(struct cache *cache, const struct cache_key *
 		    data_len > cache->cfg.seg_size - sizeof(struct cache_record))
 			return CACHE_WHANDLE_NULL;
 
-		if (data_len > cache->arena_len ||
+		if (data_len > cache->arena_len - sizeof(struct cache_record) ||
 		    (cache->cfg.max_obj_size > 0 && data_len > cache->cfg.max_obj_size))
 			return CACHE_WHANDLE_NULL;
 
@@ -2474,7 +2521,8 @@ struct cache_whandle cache_reserve(struct cache *cache, const struct cache_key *
 	 * knows how many segments this reservation is waiting for.
 	 */
 	if (total_len > cache->cfg.seg_size)
-		n_segs = (total_len + cache->cfg.seg_size - 1) / cache->cfg.seg_size;
+		n_segs = total_len / cache->cfg.seg_size +
+		         !!(total_len % cache->cfg.seg_size);
 	else
 		n_segs = 1;
 
@@ -2511,6 +2559,10 @@ int cache_write(struct cache *cache, struct cache_whandle *h,
 
 	rec = CACHE_HANDLE_REC(cache, h);
 
+	if (len > cache->arena_len - sizeof(*rec) ||
+	    h->data_off > cache->arena_len - sizeof(*rec) - len)
+		return -1;
+
 	if (cache->cfg.max_obj_size > 0 &&
 	    (len > cache->cfg.max_obj_size ||
 	     h->data_off > cache->cfg.max_obj_size - len))
@@ -2521,16 +2573,14 @@ int cache_write(struct cache *cache, struct cache_whandle *h,
 		if (cache->flags & CACHE_F_NO_JUMBO || !(head->flags & SEG_F_NO_LEN))
 			return -1;
 
-		if (len > cache->arena_len)
-			return -1;
-
 		/* If we are trying to write past the bounds of a record in the
 		 * case of an unknown length reservation and if jumbo entries
 		 * are allowed, we need to attempt to grow the reservation by
 		 * acquiring one or more segments.
 		 */
 		need = len - (CACHE_REC_CAPACITY(rec) - h->data_off);
-		n_segs = (need + cache->cfg.seg_size - 1) / cache->cfg.seg_size;
+		n_segs = need / cache->cfg.seg_size +
+		         !!(need % cache->cfg.seg_size);
 
 		/* If the last write completely filled the last segment, then
 		 * h->cur_seg_id would be CACHE_SEG_NONE, so we walk the chain

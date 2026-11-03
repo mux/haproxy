@@ -21363,20 +21363,18 @@ mean-object-size <bytes>
   can increase private/jumbo allocation and reduce hit ratio for large objects.
 
 reserved-segments <number>
-  Define how many segments are kept aside for segment merging, so that a merge
-  operation can always find a destination segment. Ordinary reservations will
-  not consume these segments. The effective default is min(nbthread, 4),
-  additionally capped at roughly a 64th of the cache's segment count (floored at
-  one segment): concurrent merges are bounded by the thread count and in
-  practice well below it, while every reserved segment is capacity withheld from
-  the cache at all times. The extra cap matters because a cache small enough to
-  turn over faster than its segments can reach merge maturity gains nothing from
-  a large reserve. The effective value is reported as "n_reserved" by "show
-  cache stats". Setting it too low makes merges fall back to evicting whole
-  segments, which shows up as a growing "merges_no_dst" counter. A value of 0
-  withholds no dedicated destination segments, but does not disable merging.
-  A merge can still run when a destination is available; without one, reclaim
-  falls back to whole-segment eviction. This setting rarely needs changing.
+  Define how many segments are kept aside for merge destinations. Ordinary
+  reservations will not consume these segments. The effective default is
+  min(nbthread, 4), additionally capped at roughly a 64th of the cache's
+  segment count (floored at one segment). At least one segment is left for
+  ordinary allocations, so a one-segment cache keeps no reserve. The cap limits
+  capacity withheld from ordinary stores. The effective value is reported as
+  "n_reserved" by "show cache stats". Setting it too low can make merges fall
+  back to evicting whole segments, which shows up as a growing "merges_no_dst"
+  counter. A value of 0 withholds no dedicated destination segments, but does
+  not disable merging. A merge can still run when a destination is available;
+  without one, reclaim falls back to whole-segment eviction. This setting
+  rarely needs changing.
 
 process-vary <on/off>
   Enable or disable the processing of the Vary header. When disabled, a response

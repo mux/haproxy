@@ -73,12 +73,10 @@ struct cache_config {
 	size_t mean_obj_size;
 	uint32_t seg_size;
 	uint32_t seg_max_entries; /* Expected-entry ceiling for auto sizing; 0 = default */
-	/* The number of segments reserved for segment merging, so a merge always
-	 * has a destination. The effective default is min(nbthread, 4), further
-	 * capped at max(1, n_segs/64) -- near 1.5% of the segment count -- because
-	 * a cache small enough to turn over faster than its segments can reach
-	 * merge maturity gains nothing from reserving a large fraction of itself.
-	 * Ignored when CACHE_F_NO_MERGE is set.
+	/* Segments reserved for merge destinations. The effective default is
+	 * min(nbthread, 4), capped at max(1, n_segs/64) -- near 1.5% of the
+	 * segment count -- while leaving at least one segment for ordinary
+	 * allocations. Ignored when CACHE_F_NO_MERGE is set.
 	 */
 	uint n_reserved;
 };
@@ -92,7 +90,7 @@ struct cache_stats {
 	                                   * all free, unpublished or condemned */
 	uint64_t reserve_fail_attempts;   /* ... because the attempts cap was reached */
 	uint64_t reserve_fail_busy;       /* ... because consecutive rounds made no progress */
-	uint64_t reserve_fail_infeasible; /* ... because the shortfall exceeded the rounds left */
+	uint64_t reserve_fail_infeasible; /* ... expiration budget exhausted */
 	uint64_t reclaim_calls;       /* Reclaim scans started */
 	uint64_t reclaim_elect_losses;/* Elected victims lost to a concurrent reclaimer */
 	uint64_t reclaim_blocked;     /* Elected victims skipped: pinned by a writer */
@@ -111,8 +109,8 @@ struct cache_stats {
 	uint64_t merges_no_dst;   /* Merges that found no destination segment and
 	                           * fell back to evicting whole segments */
 	uint64_t merges_inflight_max; /* Most merges holding a destination at once */
-	uint64_t segs_condemned;      /* Segments waiting on their last reader to
-	                               * be freed, right now (a gauge) */
+	uint64_t segs_condemned;      /* Segment/chain heads waiting on their last
+	                               * reader, right now (a gauge) */
 	uint64_t segs_condemned_max;  /* Most such segments at once */
 
 	/* Instantaneous state, not counters: they give the merge and condemn

@@ -279,40 +279,54 @@ what it earns from now on. Carrying part of the count forward keeps records that
 stopped being popular ahead of newcomers, and retained less on production
 traces.
 
-A reservation that finds no free segment frees one in two steps, tried in order:
+Demand-driven expiration counts physical records examined, including dead and
+aborted records. Let E be the segment size divided by the configured mean object
+size, rounded up, and N the segments needed for the maximum object size,
+including its record header. The minimum is 4E records and the maximum is E
+multiplied by N clamped between 4 and 32. Without a configured object limit, the
+arena capacity supplies N. Thresholds are initialized only on allocation
+pressure and shared across all rounds of one reservation or streaming growth
+operation. Whole segments and private chains stay indivisible, so the final unit
+can overrun the maximum. Descriptor walks and lock waiting are not bounded by
+this record count. `cache_expire()` still walks full expired prefixes.
 
-- **Expire first.** Reclaiming an expired segment is free -- its data is already
-  dead -- whereas evicting a live one destroys useful content, so the reserve
-  path first walks the chain heads for expired segments to reclaim, draining a
-  chain's whole expired prefix when it finds one so the extra segments feed
-  other reservations.
-- **Then merge around the oldest.** With nothing expired, a live segment goes.
-  Because each chain ages head-first, the globally oldest segment is always one
-  of the chain heads -- 2048 of them, a shared and a private queue for each of
-  the 1024 TTL buckets. The scan takes the oldest head that is not write-pinned:
-  unindexing has to parse a segment's record headers to walk it, and a write pin
-  means one of those headers is still being written. A private head is a chain
-  owned by a single entry and is evicted whole. A shared head hands its bucket
-  to the merge, which examines up to sixteen segments from where the previous
-  merge stopped, then, if needed, up to sixteen from the head towards that
-  resume point. A run already in progress may finish across it, rechecking at
-  most two segments. Without a distinct resume point, it examines up to 32 from
-  the head. A run needs at least three consecutive eligible segments: neither
-  the write tail nor being written, and more than twenty seconds from expiry.
-  They are merged into a destination taken from a small reserve of
-  `reserved-segments` segments, defaulting to min(nbthread, 4) further capped at
-  a 64th of the segment count (floored at one), that ordinary reservations leave
-  alone so a merge can always run. The sources return to the pool, unless a
-  reader still pins them, in which case they are condemned and their return is
-  delayed until that reader unpins -- which is why a burst of merges can want
-  more destinations than there are concurrent merges, and why `merges_no_dst`
-  and `segs_condemned` are reported. Without such a run the head is evicted
-  whole, as plain FIFO would. Read pins are no obstacle at all; a segment
-  reclaimed under them is condemned and handed to its last reader. With
-  `reserved-segments 0`, ordinary allocations may consume the entire pool: no
-  destination is held aside. This does not disable merging, but makes its
-  whole-segment fallback more likely. The engine's separate `CACHE_F_NO_MERGE`
-  flag disables merging explicitly.
+A reservation short of free segments reclaims space in two steps:
+
+- **Expire first.** Within each TTL bucket, visit private chains before shared
+  segments. Continue after satisfying demand until the minimum record count, but
+  stop at the maximum even if supply is insufficient. Writer-pinned segments are
+  skipped. Reader-pinned segments are unindexed and condemned: they consume
+  record work but do not supply free segments yet. No live data is evicted just
+  to reach the minimum. If no more expired records are found, stop batching.
+- **Then merge around the oldest.** If expiration falls short without exhausting
+  its budget, a live segment goes. Because each chain ages head-first, the
+  globally oldest segment is always one of the chain heads -- 2048 of them, a
+  shared and a private queue for each of the 1024 TTL buckets. The scan takes
+  the oldest head that is not write-pinned: unindexing has to parse a segment's
+  record headers to walk it, and a write pin means one of those headers is still
+  being written. A private head is a chain owned by a single entry and is
+  evicted whole. A shared head hands its bucket to the merge, which examines up
+  to sixteen segments from where the previous merge stopped, then, if needed, up
+  to sixteen from the head towards that resume point. A run already in progress
+  may finish across it, rechecking at most two segments. Without a distinct
+  resume point, it examines up to 32 from the head. A run needs at least three
+  consecutive eligible segments: neither the write tail nor being written, and
+  more than twenty seconds from expiry. They are merged into a destination taken
+  from a small reserve of `reserved-segments` segments, defaulting to
+  min(nbthread, 4) further capped at a 64th of the segment count (floored at
+  one), that ordinary reservations leave alone so a merge can always run. The
+  sources return to the pool, unless a reader still pins them, in which case
+  they are condemned and their return is delayed until that reader unpins --
+  which is why a burst of merges can want more destinations than there are
+  concurrent merges, and why `merges_no_dst` and `segs_condemned` are reported.
+  Without such a run the head is evicted whole, as plain FIFO would. Read pins
+  are no obstacle at all; a segment reclaimed under them is condemned and handed
+  to its last reader. With `reserved-segments 0`, ordinary allocations may
+  consume the entire pool: no destination is held aside. This does not disable
+  merging, but makes its whole-segment fallback more likely. The engine's
+  separate `CACHE_F_NO_MERGE` flag disables merging explicitly.
+
+A one-segment cache keeps no merge reserve, so ordinary allocations can use it.
 
 A merge that retains nothing hands its destination back, and once such merges
 outnumber the successful ones, later merges copy every live record: on a cache
@@ -328,6 +342,14 @@ same segment straight back from the pool. Without this, a client that keeps
 aborting a large download -- a health check fetching a big file every second is
 the real-world case -- fills the cache with dead segments at its own pace and
 pushes live ones out ahead of them.
+
+Allocation is retried even after the last allowed reclaim round. If it still
+fails after the expiration record budget is spent, admission is declined and
+`reserve_fail_infeasible` is incremented. This is a work limit, not a guarantee
+that every eligible object can be stored. The separate attempt and busy-round
+limits still apply to eviction and merging; their work is not counted as
+expiration records. Each retry uses the pool's current supply rather than a
+cumulative count that other reservations may already have consumed.
 
 ### Why not an admission filter
 
