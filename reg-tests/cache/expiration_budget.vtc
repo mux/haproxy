@@ -1,0 +1,74 @@
+varnishtest "Demand expiration batches records without draining the prefix"
+
+feature ignore_unknown_macro
+feature cmd "command -v socat"
+
+server s1 {
+    loop 257 {
+        rxreq
+        txresp -hdr "Cache-Control: public, max-age=2" -bodylen 3500
+    }
+} -start
+
+haproxy h1 -conf {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+        nbthread 1
+    .endif
+        stats socket "${tmpdir}/h1/stats" level admin
+
+    defaults
+        mode http
+        timeout connect "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout client "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout server "${HAPROXY_TEST_TIMEOUT-5s}"
+
+    frontend fe
+        bind "fd@${fe}"
+        # Each fill has its own key, including within the client loop.
+        http-request set-path /%[uuid()]
+        default_backend be
+
+    backend be
+        http-request cache-use budget
+        http-response cache-store budget
+        server www ${s1_addr}:${s1_port}
+
+    cache budget
+        total-max-size 1
+        segment-size 4096
+        mean-object-size 4096
+        max-object-size 4000
+        reserved-segments 0
+} -start
+
+client c1 -connect ${h1_fe_sock} {
+    # Each response occupies one segment. Fill all 256 without reclamation.
+    loop 256 {
+        txreq
+        rxresp
+        expect resp.status == 200
+        expect resp.bodylen == 3500
+    }
+    delay 3
+
+    # E=1 and Nmax=1 give a four-record minimum and maximum.
+    txreq
+    rxresp
+    expect resp.status == 200
+    expect resp.bodylen == 3500
+} -run
+
+shell {
+    set -e
+    out=$(echo 'show cache stats' | socat -t 5 "${tmpdir}/h1/stats" -)
+    echo "$out"
+    echo "$out" | grep -q '^budget.n_segs: 256$'
+    echo "$out" | grep -q '^budget.segs_expired: 4$'
+    echo "$out" | grep -q '^budget.n_free: 3$'
+    echo "$out" | grep -q '^budget.reclaim_calls: 1$'
+    echo "$out" | grep -q '^budget.segs_evicted: 0$'
+    echo "$out" | grep -q '^budget.reserve_fails: 0$'
+    echo "$out" | grep -q '^budget.publish_fails: 0$'
+}

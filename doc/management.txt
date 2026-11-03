@@ -3136,8 +3136,8 @@ show cache [stats]
                                reclaim (free, being written, or draining)
      reserve_fail_attempts     Of those, the ones that ran out of attempts
      reserve_fail_busy         Of those, the ones making no progress
-     reserve_fail_infeasible   Of those, the ones needing more space than the
-                               remaining attempts could supply
+     reserve_fail_infeasible   Of those, the ones that exhausted the expiration
+                               record budget without obtaining enough space
      reclaim_calls             Scans looking for space to reclaim
      reclaim_elect_losses      Scans whose chosen segment was reclaimed by
                                another thread first
@@ -3172,10 +3172,10 @@ show cache [stats]
                                means "reserved-segments" is too low
      merges_inflight_max       Most merges holding a destination segment at once
                                (the demand "reserved-segments" must cover)
-     segs_condemned            Segments waiting on their last reader to be freed
-                               right now (a gauge)
-     segs_condemned_max        Most such segments at once; a large value means
-                               reader pins are slowing the return of merged-out
+     segs_condemned            Segment/chain heads waiting on their last reader
+                               right now (a gauge); a private chain counts once
+     segs_condemned_max        Most such heads at once; a large value means
+                               reader pins are slowing the return of reclaimed
                                segments to the free pool
      n_segs                    Segments in the arena (a gauge)
      n_reserved                Effective number of segments reserved for merging,
