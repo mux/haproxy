@@ -3150,7 +3150,7 @@ show cache [stats]
                                key, typically concurrent stores of one URL; the
                                replaced copy stays dead until reclaim
      aborts                    Reservations abandoned before publishing
-     dead_bytes                Bytes abandoned in segments until reclaim:
+     dead_bytes_cum            Bytes abandoned in segments until reclaim:
                                superseded live copies, plus aborted or failed
                                stores in shared segments (a private chain is
                                returned to the pool at once instead)

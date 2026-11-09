@@ -2653,7 +2653,7 @@ void cache_abort(struct cache *cache, const struct cache_whandle *h)
 		return;
 	}
 
-	_HA_ATOMIC_ADD(&cache->stats.dead_bytes,
+	_HA_ATOMIC_ADD(&cache->stats.dead_bytes_cum,
 	               CACHE_OFF_ALIGN_UP(CACHE_HANDLE_REC(cache, h)->rec_len));
 	ttl_bucket = seg->ttl_bucket;
 	state_gen = _HA_ATOMIC_LOAD(&seg->state_gen);
@@ -2787,7 +2787,7 @@ int cache_publish(struct cache *cache, const struct cache_whandle *h)
 					seg_live_sub(oldseg, oldrec);
 				if (date.tv_sec < oldrec->expire) {
 					_HA_ATOMIC_INC(&cache->stats.publish_supersedes);
-					_HA_ATOMIC_ADD(&cache->stats.dead_bytes,
+					_HA_ATOMIC_ADD(&cache->stats.dead_bytes_cum,
 					               CACHE_OFF_ALIGN_UP(oldrec->rec_len));
 				}
 				ttl_bucket = oldseg->ttl_bucket;
@@ -2861,7 +2861,7 @@ fail:
 		seg_free_push(cache, h->seg_id);
 		return -1;
 	}
-	_HA_ATOMIC_ADD(&cache->stats.dead_bytes,
+	_HA_ATOMIC_ADD(&cache->stats.dead_bytes_cum,
 	               CACHE_OFF_ALIGN_UP(rec->rec_len));
 	ttl_bucket = seg->ttl_bucket;
 	state_gen = _HA_ATOMIC_LOAD(&seg->state_gen);
@@ -2887,7 +2887,7 @@ void cache_get_stats(const struct cache *cache, struct cache_stats *stats)
 	stats->segs_evicted = _HA_ATOMIC_LOAD(&cache->stats.segs_evicted);
 	stats->publish_supersedes = _HA_ATOMIC_LOAD(&cache->stats.publish_supersedes);
 	stats->aborts = _HA_ATOMIC_LOAD(&cache->stats.aborts);
-	stats->dead_bytes = _HA_ATOMIC_LOAD(&cache->stats.dead_bytes);
+	stats->dead_bytes_cum = _HA_ATOMIC_LOAD(&cache->stats.dead_bytes_cum);
 	stats->segs_emptied = _HA_ATOMIC_LOAD(&cache->stats.segs_emptied);
 	stats->merges = _HA_ATOMIC_LOAD(&cache->merge_success);
 	stats->merges_empty = _HA_ATOMIC_LOAD(&cache->merge_empty);

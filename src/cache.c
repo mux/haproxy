@@ -3336,7 +3336,7 @@ static void show_cache_stats(struct buffer *buf, const char *id,
 
 	SHOW_CACHE_METRIC(publish_supersedes);
 	SHOW_CACHE_METRIC(aborts);
-	SHOW_CACHE_METRIC(dead_bytes);
+	SHOW_CACHE_METRIC(dead_bytes_cum);
 	SHOW_CACHE_METRIC(segs_emptied);
 	SHOW_CACHE_METRIC(reserve_fails);
 	SHOW_CACHE_METRIC(reserve_fail_giveup);
