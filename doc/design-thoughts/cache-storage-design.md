@@ -341,13 +341,15 @@ A reservation short of free segments reclaims space in two steps:
   concurrent merges, and why `merges_no_dst` and `segs_condemned` are reported.
   Without a run or destination, use a bounded safe FIFO victim only when no
   merger is active in the arena. If any bucket's merger is producing supply,
-  decline storage instead of evicting useful content or waiting for it. Read
-  pins do not block reclamation; a victim held by readers is condemned and
-  handed to its last reader. With `reserved-segments 0`, ordinary allocations
-  may consume the entire pool: no destination is held aside. Merging is still
-  attempted, and succeeds whenever a segment happens to be free when the merge
-  needs one; it is just more likely to find none and fall back to whole-segment
-  eviction. The separate `CACHE_F_NO_MERGE` flag disables merging explicitly.
+  decline storage instead of evicting useful content or waiting for it, unless
+  the victim expires within twenty seconds: it could not be merged and has
+  little left to give. Read pins do not block reclamation; a victim held by
+  readers is condemned and handed to its last reader. With
+  `reserved-segments 0`, ordinary allocations may consume the entire pool: no
+  destination is held aside. Merging is still attempted, and succeeds whenever a
+  segment happens to be free when the merge needs one; it is just more likely to
+  find none and fall back to whole-segment eviction. The separate
+  `CACHE_F_NO_MERGE` flag disables merging explicitly.
 
 A one-segment cache keeps no merge reserve, so ordinary allocations can use it.
 

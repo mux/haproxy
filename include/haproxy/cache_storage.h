@@ -110,7 +110,8 @@ struct cache_stats {
 	uint64_t merges_inflight_max; /* Most merges holding a destination at once */
 	uint64_t reserve_fail_merging; /* Reservations declined during a merge */
 	uint64_t reserve_merging_rescued; /* Those retried and then satisfied */
-	uint64_t fifo_fallbacks;      /* Whole segments evicted with no merger */
+	uint64_t fifo_fallbacks;      /* Whole segments evicted with no merger running,
+	                               * or about to expire */
 	uint64_t segs_condemned;      /* Segment/chain heads waiting on their last
 	                               * reader, right now (a gauge) */
 	uint64_t segs_condemned_max;  /* Most such heads at once */

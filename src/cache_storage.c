@@ -1053,17 +1053,25 @@ static void seg_merge(struct cache *cache, seg_id_t dst_id, const seg_id_t *srcs
 	}
 }
 
+/* Tell whether <seg> of bucket <ttlb> expires within CACHE_MERGE_EXPIRY_GUARD
+ * seconds: too soon for a merge to be worth its copy.
+ */
+static inline int seg_expiring(const struct ttl_bucket *ttlb, const struct seg *seg)
+{
+	int64_t age = (int64_t)date.tv_sec - seg->create_ts;
+
+	return age + CACHE_MERGE_EXPIRY_GUARD >= ttlb->ttl_approx;
+}
+
 /* Tell whether <seg>, in <ttlb>'s shared list, can be merged: it has a
  * successor, no writer and more than CACHE_MERGE_EXPIRY_GUARD seconds
  * until expiry. The caller holds the bucket's lock.
  */
 static inline int seg_evictable(const struct ttl_bucket *ttlb, const struct seg *seg)
 {
-	int64_t age = (int64_t)date.tv_sec - seg->create_ts;
-
 	return !seg->merge_claimed && seg->next_seg_id != CACHE_SEG_NONE &&
 	       HA_ATOMIC_LOAD(&seg->w_refcount) == 0 &&
-	       age + CACHE_MERGE_EXPIRY_GUARD < ttlb->ttl_approx;
+	       !seg_expiring(ttlb, seg);
 }
 
 /* Search up to <max> segments for CACHE_MERGE_MIN consecutive evictable ones.
@@ -1835,14 +1843,16 @@ static enum cache_reclaim_status cache_merge_pending(struct cache *cache,
 	return CACHE_RECLAIM_MERGING;
 }
 
-/* Evict one whole segment from <l>, the fallback when that bucket cannot merge.
- * The bucket lock covers the index clearing. Pool supply is rechecked first
- * because another bucket's merger may have refilled it, and a merger about to
- * return space defers to the caller rather than discarding a live segment.
- * Finding no safe victim within the descriptor bound fails the round rather
- * than waiting for the merger.
+/* Evict one whole segment from <l>, a list of bucket <ttlb>, the fallback when
+ * that bucket cannot merge. The bucket lock covers the index clearing. Pool
+ * supply is rechecked first because another bucket's merger may have refilled
+ * it, and a merger about to return space defers to the caller rather than
+ * discarding a live segment, unless the victim is about to expire: it could
+ * not be merged and has little left to give. Finding no safe victim within
+ * the descriptor bound fails the round rather than waiting for the merger.
  */
 static enum cache_reclaim_status ttl_bucket_evict(struct cache *cache,
+                                                 struct ttl_bucket *ttlb,
                                                  struct seg_list *l,
                                                  unsigned int reserving,
                                                  unsigned int *freed)
@@ -1851,11 +1861,17 @@ static enum cache_reclaim_status ttl_bucket_evict(struct cache *cache,
 	enum cache_reclaim_status status;
 
 	status = cache_merge_pending(cache, reserving);
-	if (status != CACHE_RECLAIM_RETRY)
+	if (status == CACHE_RECLAIM_PROGRESS)
 		return status;
 	id = seg_fifo_find(cache, l);
-	if (id == CACHE_SEG_NONE)
+	if (id == CACHE_SEG_NONE) {
+		if (status == CACHE_RECLAIM_MERGING)
+			return status;
 		return *freed ? CACHE_RECLAIM_PROGRESS : CACHE_RECLAIM_RETRY;
+	}
+	if (status == CACHE_RECLAIM_MERGING &&
+	    !seg_expiring(ttlb, &cache->segments[id]))
+		return status;
 	_HA_ATOMIC_INC(&cache->stats.fifo_fallbacks);
 	return seg_evict(cache, l, id, freed);
 }
@@ -1874,8 +1890,8 @@ static enum cache_reclaim_status ttl_bucket_evict(struct cache *cache,
  * retained nothing returns its destination to the pool, and once such merges
  * outnumber the successful ones, later merges start out copying every live
  * record. Without a run or destination, use safe FIFO only if no arena merger
- * is active; otherwise decline the store after a final retry of the
- * reservation.
+ * is active or the victim is about to expire; otherwise decline the store
+ * after a final retry of the reservation.
  */
 static enum cache_reclaim_status ttl_bucket_merge(struct cache *cache,
                                                   struct ttl_bucket *ttlb,
@@ -1901,7 +1917,7 @@ static enum cache_reclaim_status ttl_bucket_merge(struct cache *cache,
 	if (_HA_ATOMIC_LOAD(&cache->n_free) >= cache->cfg.n_reserved + reserving)
 		return CACHE_RECLAIM_PROGRESS;
 	if (ttlb->merges_inflight)
-		return ttl_bucket_evict(cache, l, reserving, freed);
+		return ttl_bucket_evict(cache, ttlb, l, reserving, freed);
 
 	/* Split the budget between cursor and head, finishing runs across the
 	 * cursor. Without a distinct cursor, search only from the head.
@@ -1920,7 +1936,7 @@ static enum cache_reclaim_status ttl_bucket_merge(struct cache *cache,
 		                         CACHE_SEG_NONE, CACHE_MERGE_SCAN_MAX);
 	if (head_id == CACHE_SEG_NONE) {
 		seg_merge_cursor_set(cache, ttlb, CACHE_SEG_NONE);
-		return ttl_bucket_evict(cache, l, reserving, freed);
+		return ttl_bucket_evict(cache, ttlb, l, reserving, freed);
 	}
 
 	if (_HA_ATOMIC_LOAD(&cache->n_free) >= cache->cfg.n_reserved + reserving)
@@ -1928,7 +1944,7 @@ static enum cache_reclaim_status ttl_bucket_merge(struct cache *cache,
 	dst_id = seg_free_pop(cache, 1, 1);
 	if (dst_id == CACHE_SEG_NONE) {
 		_HA_ATOMIC_INC(&cache->stats.merges_no_dst);
-		return ttl_bucket_evict(cache, l, reserving, freed);
+		return ttl_bucket_evict(cache, ttlb, l, reserving, freed);
 	}
 	HA_ATOMIC_UPDATE_MAX(&cache->stats.merges_inflight_max,
 	                     _HA_ATOMIC_ADD_FETCH(&cache->merges_inflight, 1));
@@ -2225,7 +2241,7 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 	if (best_list == &best->segs && !(cache->flags & CACHE_F_NO_MERGE))
 		status = ttl_bucket_merge(cache, best, needed, reserving, freed, b);
 	else if (!(cache->flags & CACHE_F_NO_MERGE))
-		status = ttl_bucket_evict(cache, best_list, reserving, freed);
+		status = ttl_bucket_evict(cache, best, best_list, reserving, freed);
 	else
 		status = seg_evict(cache, best_list, best_seg_id, freed);
 	HA_SPIN_UNLOCK(CACHE_TTLB_LOCK, &best->lock);
