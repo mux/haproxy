@@ -331,7 +331,11 @@ A reservation short of free segments reclaims space in two steps:
   a destination taken from a small reserve of `reserved-segments` segments,
   defaulting to min(nbthread, 4) further capped at a 64th of the segment count
   (floored at one), that ordinary reservations leave alone so a merge can always
-  run. The sources return to the pool, unless a reader still pins them, in which
+  run. The destination keeps its oldest source's creation time, so that it
+  expires no later than any record it holds, and also records when it was
+  merged. The election ranks segments by the later of the two: a merged segment
+  counts as young, so older private chains come up for eviction first. The
+  sources return to the pool, unless a reader still pins them, in which
   case they are condemned and their return is delayed until that reader unpins
   -- which is why a burst of merges can want more destinations than there are
   concurrent merges, and why `merges_no_dst` and `segs_condemned` are reported.

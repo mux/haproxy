@@ -250,6 +250,7 @@ struct seg {
 	uint32_t state_gen;      /* SEG_S_* state + generation */
 	uint8_t flags;           /* SEG_F_* */
 	uint8_t merge_claimed;   /* Protected by the owning TTL bucket's lock */
+	uint32_t merge_ts;       /* Last merge into this segment, 0 if none */
 };
 
 struct seg_list {
@@ -554,6 +555,7 @@ static inline void seg_reinit(struct seg *seg)
 	seg->create_ts = date.tv_sec;
 	seg->flags = 0;
 	seg->merge_claimed = 0;
+	seg->merge_ts = 0;
 	_HA_ATOMIC_STORE(&seg->live_bytes, 0);
 	_HA_ATOMIC_STORE(&seg->n_live, 0);
 	_HA_ATOMIC_STORE(&seg->state_gen, SEG_STATE_MAKE(gen + 1, SEG_S_LIVE));
@@ -934,7 +936,11 @@ static void seg_merge(struct cache *cache, seg_id_t dst_id, const seg_id_t *srcs
 	struct seg *src;
 
 	memset(res, 0, sizeof(*res));
+	/* The destination expires with its oldest source, but ranks for
+	 * eviction by when it was merged.
+	 */
 	dst->create_ts = cache->segments[srcs[0]].create_ts;
+	dst->merge_ts = date.tv_sec;
 	dst->ttl_bucket = cache->segments[srcs[0]].ttl_bucket;
 	if (copy_all)
 		cutoff = 0.0;
@@ -2134,10 +2140,10 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 			if (seg_id != CACHE_SEG_NONE) {
 				seg = &cache->segments[seg_id];
 				if (_HA_ATOMIC_LOAD(&seg->w_refcount) == 0 &&
-				    (best == NULL || seg->create_ts < oldest_ts)) {
+				    (best == NULL || MAX(seg->create_ts, seg->merge_ts) < oldest_ts)) {
 					uint32_t sw = _HA_ATOMIC_LOAD(&seg->state_gen);
 
-					oldest_ts = seg->create_ts;
+					oldest_ts = MAX(seg->create_ts, seg->merge_ts);
 					best_gen = SEG_STATE_GEN(sw);
 					best_seg_id = seg_id;
 					best_list = lists[j];
