@@ -1890,11 +1890,6 @@ static enum cache_reclaim_status ttl_bucket_merge(struct cache *cache,
 	                          needed > *freed ? needed - *freed : 0, b);
 	if (*freed >= needed)
 		return CACHE_RECLAIM_PROGRESS;
-	if (cache_expire_done(b, needed, *freed)) {
-		if (!*freed)
-			return cache_merge_pending(cache, reserving);
-		return *freed ? CACHE_RECLAIM_PROGRESS : CACHE_RECLAIM_RETRY;
-	}
 	if (seg_list_first(l) == CACHE_SEG_NONE)
 		return CACHE_RECLAIM_RETRY;
 	if (_HA_ATOMIC_LOAD(&cache->n_free) >= cache->cfg.n_reserved + reserving)
@@ -2123,13 +2118,9 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 			remaining = needed > *freed ? needed - *freed : 0;
 			*freed += seg_list_expire(cache, ttlb, lists[j],
 			                          remaining, b);
-			if (cache_expire_done(b, needed, *freed)) {
+			if (*freed >= needed && cache_expire_done(b, needed, *freed)) {
 				HA_SPIN_UNLOCK(CACHE_TTLB_LOCK, &ttlb->lock);
-
-				if (!*freed && !(cache->flags & CACHE_F_NO_MERGE))
-					return cache_merge_pending(cache, reserving);
-				return *freed ? CACHE_RECLAIM_PROGRESS :
-				                CACHE_RECLAIM_RETRY;
+				return CACHE_RECLAIM_PROGRESS;
 			}
 
 			/* Read the head again after expiration. */
@@ -2287,10 +2278,6 @@ static enum cache_reclaim_status cache_reclaim_try(struct cache *cache,
 	}
 	if (b->busy >= CACHE_RESERVE_MAX_BUSY) {
 		_HA_ATOMIC_INC(&cache->stats.reserve_fail_busy);
-		goto fail;
-	}
-	if (b->expire.records >= b->expire.max_records) {
-		_HA_ATOMIC_INC(&cache->stats.reserve_fail_infeasible);
 		goto fail;
 	}
 
@@ -3056,7 +3043,6 @@ void cache_get_stats(const struct cache *cache, struct cache_stats *stats)
 	stats->reserve_fail_giveup = _HA_ATOMIC_LOAD(&cache->stats.reserve_fail_giveup);
 	stats->reserve_fail_attempts = _HA_ATOMIC_LOAD(&cache->stats.reserve_fail_attempts);
 	stats->reserve_fail_busy = _HA_ATOMIC_LOAD(&cache->stats.reserve_fail_busy);
-	stats->reserve_fail_infeasible = _HA_ATOMIC_LOAD(&cache->stats.reserve_fail_infeasible);
 	stats->reclaim_calls = _HA_ATOMIC_LOAD(&cache->stats.reclaim_calls);
 	stats->reclaim_elect_losses = _HA_ATOMIC_LOAD(&cache->stats.reclaim_elect_losses);
 	stats->reclaim_blocked = _HA_ATOMIC_LOAD(&cache->stats.reclaim_blocked);

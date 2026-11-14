@@ -90,7 +90,6 @@ struct cache_stats {
 	                                   * all free, unpublished or condemned */
 	uint64_t reserve_fail_attempts;   /* ... because the attempts cap was reached */
 	uint64_t reserve_fail_busy;       /* ... because consecutive rounds made no progress */
-	uint64_t reserve_fail_infeasible; /* ... expiration budget exhausted */
 	uint64_t reclaim_calls;       /* Reclaim scans started */
 	uint64_t reclaim_elect_losses;/* Elected victims lost to a concurrent reclaimer */
 	uint64_t reclaim_blocked;     /* Elected victims skipped: writer-pinned or merge-claimed */

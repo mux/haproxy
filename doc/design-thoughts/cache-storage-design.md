@@ -315,8 +315,8 @@ A reservation short of free segments reclaims space in two steps:
   skipped. Reader-pinned segments are unindexed and condemned: they consume
   record work but do not supply free segments yet. No live data is evicted just
   to reach the minimum. If no more expired records are found, stop batching.
-- **Then merge around the oldest.** If expiration falls short without exhausting
-  its budget, elect an old safe victim. Each bucket has a shared and a private
+- **Then merge around the oldest.** If expiration falls short, budget spent or
+  not, elect an old safe victim. Each bucket has a shared and a private
   queue. Within a bounded 64-descriptor search of each queue, skip claimed and
   write-pinned segments, then elect the oldest candidate across buckets.
   Unindexing parses record headers, so a write pin means a candidate cannot be
@@ -376,13 +376,13 @@ keeps aborting a large download -- a health check fetching a big file every
 second is the real-world case -- fills the cache with dead segments at its own
 pace and pushes live ones out ahead of them.
 
-Allocation is retried even after the last allowed reclaim round. If it still
-fails after the expiration record budget is spent, admission is declined and
-`reserve_fail_infeasible` is incremented. This is a work limit, not a guarantee
-that every eligible object can be stored. The separate attempt and busy-round
-limits still apply to eviction and merging; their work is not counted as
-expiration records. Each retry uses the pool's current supply rather than a
-cumulative count that other reservations may already have consumed.
+The expiration record budget bounds expiration only. Once it is spent, the
+round stops expiring and still runs its merge or eviction, and the later rounds
+of the same reservation go straight to eviction. The reservation is retried
+even after the last allowed reclaim round. The attempt and busy-round limits bound
+the total work; eviction and merging are not counted as expiration records.
+Each retry uses the pool's current supply rather than a cumulative count that
+other reservations may already have consumed.
 
 ### Why not a popularity admission filter
 

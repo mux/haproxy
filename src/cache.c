@@ -3305,7 +3305,6 @@ static void show_cache_stats(struct buffer *buf, const char *id,
 	SHOW_CACHE_METRIC(reserve_fail_giveup);
 	SHOW_CACHE_METRIC(reserve_fail_attempts);
 	SHOW_CACHE_METRIC(reserve_fail_busy);
-	SHOW_CACHE_METRIC(reserve_fail_infeasible);
 	SHOW_CACHE_METRIC(reclaim_calls);
 	SHOW_CACHE_METRIC(reclaim_elect_losses);
 	SHOW_CACHE_METRIC(reclaim_blocked);

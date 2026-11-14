@@ -3143,8 +3143,6 @@ show cache [stats]
      reserve_merging_rescued   Reservations sent back for one final attempt
                                that space returned by a merger satisfied; a
                                high count means the final check rarely fails
-     reserve_fail_infeasible   Of those, the ones that exhausted the expiration
-                               record budget without obtaining enough space
      reclaim_calls             Scans looking for space to reclaim
      reclaim_elect_losses      Scans whose chosen segment was reclaimed by
                                another thread first
