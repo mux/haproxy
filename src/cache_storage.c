@@ -1913,7 +1913,8 @@ static enum cache_reclaim_status ttl_bucket_merge(struct cache *cache,
 		return CACHE_RECLAIM_RETRY;
 	if (_HA_ATOMIC_LOAD(&cache->n_free) >= cache->cfg.n_reserved + reserving)
 		return CACHE_RECLAIM_PROGRESS;
-	if (ttlb->merges_inflight)
+	/* A TTL within the expiry guard leaves no segment evictable. */
+	if (ttlb->merges_inflight || ttlb->ttl_approx <= CACHE_MERGE_EXPIRY_GUARD)
 		return ttl_bucket_evict(cache, ttlb, l, reserving, freed);
 
 	/* Split the budget between cursor and head, finishing runs across the
