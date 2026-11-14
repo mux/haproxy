@@ -90,19 +90,6 @@ haproxy h1 -conf {
         mean-object-size 128
         segment-max-entries 16
 
-    # Explicit segment size wins, regardless of directive order.
-    cache explicit_before
-        total-max-size 16
-        mean-object-size 128
-        segment-size 131072
-        segment-max-entries 16
-
-    cache explicit_after
-        total-max-size 16
-        mean-object-size 128
-        segment-max-entries 16
-        segment-size 131072
-
     # The default 4 KiB mean now caps auto sizing at 1 MiB.
     cache normal_default
         total-max-size 128
@@ -121,7 +108,7 @@ haproxy h1 -conf {
         total-max-size 1
         mean-object-size 128
 
-    # Raising the count does not raise the 2 MiB automatic byte ceiling.
+    # Raising the count reaches the 8 MB slot-layout ceiling, but not past it.
     cache byte_ceiling
         total-max-size 128
         mean-object-size 1048576
@@ -142,11 +129,9 @@ shell {
     echo "$out" | grep -q '^small_override.n_segs: 256$'
     echo "$out" | grep -q '^non_power.n_segs: 512$'
     echo "$out" | grep -q '^minimum.n_segs: 4096$'
-    echo "$out" | grep -q '^explicit_before.n_segs: 128$'
-    echo "$out" | grep -q '^explicit_after.n_segs: 128$'
     echo "$out" | grep -q '^normal_default.n_segs: 128$'
     echo "$out" | grep -q '^normal_override.n_segs: 64$'
     echo "$out" | grep -q '^few_objects.n_segs: 16$'
     echo "$out" | grep -q '^small_arena.n_segs: 64$'
-    echo "$out" | grep -q '^byte_ceiling.n_segs: 64$'
+    echo "$out" | grep -q '^byte_ceiling.n_segs: 16$'
 }

@@ -85,7 +85,7 @@ struct cache_config {
  * cache_get_stats().
  */
 struct cache_stats {
-	uint64_t reserve_fails;   /* Reservations abandoned: reclaim found no room in time */
+	uint64_t reserve_fails;   /* Reservations refused, merge declines included */
 	uint64_t reserve_fail_giveup;     /* ... because no listed segment was left:
 	                                   * all free, unpublished or condemned */
 	uint64_t reserve_fail_attempts;   /* ... because the attempts cap was reached */
@@ -93,7 +93,7 @@ struct cache_stats {
 	uint64_t reserve_fail_infeasible; /* ... expiration budget exhausted */
 	uint64_t reclaim_calls;       /* Reclaim scans started */
 	uint64_t reclaim_elect_losses;/* Elected victims lost to a concurrent reclaimer */
-	uint64_t reclaim_blocked;     /* Elected victims skipped: pinned by a writer */
+	uint64_t reclaim_blocked;     /* Elected victims skipped: writer-pinned or merge-claimed */
 	uint64_t reclaim_no_candidate;/* Scans that found segments but no electable victim */
 	uint64_t publish_fails;   /* Publishes refused: index full or entry incomplete */
 	uint64_t read_pin_fails;  /* Read pins abandoned: the entry's slot kept being
@@ -107,8 +107,11 @@ struct cache_stats {
 	uint64_t merges;          /* Merges that retained something */
 	uint64_t merges_empty;    /* Merges that retained nothing */
 	uint64_t merges_no_dst;   /* Merges that found no destination segment and
-	                           * fell back to evicting whole segments */
+	                           * fell back to eviction or declined */
 	uint64_t merges_inflight_max; /* Most merges holding a destination at once */
+	uint64_t reserve_fail_merging; /* Reservations declined during a merge */
+	uint64_t reserve_merging_rescued; /* Those retried and then satisfied */
+	uint64_t fifo_fallbacks;      /* Whole segments evicted with no merger */
 	uint64_t segs_condemned;      /* Segment/chain heads waiting on their last
 	                               * reader, right now (a gauge) */
 	uint64_t segs_condemned_max;  /* Most such heads at once */

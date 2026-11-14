@@ -37,8 +37,8 @@ haproxy h1 -conf {
 
     cache budget
         total-max-size 1
-        segment-size 4096
-        mean-object-size 4096
+        mean-object-size 256
+        segment-max-entries 16
         max-object-size 4000
         reserved-segments 0
 } -start
@@ -53,7 +53,7 @@ client c1 -connect ${h1_fe_sock} {
     }
     delay 3
 
-    # E=1 and Nmax=1 give a four-record minimum and maximum.
+    # E=16 and Nmax=1 clamp the factor to four, giving 64 records.
     txreq
     rxresp
     expect resp.status == 200
@@ -65,8 +65,8 @@ shell {
     out=$(echo 'show cache stats' | socat -t 5 "${tmpdir}/h1/stats" -)
     echo "$out"
     echo "$out" | grep -q '^budget.n_segs: 256$'
-    echo "$out" | grep -q '^budget.segs_expired: 4$'
-    echo "$out" | grep -q '^budget.n_free: 3$'
+    echo "$out" | grep -q '^budget.segs_expired: 64$'
+    echo "$out" | grep -q '^budget.n_free: 63$'
     echo "$out" | grep -q '^budget.reclaim_calls: 1$'
     echo "$out" | grep -q '^budget.segs_evicted: 0$'
     echo "$out" | grep -q '^budget.reserve_fails: 0$'

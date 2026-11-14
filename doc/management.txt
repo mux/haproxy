@@ -3130,19 +3130,27 @@ show cache [stats]
   foobar-hints.publish_supersedes: 0
   (...)
 
-     reserve_fails             Objects not stored because no space could be
-                               reclaimed in time
+     reserve_fails             Cache admissions or growth attempts declined
+                               because space was not immediately available;
+                               includes active-merge refusals, not HTTP errors
+     reserve_fail_merging      Of those, the ones declined because another
+                               merge was in flight after a final failed
+                               reservation
      reserve_fail_giveup       Of those, the ones finding nothing left to
                                reclaim (free, being written, or draining)
      reserve_fail_attempts     Of those, the ones that ran out of attempts
      reserve_fail_busy         Of those, the ones making no progress
+     reserve_merging_rescued   Reservations sent back for one final attempt
+                               that space returned by a merger satisfied; a
+                               high count means the final check rarely fails
      reserve_fail_infeasible   Of those, the ones that exhausted the expiration
                                record budget without obtaining enough space
      reclaim_calls             Scans looking for space to reclaim
      reclaim_elect_losses      Scans whose chosen segment was reclaimed by
                                another thread first
      reclaim_blocked           Segments left alone because an object was still
-                               being written into them
+                               being written into them, or a merge was reading
+                               them
      reclaim_no_candidate      Scans that found no reclaimable segment
      publish_fails             Objects written in full but not indexed: no free
                                index slot for their key, or an incomplete entry
@@ -3167,25 +3175,31 @@ show cache [stats]
                                into their destination segment
      merges_empty              Merges that found nothing left alive and only
                                freed their sources
-     merges_no_dst             Merges that found no destination segment and fell
-                               back to evicting whole segments; sustained growth
-                               means "reserved-segments" is too low
-     merges_inflight_max       Most merges holding a destination segment at once
-                               (the demand "reserved-segments" must cover)
+     merges_no_dst             Reclaim attempts finding no merge destination:
+                               FIFO if no merger is active, otherwise refusal;
+                               check reserves and reader-held segments
+     merges_inflight_max       Most mergers holding a destination at once (the
+                               demand "reserved-segments" must cover)
+     fifo_fallbacks            Whole segments evicted because no merger was
+                               active, their index clearing still locked
      segs_condemned            Segment/chain heads waiting on their last reader
                                right now (a gauge); a private chain counts once
      segs_condemned_max        Most such heads at once; a large value means
                                reader pins are slowing the return of reclaimed
                                segments to the free pool
      n_segs                    Segments in the arena (a gauge)
-     n_reserved                Effective number of segments reserved for merging,
-                               after the internal cap; 0 when merging is disabled
-                               (a gauge)
+     n_reserved                Effective merge reserve after the internal cap;
+                               0 for disabled merging or a one-segment arena (a
+                               gauge)
      n_free                    Free segments in the pool right now (a gauge)
 
-  Sustained growth of "reserve_fails" or "publish_fails" means objects are
-  failing to be cached, the former pointing at reclamation, the latter at
-  index capacity.
+  "reserve_fail_merging" counts deliberate cache bypass, not failed responses:
+  useful data is not evicted and the caller does not wait for a merger. Other
+  "reserve_fail_*" counters describe bounded reclaim failures; "publish_fails"
+  points at index capacity or incomplete entries. Refusal can slow admission
+  after a working-set change. Include refused stores among misses when
+  comparing hit ratios or origin demand; excluding them from the denominator
+  inflates the apparent hit rate.
 
 show default-server [<backend>]
   Dump the list of default-server instances still present in a backend after

@@ -44,23 +44,24 @@ yet known when their space is reserved, and entries too large for a single
 segment, instead get segments of their own; both cases are covered under
 *Private segments* below.
 
-Two different limits bound the segment size. The hard ceiling is 8 MB, set by
-the slot layout: a slot encodes a record's offset within its segment in 20 bits
-of 8-byte units. Below that the engine sizes segments from the configured
-capacity, and `segment-size` overrides it. Automatic sizing targets 64 segments,
-with a lower target of 16 mean-sized objects per segment and at least 16
-segments when possible. It caps size at 2 MiB and at `segment-max-entries` (256
-by default) times `mean-object-size`, then rounds down to a power of two. The
-4096-byte minimum and the minimum size needed to fit the index's segment-ID
-field take precedence over the expected-entry ceiling. The latter preserves
-representable large arenas; it does not raise the 2 MiB automatic byte ceiling.
+The segment size is derived, not configured directly: `mean-object-size`,
+`segment-max-entries` and `total-max-size` determine it, and the product of the
+first two is what selects the upper bound. Sizing targets 64 segments, with a
+lower target of 16 mean-sized objects per segment and at least 16 segments when
+possible. It caps size at `segment-max-entries` (256 by default) times
+`mean-object-size`, then rounds down to a power of two. Sizes that would leave a
+segment below 4096 bytes, or below the size needed to fit the index's segment-ID
+field, are raised instead. The hard ceiling is 8 MB, set by the slot layout: a
+slot encodes a record's offset within its segment in 20 bits of 8-byte units, so
+a larger `segment-max-entries` can reach it but no setting can exceed it.
 
-This entry target limits dense-segment traversal under a TTL-bucket lock, not
-the actual number of physical records: the configured mean is only an estimate,
-dead records still cost work, and merging can traverse several source segments.
-A conservative index estimate can also select smaller-than-desirable segments
-for large responses. Operators can raise the target or set `segment-size`
-explicitly in that case; changing the entry target leaves index sizing alone.
+This entry target limits segment-granularity work, not the actual number of
+physical records: the configured mean is only an estimate, dead records still
+cost work, and merging can traverse several source segments. Expiration and
+whole-segment FIFO clearing remain bucket-locked; bulk merging does not. A
+conservative index estimate can also select smaller-than-desirable segments for
+large responses. Raising `mean-object-size` or `segment-max-entries` widens that
+ceiling; changing the entry target leaves index sizing alone.
 
 This log-structured shape is the core idea taken from Segcache. Its consequences
 -- no in-place mutation and segment-granularity reclaim and relocation -- drive
@@ -147,9 +148,10 @@ empty check be a single comparison against zero.
 
 The index itself is lock-free: slots are accessed only with atomics -- a lookup
 loads a slot atomically, and publish, delete, and expiry update slots with a
-compare-and-swap. The spinlocks in the engine guard segment bookkeeping (the
-TTL-bucket segment lists, byte reservation, the free-segment pool), never the
-index and, with the one exception below, never reads.
+compare-and-swap. The spinlocks in the engine guard segment bookkeeping: the
+TTL-bucket segment lists, byte reservation and free-segment pool. Index access
+requires no index lock, although expiration and FIFO clear slots while holding a
+bucket lock. With the one exception below, reads never take a lock.
 
 Reads take no lock at all. A reader pins the target segment (a reference count),
 re-reads the index slot to confirm nothing changed under it, then checks that
@@ -206,6 +208,21 @@ at the scale they run, where thousands of small entries fit in one segment and
 reservations are constant; it does not for an HTTP cache, where a segment holds
 tens of entries and every reservation is followed by a comparatively enormous
 streamed copy that takes no lock at all.
+
+Reclamation also releases the bucket lock during a merge. Under that lock it
+claims the source IDs and a destination, then scores, copies and updates index
+slots without holding it. Claims prevent source reuse and appending even when an
+expired successor makes a source the new tail; they also protect the published
+but not yet linked destination. Finalization reacquires the lock, uses current
+boundary links, releases unused claims and performs the normal
+reader-condemnation handoff. Purges that empty claimed segments defer their
+cleanup until the owner can safely finalize them.
+
+Only one merger owns a TTL bucket at a time. Different buckets may merge
+concurrently, but there is no maintenance mutex or waiting queue for a merger.
+This does not make reclaim free: the caller still performs the merge's CPU work
+synchronously, and reservations and finalization can still contend on the bucket
+lock.
 
 ## TTL buckets and expiration
 
@@ -299,34 +316,50 @@ A reservation short of free segments reclaims space in two steps:
   record work but do not supply free segments yet. No live data is evicted just
   to reach the minimum. If no more expired records are found, stop batching.
 - **Then merge around the oldest.** If expiration falls short without exhausting
-  its budget, a live segment goes. Because each chain ages head-first, the
-  globally oldest segment is always one of the chain heads -- 2048 of them, a
-  shared and a private queue for each of the 1024 TTL buckets. The scan takes
-  the oldest head that is not write-pinned: unindexing has to parse a segment's
-  record headers to walk it, and a write pin means one of those headers is still
-  being written. A private head is a chain owned by a single entry and is
-  evicted whole. A shared head hands its bucket to the merge, which examines up
-  to sixteen segments from where the previous merge stopped, then, if needed, up
-  to sixteen from the head towards that resume point. A run already in progress
-  may finish across it, rechecking at most two segments. Without a distinct
-  resume point, it examines up to 32 from the head. A run needs at least three
-  consecutive eligible segments: neither the write tail nor being written, and
-  more than twenty seconds from expiry. They are merged into a destination taken
-  from a small reserve of `reserved-segments` segments, defaulting to
-  min(nbthread, 4) further capped at a 64th of the segment count (floored at
-  one), that ordinary reservations leave alone so a merge can always run. The
-  sources return to the pool, unless a reader still pins them, in which case
-  they are condemned and their return is delayed until that reader unpins --
-  which is why a burst of merges can want more destinations than there are
+  its budget, elect an old safe victim. Each bucket has a shared and a private
+  queue. Within a bounded 64-descriptor search of each queue, skip claimed and
+  write-pinned segments, then elect the oldest candidate across buckets.
+  Unindexing parses record headers, so a write pin means a candidate cannot be
+  reclaimed safely. A private candidate is a chain owned by one entry and can
+  only be evicted whole. A shared candidate hands its bucket to the merge, which
+  examines up to sixteen segments from where the previous merge stopped, then,
+  if needed, up to sixteen from the head towards that resume point. A run
+  already in progress may finish across it, rechecking at most two segments.
+  Without a distinct resume point, it examines up to 32 from the head. A run
+  needs at least three consecutive eligible segments: neither the write tail nor
+  being written, and more than twenty seconds from expiry. They are merged into
+  a destination taken from a small reserve of `reserved-segments` segments,
+  defaulting to min(nbthread, 4) further capped at a 64th of the segment count
+  (floored at one), that ordinary reservations leave alone so a merge can always
+  run. The sources return to the pool, unless a reader still pins them, in which
+  case they are condemned and their return is delayed until that reader unpins
+  -- which is why a burst of merges can want more destinations than there are
   concurrent merges, and why `merges_no_dst` and `segs_condemned` are reported.
-  Without such a run the head is evicted whole, as plain FIFO would. Read pins
-  are no obstacle at all; a segment reclaimed under them is condemned and handed
-  to its last reader. With `reserved-segments 0`, ordinary allocations may
-  consume the entire pool: no destination is held aside. This does not disable
-  merging, but makes its whole-segment fallback more likely. The engine's
-  separate `CACHE_F_NO_MERGE` flag disables merging explicitly.
+  Without a run or destination, use a bounded safe FIFO victim only when no
+  merger is active in the arena. If any bucket's merger is producing supply,
+  decline storage instead of evicting useful content or waiting for it. Read
+  pins do not block reclamation; a victim held by readers is condemned and
+  handed to its last reader. With `reserved-segments 0`, ordinary allocations
+  may consume the entire pool: no destination is held aside. Merging is still
+  attempted, and succeeds whenever a segment happens to be free when the merge
+  needs one; it is just more likely to find none and fall back to whole-segment
+  eviction. The separate `CACHE_F_NO_MERGE` flag disables merging explicitly.
 
 A one-segment cache keeps no merge reserve, so ordinary allocations can use it.
+
+Refusal is a capacity decision, not a popularity filter. It applies only after a
+reservation and bounded expiration fail to provide usable space and the elected
+bucket cannot start a useful merge. Before declining, try reserving space once
+more: a new shared tail or free segment may already satisfy the request. If that
+reservation fails and mergers remain active, abandon only the cache copy; the
+HTTP response continues normally. If all mergers ended, resume ordinary bounded
+reclamation. Free means available beyond the merge reserve for this request, not
+merely a nonzero free-list count. No timer, completion-counter polling or retry
+burst waits for supply to appear.
+
+This preserves existing content at the cost of declining some new stores and can
+slow learning after a working-set change. Hit-rate measurements must count
+refused stores as misses, rather than divide only by hits and successful stores.
 
 A merge that retains nothing hands its destination back, and once such merges
 outnumber the successful ones, later merges copy every live record: on a cache
@@ -336,12 +369,12 @@ alive.
 Dead segments do not wait for either step. A shared segment whose stores were
 all aborted, or whose last indexed object was deleted or replaced, can never be
 read again, so it is reclaimed as soon as it is neither the bucket's tail nor
-being written: at the abort, delete or supersede that emptied it, or, for a full
-tail, when the next reservation rolls over to a new one, which then gets the
-same segment straight back from the pool. Without this, a client that keeps
-aborting a large download -- a health check fetching a big file every second is
-the real-world case -- fills the cache with dead segments at its own pace and
-pushes live ones out ahead of them.
+being written or claimed: at the abort, delete or supersede that emptied it, or,
+for a full tail, when the next reservation rolls over to a new one, which then
+gets the same segment straight back from the pool. Without this, a client that
+keeps aborting a large download -- a health check fetching a big file every
+second is the real-world case -- fills the cache with dead segments at its own
+pace and pushes live ones out ahead of them.
 
 Allocation is retried even after the last allowed reclaim round. If it still
 fails after the expiration record budget is spent, admission is declined and
@@ -351,7 +384,7 @@ limits still apply to eviction and merging; their work is not counted as
 expiration records. Each retry uses the pool's current supply rather than a
 cumulative count that other reservations may already have consumed.
 
-### Why not an admission filter
+### Why not a popularity admission filter
 
 Caching an object only on its second request is common practice for HTTP caches:
 [Akamai][ak] does it with a Bloom filter and reports three-quarters of its
@@ -403,7 +436,8 @@ refuse to cache an object larger than a segment. HTTP object sizes vary
 enormously -- from tiny API responses to large media -- so refusing the large
 ones is not acceptable. A store is refused only when the entry would exceed
 `max-object-size`, when jumbo entries are disabled on the instance, or when
-reclaim cannot supply the segments.
+reclaim cannot supply the segments, including temporary refusal while another
+merger is producing space.
 
 A chain costs contiguity: a jumbo entry's payload is no longer one contiguous
 run, so serving it means gathering across segments. A cache large enough to
@@ -585,27 +619,24 @@ Three items are known and deliberately deferred.
 
 - **Reclaim scanning.** `cache_reclaim()` scans all 1024 TTL buckets, locking
   every non-empty one, to find a segment to expire or the best eviction
-  candidate, and may run again when its victim was blocked by writers. Measured
-  under adversarial in-process load this is not the bottleneck it looks like:
-  reservations essentially never fail, even with objects arriving back-to-back
-  from memory with no network to pace them. The margin is structural: unindexing
-  costs a few memory accesses per record, while storing that record cost at
-  least the object's copy and a round of request processing -- far more. Both
-  scale with the same memory system, so a machine runs out of capacity to store
-  objects long before it can congest the scan that reclaims their space. The
-  `reserve_fail_*` counters are there to prove it either way in production; if
-  they ever climb, this can be addressed by replacing the scan with a reclaim
-  list to which segments are appended as they fill.
+  candidate, and may run again when its victim was blocked by writers. This
+  traversal and its acquisitions still cost foreground time even though bulk
+  merging is unlocked. A reclaim list or expiration coalescing could avoid some
+  scans. The `reserve_fail_*` counters distinguish deliberate active-merge
+  admission refusal from other failures; a rising refusal count alone does not
+  establish an insufficient cache size or a slow scan.
 
 - **The write tail under a single TTL class.** When nearly all entries share one
-  TTL bucket, writers queue behind evictions on that bucket's lock: unindexing a
-  full segment holds it for a few microseconds up to a few hundred, in
-  proportion to its record count, which inflates write tail latency without
-  failing anything. The hold is bounded by the segment size, so `segment-size`
-  already caps it. The fix is to unindex outside the lock, after the victim is
-  unlinked from its bucket list: the orderings that protect readers never
-  depended on the lock, unlinking replaces it as the barrier against new
-  writers, and the condemned handoff keeps its two-phase check.
+  TTL bucket, writers can still queue behind expiration and whole-segment FIFO
+  clearing on that bucket's lock. Those walks scale with physical record count
+  and can inflate write tail latency. Bulk merging is already outside the lock;
+  active-merge refusal avoids destructive FIFO while supply is being produced,
+  without waiting for it. The physical walk is bounded by the segment size, so
+  the configured size caps its record footprint, not its elapsed time.
+  Unindexing could move outside the lock after the victim is unlinked from its
+  bucket list: the orderings that protect readers never depended on the lock,
+  unlinking replaces it as the barrier against new writers, and the condemned
+  handoff keeps its two-phase check.
 
 - **Scheduled expiry.** Nothing calls `cache_expire()` yet: expired segments are
   reclaimed inline, by the reservation that needs their space. A periodic call

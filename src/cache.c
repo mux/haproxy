@@ -2439,36 +2439,6 @@ int cfg_parse_cache(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 		tmp_cache_config->store_cfg.seg_max_entries = maxentries;
-	} else if (strcmp(args[0], "segment-size") == 0) {
-		unsigned long long segsz;
-		char *err;
-
-		if (alertif_too_many_args(1, file, linenum, args, &err_code)) {
-			err_code |= ERR_ABORT;
-			goto out;
-		}
-
-		if (!*args[1]) {
-			ha_warning("parsing [%s:%d]: '%s' expects a segment size parameter in bytes.\n",
-			        file, linenum, args[0]);
-			err_code |= ERR_WARN;
-		}
-
-		segsz = strtoull(args[1], &err, 10);
-		if (err == args[1] || *err != '\0') {
-			ha_warning("parsing [%s:%d]: segment-size wrong value '%s'\n",
-			           file, linenum, args[1]);
-			err_code |= ERR_ABORT;
-			goto out;
-		}
-		if (segsz > CACHE_SEG_MAX_SIZE) {
-			ha_warning("parsing [%s:%d]: segment-size too large '%s' (maximum %llu)\n",
-			           file, linenum, args[1],
-			           (unsigned long long)CACHE_SEG_MAX_SIZE);
-			err_code |= ERR_ABORT;
-			goto out;
-		}
-		tmp_cache_config->store_cfg.seg_size = segsz;
 	} else if (strcmp(args[0], "mean-object-size") == 0) {
 		unsigned long long meansz;
 		char *err;
@@ -2668,13 +2638,6 @@ int cfg_post_parse_section_cache()
 		    (!(tmp_cache_config->flags & CACHE_CF_VARY_PROCESSING) ||
 		     (tmp_cache_config->flags & CACHE_CF_EARLY_HINTS_ONLY))) {
 			ha_alert("\"vary-cache-size\" requires \"process-vary on\" and a response cache.\n");
-			err_code |= ERR_FATAL | ERR_ALERT;
-			goto out;
-		}
-
-		if (tmp_cache_config->store_cfg.seg_size != 0 &&
-		    tmp_cache_config->total_size % tmp_cache_config->store_cfg.seg_size != 0) {
-			ha_alert("\"segment-size\" must divide \"total-max-size\" evenly\n");
 			err_code |= ERR_FATAL | ERR_ALERT;
 			goto out;
 		}
@@ -3355,6 +3318,9 @@ static void show_cache_stats(struct buffer *buf, const char *id,
 	SHOW_CACHE_METRIC(merges_empty);
 	SHOW_CACHE_METRIC(merges_no_dst);
 	SHOW_CACHE_METRIC(merges_inflight_max);
+	SHOW_CACHE_METRIC(reserve_fail_merging);
+	SHOW_CACHE_METRIC(reserve_merging_rescued);
+	SHOW_CACHE_METRIC(fifo_fallbacks);
 	SHOW_CACHE_METRIC(segs_condemned);
 	SHOW_CACHE_METRIC(segs_condemned_max);
 	SHOW_CACHE_METRIC(n_segs);
