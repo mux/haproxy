@@ -1529,13 +1529,23 @@ out:
 #define 	HTX_CACHE_EOM    4  /* Cache entry completely forwarded. Finish the HTX message */
 #define 	HTX_CACHE_END    5  /* Cache entry treatment terminated */
 
-static void http_cache_applet_release(struct appctx *appctx)
+/* Drop the read pin once nothing more is read from the store, so that the
+ * entry's segment can be reclaimed while the client drains the end of the
+ * response. ctx->entry points into the store and is not to be read after.
+ */
+static void http_cache_applet_unpin(struct appctx *appctx)
 {
 	struct cache_appctx *ctx = appctx->svcctx;
-	struct cache *store = ctx->cache->store;
 
-	cache_release(store, &ctx->handle);
-	CACHE_HANDLE_INIT(ctx->handle);
+	if (!CACHE_HANDLE_ERR(ctx->handle)) {
+		cache_release(ctx->cache->store, &ctx->handle);
+		CACHE_HANDLE_INIT(ctx->handle);
+	}
+}
+
+static void http_cache_applet_release(struct appctx *appctx)
+{
+	http_cache_applet_unpin(appctx);
 }
 
 static unsigned int htx_cache_dump_blk(struct appctx *appctx, struct htx *htx, enum htx_blk_type type,
@@ -1716,6 +1726,7 @@ static size_t http_cache_fastfwd(struct appctx *appctx, struct buffer *buf, size
 				 */
 				appctx->st0 = HTX_CACHE_EOM;
 			}
+			http_cache_applet_unpin(appctx);
 		}
 	}
 	return ret;
@@ -1831,6 +1842,8 @@ static void http_cache_io_handler(struct appctx *appctx)
 	}
 
 	if (appctx->st0 == HTX_CACHE_EOM) {
+		http_cache_applet_unpin(appctx);
+
 		/* No more data are expected. htx_set_eom() adds an EOT block
 		 * itself when the response buffer is empty, e.g. after a
 		 * fast-forwarded body.
@@ -1847,6 +1860,7 @@ static void http_cache_io_handler(struct appctx *appctx)
 
   end:
 	if (appctx->st0 == HTX_CACHE_END) {
+		http_cache_applet_unpin(appctx);
 		applet_set_eos(appctx);
 	}
 
