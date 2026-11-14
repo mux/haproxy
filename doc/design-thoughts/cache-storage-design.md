@@ -301,7 +301,7 @@ aborted records. Let E be the segment size divided by the configured mean object
 size, rounded up, and N the segments needed for the maximum object size,
 including its record header. The minimum is 4E records and the maximum is E
 multiplied by N clamped between 4 and 32. Without a configured object limit, the
-arena capacity supplies N. Thresholds are initialized only on allocation
+arena capacity supplies N. Thresholds are initialized only on reservation
 pressure and shared across all rounds of one reservation or streaming growth
 operation. Whole segments and private chains stay indivisible, so the final unit
 can overrun the maximum. Descriptor walks and lock waiting are not bounded by
@@ -345,13 +345,11 @@ A reservation short of free segments reclaims space in two steps:
   the victim expires within twenty seconds: it could not be merged and has
   little left to give. Read pins do not block reclamation; a victim held by
   readers is condemned and handed to its last reader. With
-  `reserved-segments 0`, ordinary allocations may consume the entire pool: no
+  `reserved-segments 0`, ordinary reservations may consume the entire pool: no
   destination is held aside. Merging is still attempted, and succeeds whenever a
   segment happens to be free when the merge needs one; it is just more likely to
   find none and fall back to whole-segment eviction. The separate
   `CACHE_F_NO_MERGE` flag disables merging explicitly.
-
-A one-segment cache keeps no merge reserve, so ordinary allocations can use it.
 
 Refusal is a capacity decision, not a popularity filter. It applies only after a
 reservation and bounded expiration fail to provide usable space and the elected

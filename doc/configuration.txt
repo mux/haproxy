@@ -21368,18 +21368,16 @@ reserved-segments <number>
   Define how many segments are kept aside for merge destinations, from 0 to
   65535. Ordinary reservations will not consume these segments. The effective
   default is min(nbthread, 4), additionally capped at roughly a 64th of the
-  cache's segment count (floored at one segment). At least one segment is left
-  for ordinary allocations, so a one-segment cache keeps no reserve. The cap
-  limits capacity withheld from ordinary stores. The effective value is reported
-  as "n_reserved" by "show cache stats". Setting it too low can make merges fall
-  back to evicting whole segments, which shows up as a growing "merges_no_dst"
-  counter. A value of 0 does not disable merging. It only withholds nothing, so
-  ordinary reservations may occupy every free segment. A merge then takes
-  whatever segment is free at the moment it needs a destination; if the pool is
-  empty by then, that attempt falls back to whole-segment eviction. Merging
-  therefore becomes less likely, not impossible, and more dependent on other
-  threads releasing segments at the right time. This setting rarely needs
-  changing.
+  cache's segment count (floored at one segment). The cap limits capacity
+  withheld from ordinary stores. The effective value is reported as "n_reserved"
+  by "show cache stats". Setting it too low can make merges fall back to
+  evicting whole segments, which shows up as a growing "merges_no_dst" counter.
+  A value of 0 does not disable merging. It only withholds nothing, so ordinary
+  reservations may occupy every free segment. A merge then takes whatever
+  segment is free at the moment it needs a destination; if the pool is empty by
+  then, that attempt falls back to whole-segment eviction. Merging therefore
+  becomes less likely, not impossible, and more dependent on other threads
+  releasing segments at the right time. This setting rarely needs changing.
 
 process-vary <on/off>
   Enable or disable the processing of the Vary header. When disabled, a response
