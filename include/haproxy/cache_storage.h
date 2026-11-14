@@ -75,8 +75,7 @@ struct cache_config {
 	uint32_t seg_max_entries; /* Expected-entry ceiling for auto sizing; 0 = default */
 	/* Segments reserved for merge destinations. The effective default is
 	 * min(nbthread, 4), capped at max(1, n_segs/64) -- near 1.5% of the
-	 * segment count -- while leaving at least one segment for ordinary
-	 * allocations. Ignored when CACHE_F_NO_MERGE is set.
+	 * segment count. Ignored when CACHE_F_NO_MERGE is set.
 	 */
 	uint n_reserved;
 };

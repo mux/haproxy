@@ -3189,8 +3189,8 @@ show cache [stats]
                                segments to the free pool
      n_segs                    Segments in the arena (a gauge)
      n_reserved                Effective merge reserve after the internal cap;
-                               0 for disabled merging or a one-segment arena (a
-                               gauge)
+                               always 0 for the anchors and hints storages,
+                               which keep no reserve (a gauge)
      n_free                    Free segments in the pool right now (a gauge)
 
   "reserve_fail_merging" counts deliberate cache bypass, not failed responses:

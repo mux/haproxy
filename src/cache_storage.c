@@ -1679,13 +1679,10 @@ struct cache *cache_new(const struct cache_config *ucfg, uint flags,
 	if (flags & CACHE_F_NO_MERGE)
 		cache->cfg.n_reserved = 0;
 
-	/* Keep the reserve small and leave at least one segment for ordinary
-	 * allocations, which cannot consume the reserve.
-	 */
+	/* Keep the reserve small: a 64th of the segments, but at least one. */
 	cap = cache->n_segs / 64;
 	if (cap < 1)
 		cap = 1;
-	cap = MIN(cap, cache->n_segs - 1);
 	if (cache->cfg.n_reserved > cap)
 		cache->cfg.n_reserved = cap;
 
