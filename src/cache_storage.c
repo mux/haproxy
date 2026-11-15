@@ -1402,14 +1402,29 @@ static void seg_check_dead(struct cache *cache, seg_id_t seg_id,
 #define CACHE_EXPIRE_MIN_FACTOR  4
 #define CACHE_EXPIRE_MAX_FACTOR 32
 
-struct cache_expire_budget {
-	unsigned int records;
-	unsigned int min_records;
-	unsigned int max_records;
+/* One reservation or growth operation shares this state across its reclaim
+ * rounds. <reserving> is its segment count. Each round tries to free
+ * <shortfall> segments and counts in <freed> those that reached the pool.
+ * <last> is the previous round's result; <busy> counts consecutive
+ * unproductive rounds. Expiration thresholds are initialized only when
+ * reclaim is first needed.
+ */
+struct cache_reclaim_ctx {
+	unsigned int reserving;
+	unsigned int shortfall;
+	unsigned int freed;
+	enum cache_reclaim_status last;
+	int attempts;
+	int busy;
+	struct {
+		unsigned int records;
+		unsigned int min_records;
+		unsigned int max_records;
+	} expire;
 };
 
 static void cache_expire_budget_init(const struct cache *cache,
-                                     struct cache_expire_budget *b)
+                                     struct cache_reclaim_ctx *rc)
 {
 	uint64_t n_max;
 	size_t max_size;
@@ -1423,52 +1438,63 @@ static void cache_expire_budget_init(const struct cache *cache,
 	n_max = cache_seg_count(cache, max_size + sizeof(struct cache_record));
 	n_max = MIN(CACHE_EXPIRE_MAX_FACTOR,
 	            MAX(CACHE_EXPIRE_MIN_FACTOR, n_max));
-	b->records = 0;
-	b->min_records = CACHE_EXPIRE_MIN_FACTOR * entries;
-	b->max_records = n_max * entries;
+	rc->expire.records = 0;
+	rc->expire.min_records = CACHE_EXPIRE_MIN_FACTOR * entries;
+	rc->expire.max_records = n_max * entries;
+}
+
+static inline void cache_reclaim_init(struct cache_reclaim_ctx *rc,
+                                      unsigned int reserving)
+{
+	*rc = (struct cache_reclaim_ctx){
+		.reserving = reserving,
+		.last = CACHE_RECLAIM_RETRY,
+	};
+}
+
+/* Tell whether the pool can already serve <rc>'s reservation. */
+static inline int cache_pool_covers(struct cache *cache,
+                                    const struct cache_reclaim_ctx *rc)
+{
+	return _HA_ATOMIC_LOAD(&cache->n_free) >= cache->cfg.n_reserved + rc->reserving;
 }
 
 /* NULL leaves the expired prefix unbounded, as in cache_expire(). */
-static inline int cache_expire_done(const struct cache_expire_budget *b,
-                                    unsigned int needed, unsigned int freed)
+static inline int cache_expire_done(const struct cache_reclaim_ctx *rc)
 {
-	return b && (b->records >= b->max_records ||
-	             (freed >= needed && b->records >= b->min_records));
+	return rc && (rc->expire.records >= rc->expire.max_records ||
+	              (rc->freed >= rc->shortfall &&
+	               rc->expire.records >= rc->expire.min_records));
 }
 
-/* Reclaim an expired prefix until <b> stops it. Writer pins are skipped;
- * condemned segments consume records but supply no free segments. Whole
- * segments/chains may overrun the record limit. Returns segments freed.
+/* Reclaim an expired prefix until <rc> stops it, adding the segments freed to
+ * its count. Writer pins are skipped; condemned segments consume records but
+ * supply no free segments. Whole segments/chains may overrun the record limit.
  */
-static unsigned int seg_list_expire(struct cache *cache,
-                                    struct ttl_bucket *ttlb, struct seg_list *l,
-                                    unsigned int needed,
-                                    struct cache_expire_budget *b)
+static void seg_list_expire(struct cache *cache, struct ttl_bucket *ttlb,
+                            struct seg_list *l, struct cache_reclaim_ctx *rc)
 {
 	enum seg_reclaim_status status;
 	struct seg *seg;
 	seg_id_t seg_id, next_id;
 	uint32_t n_segs;
-	unsigned int freed = 0;
 
 	seg_id = seg_list_first(l);
 	while (seg_id != CACHE_SEG_NONE) {
-		if (cache_expire_done(b, needed, freed))
+		if (cache_expire_done(rc))
 			break;
 		seg = &cache->segments[seg_id];
 		next_id = seg->next_seg_id;
 		if (!seg_expired(ttlb, seg))
 			break;
 		status = seg_reclaim(cache, l, seg_id, &n_segs,
-		                     b ? &b->records : NULL);
-		if (status == SEG_RECLAIM_FREED)
-			freed += n_segs;
+		                     rc ? &rc->expire.records : NULL);
+		if (status == SEG_RECLAIM_FREED && rc)
+			rc->freed += n_segs;
 		if (status != SEG_RECLAIM_BLOCKED)
 			_HA_ATOMIC_ADD(&cache->stats.segs_expired, n_segs);
 		seg_id = next_id;
 	}
-
-	return freed;
 }
 
 /* Internal TTL bucket API */
@@ -1770,8 +1796,8 @@ void cache_expire(struct cache *cache)
 		ttlb = &cache->ttl_buckets[i];
 
 		HA_SPIN_LOCK(CACHE_TTLB_LOCK, &ttlb->lock);
-		seg_list_expire(cache, ttlb, &ttlb->prv_segs, 0, NULL);
-		seg_list_expire(cache, ttlb, &ttlb->segs, 0, NULL);
+		seg_list_expire(cache, ttlb, &ttlb->prv_segs, NULL);
+		seg_list_expire(cache, ttlb, &ttlb->segs, NULL);
 		HA_SPIN_UNLOCK(CACHE_TTLB_LOCK, &ttlb->lock);
 	}
 }
@@ -1782,7 +1808,8 @@ void cache_expire(struct cache *cache)
  * not consult seg_evictable(): it is the fallback when merging cannot run.
  */
 static enum cache_reclaim_status seg_evict(struct cache *cache, struct seg_list *l,
-                                           seg_id_t seg_id, unsigned int *freed)
+                                           seg_id_t seg_id,
+                                           struct cache_reclaim_ctx *rc)
 {
 	enum seg_reclaim_status status;
 	uint32_t n_segs;
@@ -1794,7 +1821,7 @@ static enum cache_reclaim_status seg_evict(struct cache *cache, struct seg_list 
 	}
 	_HA_ATOMIC_ADD(&cache->stats.segs_evicted, n_segs);
 	if (status == SEG_RECLAIM_FREED) {
-		*freed += n_segs;
+		rc->freed += n_segs;
 		return CACHE_RECLAIM_PROGRESS;
 	}
 	return CACHE_RECLAIM_RETRY;
@@ -1835,9 +1862,9 @@ static seg_id_t seg_fifo_find(struct cache *cache, struct seg_list *l)
  * whole-segment FIFO.
  */
 static enum cache_reclaim_status cache_merge_pending(struct cache *cache,
-                                                    unsigned int reserving)
+                                                    const struct cache_reclaim_ctx *rc)
 {
-	if (_HA_ATOMIC_LOAD(&cache->n_free) >= cache->cfg.n_reserved + reserving)
+	if (cache_pool_covers(cache, rc))
 		return CACHE_RECLAIM_PROGRESS;
 	if (!_HA_ATOMIC_LOAD(&cache->merges_inflight))
 		return CACHE_RECLAIM_RETRY;
@@ -1855,34 +1882,33 @@ static enum cache_reclaim_status cache_merge_pending(struct cache *cache,
 static enum cache_reclaim_status ttl_bucket_evict(struct cache *cache,
                                                  struct ttl_bucket *ttlb,
                                                  struct seg_list *l,
-                                                 unsigned int reserving,
-                                                 unsigned int *freed)
+                                                 struct cache_reclaim_ctx *rc)
 {
 	seg_id_t id;
 	enum cache_reclaim_status status;
 
-	status = cache_merge_pending(cache, reserving);
+	status = cache_merge_pending(cache, rc);
 	if (status == CACHE_RECLAIM_PROGRESS)
 		return status;
 	id = seg_fifo_find(cache, l);
 	if (id == CACHE_SEG_NONE) {
 		if (status == CACHE_RECLAIM_MERGING)
 			return status;
-		return *freed ? CACHE_RECLAIM_PROGRESS : CACHE_RECLAIM_RETRY;
+		return rc->freed ? CACHE_RECLAIM_PROGRESS : CACHE_RECLAIM_RETRY;
 	}
 	if (status == CACHE_RECLAIM_MERGING &&
 	    !seg_expiring(ttlb, &cache->segments[id]))
 		return status;
 	_HA_ATOMIC_INC(&cache->stats.fifo_fallbacks);
-	return seg_evict(cache, l, id, freed);
+	return seg_evict(cache, l, id, rc);
 }
 
 /* Merge-based eviction in the shared list of <ttlb>, whose lock the caller
  * holds. Descriptor claims protect one active merger per bucket without a
  * second lock. Different buckets may merge concurrently. The bucket lock is
- * dropped during bulk work and reacquired before returning. <needed> is the
- * number of segments the caller still waits for and <freed> accumulates the
- * segments that reached the free pool. Returns the status of the reclaim round.
+ * dropped during bulk work and reacquired before returning. Segments that
+ * reached the free pool are added to <rc>'s count. Returns the status of the
+ * reclaim round.
  *
  * Expire first within the caller's record budget. Otherwise a sequence of
  * evictable segments is searched from the bucket's cursor, then from its head,
@@ -1896,10 +1922,7 @@ static enum cache_reclaim_status ttl_bucket_evict(struct cache *cache,
  */
 static enum cache_reclaim_status ttl_bucket_merge(struct cache *cache,
                                                   struct ttl_bucket *ttlb,
-                                                  unsigned int needed,
-                                                  unsigned int reserving,
-                                                  unsigned int *freed,
-                                                  struct cache_expire_budget *b)
+                                                  struct cache_reclaim_ctx *rc)
 {
 	struct seg_list *l = &ttlb->segs;
 	seg_id_t srcs[CACHE_MERGE_MAX];
@@ -1909,17 +1932,16 @@ static enum cache_reclaim_status ttl_bucket_merge(struct cache *cache,
 	unsigned int n, i, dead = 0;
 	int supply;
 
-	*freed += seg_list_expire(cache, ttlb, l,
-	                          needed > *freed ? needed - *freed : 0, b);
-	if (*freed >= needed)
+	seg_list_expire(cache, ttlb, l, rc);
+	if (rc->freed >= rc->shortfall)
 		return CACHE_RECLAIM_PROGRESS;
 	if (seg_list_first(l) == CACHE_SEG_NONE)
 		return CACHE_RECLAIM_RETRY;
-	if (_HA_ATOMIC_LOAD(&cache->n_free) >= cache->cfg.n_reserved + reserving)
+	if (cache_pool_covers(cache, rc))
 		return CACHE_RECLAIM_PROGRESS;
 	/* A TTL within the expiry guard leaves no segment evictable. */
 	if (ttlb->merges_inflight || ttlb->ttl_approx <= CACHE_MERGE_EXPIRY_GUARD)
-		return ttl_bucket_evict(cache, ttlb, l, reserving, freed);
+		return ttl_bucket_evict(cache, ttlb, l, rc);
 
 	/* Split the budget between cursor and head, finishing runs across the
 	 * cursor. Without a distinct cursor, search only from the head.
@@ -1938,15 +1960,15 @@ static enum cache_reclaim_status ttl_bucket_merge(struct cache *cache,
 		                         CACHE_SEG_NONE, CACHE_MERGE_SCAN_MAX);
 	if (head_id == CACHE_SEG_NONE) {
 		seg_merge_cursor_set(cache, ttlb, CACHE_SEG_NONE);
-		return ttl_bucket_evict(cache, ttlb, l, reserving, freed);
+		return ttl_bucket_evict(cache, ttlb, l, rc);
 	}
 
-	if (_HA_ATOMIC_LOAD(&cache->n_free) >= cache->cfg.n_reserved + reserving)
+	if (cache_pool_covers(cache, rc))
 		return CACHE_RECLAIM_PROGRESS;
 	dst_id = seg_free_pop(cache, 1, 1);
 	if (dst_id == CACHE_SEG_NONE) {
 		_HA_ATOMIC_INC(&cache->stats.merges_no_dst);
-		return ttl_bucket_evict(cache, ttlb, l, reserving, freed);
+		return ttl_bucket_evict(cache, ttlb, l, rc);
 	}
 	HA_ATOMIC_UPDATE_MAX(&cache->stats.merges_inflight_max,
 	                     _HA_ATOMIC_ADD_FETCH(&cache->merges_inflight, 1));
@@ -2040,11 +2062,11 @@ static enum cache_reclaim_status ttl_bucket_merge(struct cache *cache,
 	 * pool is one short of what the scan's expiries counted.
 	 */
 	if (supply <= 0) {
-		if (supply < 0 && *freed > 0)
-			(*freed)--;
+		if (supply < 0 && rc->freed > 0)
+			rc->freed--;
 		return CACHE_RECLAIM_RETRY;
 	}
-	*freed += supply;
+	rc->freed += supply;
 	return CACHE_RECLAIM_PROGRESS;
 }
 
@@ -2055,15 +2077,14 @@ static enum cache_reclaim_status ttl_bucket_merge(struct cache *cache,
  * election or a write-pinned victim. The expiration record budget does not
  * bound bucket scans, skipped writer pins or time spent waiting for locks.
  *
- * <needed> is the number of segments the caller is waiting for: expired
- * segments freed during the scan count towards it. Expiration continues to
- * <b>'s minimum after covering it, but never starts another segment at its
- * maximum. At most one eviction or merge runs per call.
- * <reserving> is the size of the reservation the caller will retry: once the
- * victim is locked, a pool that can already serve it ends the round. The
- * number of segments that measurably reached the free pool is returned in
- * <freed>; it can exceed <needed> since segments are freed whole chains at a
- * time.
+ * <rc>'s shortfall is the number of segments the caller is waiting for:
+ * expired segments freed during the scan count towards it. Expiration
+ * continues to its budget's minimum after covering it, but never starts
+ * another segment at its maximum. At most one eviction or merge runs per call.
+ * Once the victim is locked, a pool that can already serve <rc>'s reservation
+ * ends the round. The number of segments that measurably reached the free pool
+ * is returned in <rc>'s freed count; it can exceed the shortfall since
+ * segments are freed whole chains at a time.
  *
  * If we observed no in-use segment, return CACHE_RECLAIM_GIVEUP. This should
  * hardly ever happen in practice. If a segment actually reached the free
@@ -2075,10 +2096,7 @@ static enum cache_reclaim_status ttl_bucket_merge(struct cache *cache,
  * like victims blocked by write pins.
  */
 static enum cache_reclaim_status cache_reclaim(struct cache *cache,
-                                               unsigned int needed,
-                                               unsigned int reserving,
-                                               unsigned int *freed,
-                                               struct cache_expire_budget *b)
+                                               struct cache_reclaim_ctx *rc)
 {
 	struct ttl_bucket *ttlb, *best;
 	struct seg_list *best_list;
@@ -2089,9 +2107,9 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 	uint32_t scan_off;
 	int i, j, seen, vanished;
 
-	*freed = 0;
+	rc->freed = 0;
 	_HA_ATOMIC_INC(&cache->stats.reclaim_calls);
-	if (!needed)
+	if (!rc->shortfall)
 		return CACHE_RECLAIM_PROGRESS;
 
 	/* Locate the oldest segment which is our best candidate for eviction.
@@ -2127,8 +2145,6 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 		seen = 1;
 		HA_SPIN_LOCK(CACHE_TTLB_LOCK, &ttlb->lock);
 		for (j = 0; j < 2; j++) {
-			unsigned int remaining;
-
 			/* Now that we hold the TTL bucket lock, we need to
 			 * re-read segment ID and validate it.
 			 */
@@ -2139,10 +2155,8 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 			if (seg_id == CACHE_SEG_NONE)
 				continue;
 
-			remaining = needed > *freed ? needed - *freed : 0;
-			*freed += seg_list_expire(cache, ttlb, lists[j],
-			                          remaining, b);
-			if (*freed >= needed && cache_expire_done(b, needed, *freed)) {
+			seg_list_expire(cache, ttlb, lists[j], rc);
+			if (rc->freed >= rc->shortfall && cache_expire_done(rc)) {
 				HA_SPIN_UNLOCK(CACHE_TTLB_LOCK, &ttlb->lock);
 				return CACHE_RECLAIM_PROGRESS;
 			}
@@ -2173,8 +2187,7 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 	}
 
 	/* Other reclaimers may have supplied the pool during this scan. */
-	if (*freed >= needed ||
-	    _HA_ATOMIC_LOAD(&cache->n_free) >= cache->cfg.n_reserved + reserving)
+	if (rc->freed >= rc->shortfall || cache_pool_covers(cache, rc))
 		return CACHE_RECLAIM_PROGRESS;
 
 	/* We did not see a single segment in use, or all of them were pinned
@@ -2188,10 +2201,10 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 	 * the need.
 	 */
 	if (best == NULL) {
-		if (*freed > 0 || vanished)
+		if (rc->freed > 0 || vanished)
 			return CACHE_RECLAIM_PROGRESS;
 		if (!(cache->flags & CACHE_F_NO_MERGE)) {
-			status = cache_merge_pending(cache, reserving);
+			status = cache_merge_pending(cache, rc);
 			if (status != CACHE_RECLAIM_RETRY)
 				return status;
 		}
@@ -2234,18 +2247,18 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 	}
 
 	/* Another reclaimer may have refilled the pool since the election. */
-	if (_HA_ATOMIC_LOAD(&cache->n_free) >= cache->cfg.n_reserved + reserving) {
+	if (cache_pool_covers(cache, rc)) {
 		HA_SPIN_UNLOCK(CACHE_TTLB_LOCK, &best->lock);
 
 		return CACHE_RECLAIM_PROGRESS;
 	}
 
 	if (best_list == &best->segs && !(cache->flags & CACHE_F_NO_MERGE))
-		status = ttl_bucket_merge(cache, best, needed, reserving, freed, b);
+		status = ttl_bucket_merge(cache, best, rc);
 	else if (!(cache->flags & CACHE_F_NO_MERGE))
-		status = ttl_bucket_evict(cache, best, best_list, reserving, freed);
+		status = ttl_bucket_evict(cache, best, best_list, rc);
 	else
-		status = seg_evict(cache, best_list, best_seg_id, freed);
+		status = seg_evict(cache, best_list, best_seg_id, rc);
 	HA_SPIN_UNLOCK(CACHE_TTLB_LOCK, &best->lock);
 
 	if (status == CACHE_RECLAIM_PROGRESS || status == CACHE_RECLAIM_MERGING)
@@ -2255,52 +2268,34 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 	 * reader) or blocked by a writer - not supply. Expired segments
 	 * freed during the scan still are.
 	 */
-	if (*freed > 0)
+	if (rc->freed > 0)
 		return CACHE_RECLAIM_PROGRESS;
 	return CACHE_RECLAIM_RETRY;
 }
 
-/* One reservation or growth operation shares these limits across its rounds.
- * <needed> is its segment count; <busy> counts consecutive unproductive rounds.
- * Expiration thresholds are initialized only when reclaim is first needed.
- */
-struct cache_reclaim_budget {
-	unsigned int needed;
-	int attempts;
-	int busy;
-	struct cache_expire_budget expire;
-};
-
-static inline void cache_reclaim_budget_init(struct cache_reclaim_budget *b,
-                                             unsigned int needed)
-{
-	*b = (struct cache_reclaim_budget){ .needed = needed };
-}
-
-/* Reclaim after a failed reservation. <last> is the previous round's result;
- * MERGING means the caller just retried the reservation before refusal. Return
- * GIVEUP on refusal or an exhausted budget, otherwise the new result.
+/* Reclaim after a failed reservation. A MERGING last round means the caller
+ * just retried the reservation before refusal. Return GIVEUP on refusal or an
+ * exhausted budget, otherwise the new result.
  */
 static enum cache_reclaim_status cache_reclaim_try(struct cache *cache,
-                                                  struct cache_reclaim_budget *b,
-                                                  enum cache_reclaim_status last)
+                                                  struct cache_reclaim_ctx *rc)
 {
 	enum cache_reclaim_status status;
-	unsigned int shortfall, freed, n_free;
+	unsigned int n_free;
 
-	if (last == CACHE_RECLAIM_MERGING) {
+	if (rc->last == CACHE_RECLAIM_MERGING) {
 		if (_HA_ATOMIC_LOAD(&cache->merges_inflight)) {
 			_HA_ATOMIC_INC(&cache->stats.reserve_fail_merging);
 			goto fail;
 		}
 	}
-	if (!b->expire.max_records)
-		cache_expire_budget_init(cache, &b->expire);
-	if (b->attempts >= CACHE_RESERVE_ATTEMPTS) {
+	if (!rc->expire.max_records)
+		cache_expire_budget_init(cache, rc);
+	if (rc->attempts >= CACHE_RESERVE_ATTEMPTS) {
 		_HA_ATOMIC_INC(&cache->stats.reserve_fail_attempts);
 		goto fail;
 	}
-	if (b->busy >= CACHE_RESERVE_MAX_BUSY) {
+	if (rc->busy >= CACHE_RESERVE_MAX_BUSY) {
 		_HA_ATOMIC_INC(&cache->stats.reserve_fail_busy);
 		goto fail;
 	}
@@ -2309,23 +2304,32 @@ static enum cache_reclaim_status cache_reclaim_try(struct cache *cache,
 	 * frees may already have been consumed by another reservation.
 	 */
 	n_free = _HA_ATOMIC_LOAD(&cache->n_free);
-	shortfall = cache->cfg.n_reserved + b->needed;
-	shortfall = shortfall > n_free ? shortfall - n_free : 0;
-	status = cache_reclaim(cache, shortfall, b->needed, &freed, &b->expire);
+	rc->shortfall = cache->cfg.n_reserved + rc->reserving;
+	rc->shortfall = rc->shortfall > n_free ? rc->shortfall - n_free : 0;
+	status = cache_reclaim(cache, rc);
 	if (status == CACHE_RECLAIM_GIVEUP) {
 		_HA_ATOMIC_INC(&cache->stats.reserve_fail_giveup);
 		goto fail;
 	}
-	b->attempts++;
+	rc->attempts++;
 	if (status == CACHE_RECLAIM_PROGRESS)
-		b->busy = 0;
+		rc->busy = 0;
 	else if (status != CACHE_RECLAIM_MERGING)
-		b->busy++;
+		rc->busy++;
+	rc->last = status;
 	return status;
 
 fail:
 	_HA_ATOMIC_INC(&cache->stats.reserve_fails);
 	return CACHE_RECLAIM_GIVEUP;
+}
+
+/* Account for a reservation that succeeded after the rounds of <rc>. */
+static inline void cache_reclaim_done(struct cache *cache,
+                                      const struct cache_reclaim_ctx *rc)
+{
+	if (rc->last == CACHE_RECLAIM_MERGING)
+		_HA_ATOMIC_INC(&cache->stats.reserve_merging_rescued);
 }
 
 /* Move a finished unknown-length entry that fits in one segment, <h>, out of
@@ -2659,8 +2663,7 @@ struct cache_whandle cache_reserve(struct cache *cache, const struct cache_key *
 {
 	struct cache_whandle h;
 	struct cache_record *rec;
-	struct cache_reclaim_budget budget;
-	enum cache_reclaim_status status = CACHE_RECLAIM_RETRY;
+	struct cache_reclaim_ctx rc;
 	struct ttl_bucket *ttlb;
 	size_t total_len;
 	unsigned int n_segs;
@@ -2708,19 +2711,17 @@ struct cache_whandle cache_reserve(struct cache *cache, const struct cache_key *
 	else
 		n_segs = 1;
 
-	cache_reclaim_budget_init(&budget, n_segs);
+	cache_reclaim_init(&rc, n_segs);
 	while (1) {
 		h = ttl_bucket_reserve(cache, ttlb, total_len);
 		if (!CACHE_HANDLE_ERR(h))
 			break;
 
 		/* The bucket had no segment to give: try to reclaim. */
-		status = cache_reclaim_try(cache, &budget, status);
-		if (status == CACHE_RECLAIM_GIVEUP)
+		if (cache_reclaim_try(cache, &rc) == CACHE_RECLAIM_GIVEUP)
 			return CACHE_WHANDLE_NULL;
 	}
-	if (status == CACHE_RECLAIM_MERGING)
-		_HA_ATOMIC_INC(&cache->stats.reserve_merging_rescued);
+	cache_reclaim_done(cache, &rc);
 
 	rec = CACHE_HANDLE_REC(cache, &h);
 	rec->rec_len = data_len;
@@ -2735,8 +2736,7 @@ int cache_write(struct cache *cache, struct cache_whandle *h,
 {
 	struct cache_record *rec;
 	struct seg *seg, *head, *tail;
-	struct cache_reclaim_budget budget;
-	enum cache_reclaim_status status = CACHE_RECLAIM_RETRY;
+	struct cache_reclaim_ctx rc;
 	unsigned int n_segs;
 	seg_id_t seg_id;
 	size_t need;
@@ -2783,14 +2783,12 @@ int cache_write(struct cache *cache, struct cache_whandle *h,
 		 * entry being grown: its head is write-pinned, so at worst
 		 * it elects it and comes back empty-handed.
 		 */
-		cache_reclaim_budget_init(&budget, n_segs);
+		cache_reclaim_init(&rc, n_segs);
 		while ((seg_id = seg_free_pop(cache, n_segs, 0)) == CACHE_SEG_NONE) {
-			status = cache_reclaim_try(cache, &budget, status);
-			if (status == CACHE_RECLAIM_GIVEUP)
+			if (cache_reclaim_try(cache, &rc) == CACHE_RECLAIM_GIVEUP)
 				return -1;
 		}
-		if (status == CACHE_RECLAIM_MERGING)
-			_HA_ATOMIC_INC(&cache->stats.reserve_merging_rescued);
+		cache_reclaim_done(cache, &rc);
 		rec->rec_len += (size_t)n_segs * cache->cfg.seg_size;
 		tail->next_chain_id = seg_id;
 		head->n_chain += n_segs;
