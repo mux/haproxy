@@ -75,16 +75,27 @@ extern struct applet http_cache_applet;
 
 struct flt_ops cache_ops;
 
+#ifdef USE_THREAD
+struct cache_vary_lock {
+	HA_SPINLOCK_T lock;
+} THREAD_ALIGNED();
+#endif
+
 struct http_cache {
 	struct cache *store;
 	struct cache_config store_cfg;
 	size_t total_size;
 	struct cache *vary_anchors; /* separate storage for Vary routing metadata */
 	size_t vary_anchors_size;   /* arena size, 0 selects the default */
+#ifdef USE_THREAD
 	/* Serialize anchor replacement/deletion and plain<->Vary transitions.
 	 * Readers never acquire this lock. No response is streamed under it.
+	 * It is striped by primary key so that unrelated resources rarely
+	 * contend.
 	 */
-	__decl_thread(HA_SPINLOCK_T vary_lock);
+	struct cache_vary_lock *vary_locks;
+	unsigned int vary_lock_mask;
+#endif
 	struct cache *early_hints; /* hints cache */
 	size_t early_hints_size;   /* size of the hints cache, 0 = default */
 	struct list list;          /* cache linked list */
@@ -364,6 +375,20 @@ cache_store_check(struct proxy *px, struct flt_conf *fconf)
 	return flt_foreach_conf(px, FLT_SIDE_RES, cache_store_check_order, &ctx);
 }
 
+static inline void
+cache_vary_lock(struct http_cache *cache, const struct cache_key *key)
+{
+	HA_SPIN_LOCK(CACHE_VARY_LOCK,
+	             &cache->vary_locks[key->hash.low64 & cache->vary_lock_mask].lock);
+}
+
+static inline void
+cache_vary_unlock(struct http_cache *cache, const struct cache_key *key)
+{
+	HA_SPIN_UNLOCK(CACHE_VARY_LOCK,
+	               &cache->vary_locks[key->hash.low64 & cache->vary_lock_mask].lock);
+}
+
 static int
 cache_store_strm_init(struct stream *s, struct filter *filter)
 {
@@ -563,10 +588,10 @@ cache_store_http_end(struct stream *s, struct filter *filter,
 			 * its publication and anchor deletion under the same writer
 			 * lock as anchor updates, so an old copy cannot restore it.
 			 */
-			HA_SPIN_LOCK(CACHE_VARY_LOCK, &cache->vary_lock);
+			cache_vary_lock(cache, &s->txn.http->cache_hash);
 			cache_delete(cache->vary_anchors, &s->txn.http->cache_hash);
 			cache_publish(cache->store, &st->handle);
-			HA_SPIN_UNLOCK(CACHE_VARY_LOCK, &cache->vary_lock);
+			cache_vary_unlock(cache, &s->txn.http->cache_hash);
 		}
 		else
 			cache_publish(cache->store, &st->handle);
@@ -1089,7 +1114,7 @@ static int cache_vary_anchor(struct http_cache *cache, struct cache_key *pkey,
 	struct cache_rhandle rh;
 	int ret = -1;
 
-	HA_SPIN_LOCK(CACHE_VARY_LOCK, &cache->vary_lock);
+	cache_vary_lock(cache, pkey);
 
 	rh = cache_lookup(cache->vary_anchors, pkey);
 	if (!CACHE_HANDLE_ERR(rh)) {
@@ -1133,7 +1158,7 @@ static int cache_vary_anchor(struct http_cache *cache, struct cache_key *pkey,
 	*generation = anchor.generation;
 	ret = 0;
 out:
-	HA_SPIN_UNLOCK(CACHE_VARY_LOCK, &cache->vary_lock);
+	cache_vary_unlock(cache, pkey);
 	return ret;
 }
 
@@ -1276,10 +1301,10 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 					/* Do not let an in-progress anchor copy restore an
 					 * invalidated generation after this deletion.
 					 */
-					HA_SPIN_LOCK(CACHE_VARY_LOCK, &cache->vary_lock);
+					cache_vary_lock(cache, &txn->cache_hash);
 					cache_delete(cache->vary_anchors, &txn->cache_hash);
 					cache_delete(cache->store, &txn->cache_hash);
-					HA_SPIN_UNLOCK(CACHE_VARY_LOCK, &cache->vary_lock);
+					cache_vary_unlock(cache, &txn->cache_hash);
 				}
 				else if (cache->store)
 					cache_delete(cache->store, &txn->cache_hash);
@@ -2704,9 +2729,30 @@ int post_check_cache()
 	struct proxy *px;
 	struct http_cache *back, *cache;
 	int err_code = ERR_NONE;
+#ifdef USE_THREAD
+	unsigned int i, num_locks;
+
+	/* At most 4 threads per stripe keeps contention low even when every
+	 * request stores.
+	 */
+	num_locks = (global.nbthread + 3) / 4;
+	if (num_locks > 1)
+		num_locks = 1UL << my_flsl(num_locks - 1);      /* round up to a power of two */
+#endif
 
 	list_for_each_entry_safe(cache, back, &caches_config, list) {
-		HA_SPIN_INIT(&cache->vary_lock);
+#ifdef USE_THREAD
+		cache->vary_locks = ha_aligned_alloc_typed(num_locks, struct cache_vary_lock);
+		if (cache->vary_locks == NULL) {
+			ha_alert("Unable to allocate Vary locks for cache '%s'.\n", cache->id);
+			err_code |= ERR_FATAL | ERR_ALERT;
+			goto out;
+		}
+
+		cache->vary_lock_mask = num_locks - 1;
+		for (i = 0; i < num_locks; i++)
+			HA_SPIN_INIT(&cache->vary_locks[i].lock);
+#endif
 		if (!(cache->flags & CACHE_CF_EARLY_HINTS_ONLY)) {
 			/* Effective default min(nbthread, 4), further capped at
 			 * max(1, n_segs/64) in cache_new(): a merge needs a
