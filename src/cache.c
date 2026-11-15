@@ -2771,8 +2771,7 @@ int post_check_cache()
 			                         cache->total_size,
 			                         cache_hash_seed, cache->id);
 			if (cache->store == NULL) {
-				ha_alert("Unable to allocate cache.\n");
-
+				ha_alert("Unable to allocate cache store for '%s'.\n", cache->id);
 				err_code |= ERR_FATAL | ERR_ALERT;
 				goto out;
 			}
