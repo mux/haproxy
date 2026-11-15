@@ -345,6 +345,12 @@ static uint32_t pow2_down(uint32_t x)
 	return x <= 1 ? 1 : 1U << (31 - __builtin_clz(x));
 }
 
+/* Number of segments <len> bytes span. */
+static inline unsigned int cache_seg_count(const struct cache *cache, size_t len)
+{
+	return len / cache->cfg.seg_size + !!(len % cache->cfg.seg_size);
+}
+
 /* Pick an automatic segment size, before rounding the arena down to whole
  * segments. <max_entries> is nonzero and at least CACHE_SEG_MIN_ENTRIES.
  */
@@ -1414,8 +1420,7 @@ static void cache_expire_budget_init(const struct cache *cache,
 	max_size = cache->arena_len - sizeof(struct cache_record);
 	if (cache->cfg.max_obj_size)
 		max_size = MIN(max_size, cache->cfg.max_obj_size);
-	n_max = ((uint64_t)max_size + sizeof(struct cache_record) +
-	         cache->cfg.seg_size - 1) / cache->cfg.seg_size;
+	n_max = cache_seg_count(cache, max_size + sizeof(struct cache_record));
 	n_max = MIN(CACHE_EXPIRE_MAX_FACTOR,
 	            MAX(CACHE_EXPIRE_MIN_FACTOR, n_max));
 	b->records = 0;
@@ -1535,8 +1540,7 @@ static struct cache_whandle ttl_bucket_reserve(struct cache *cache, struct ttl_b
 
 		/* See if this entry requires more than one segment. */
 		if (size > cache->cfg.seg_size)
-			n_segs = size / cache->cfg.seg_size +
-			         !!(size % cache->cfg.seg_size);
+			n_segs = cache_seg_count(cache, size);
 		else
 			n_segs = 1;
 
@@ -2700,8 +2704,7 @@ struct cache_whandle cache_reserve(struct cache *cache, const struct cache_key *
 	 * knows how many segments this reservation is waiting for.
 	 */
 	if (total_len > cache->cfg.seg_size)
-		n_segs = total_len / cache->cfg.seg_size +
-		         !!(total_len % cache->cfg.seg_size);
+		n_segs = cache_seg_count(cache, total_len);
 	else
 		n_segs = 1;
 
@@ -2762,8 +2765,7 @@ int cache_write(struct cache *cache, struct cache_whandle *h,
 		 * acquiring one or more segments.
 		 */
 		need = len - (CACHE_REC_CAPACITY(rec) - h->data_off);
-		n_segs = need / cache->cfg.seg_size +
-		         !!(need % cache->cfg.seg_size);
+		n_segs = cache_seg_count(cache, need);
 
 		/* If the last write completely filled the last segment, then
 		 * h->cur_seg_id would be CACHE_SEG_NONE, so we walk the chain
