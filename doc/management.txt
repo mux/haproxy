@@ -3180,8 +3180,7 @@ show cache [stats]
                                demand "reserved-segments" must cover)
      fifo_fallbacks            Whole segments evicted because they could not
                                be merged and no merger was active, or they
-                               were about to expire; their index clearing
-                               still locked
+                               were about to expire
      segs_condemned            Segment/chain heads waiting on their last reader
                                right now (a gauge); a private chain counts once
      segs_condemned_max        Most such heads at once; a large value means

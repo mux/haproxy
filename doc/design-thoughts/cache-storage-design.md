@@ -57,10 +57,10 @@ a larger `segment-max-entries` can reach it but no setting can exceed it.
 
 This entry target limits segment-granularity work, not the actual number of
 physical records: the configured mean is only an estimate, dead records still
-cost work, and merging can traverse several source segments. Expiration and
-whole-segment FIFO clearing remain bucket-locked; bulk merging does not. A
-conservative index estimate can also select smaller-than-desirable segments for
-large responses. Raising `mean-object-size` or `segment-max-entries` widens that
+cost work, and merging can traverse several source segments. Expiration,
+eviction and merging all walk records without the bucket lock. A conservative
+index estimate can also select smaller-than-desirable segments for large
+responses. Raising `mean-object-size` or `segment-max-entries` widens that
 ceiling; changing the entry target leaves index sizing alone.
 
 This log-structured shape is the core idea taken from Segcache. Its consequences
@@ -150,8 +150,10 @@ The index itself is lock-free: slots are accessed only with atomics -- a lookup
 loads a slot atomically, and publish, delete, and expiry update slots with a
 compare-and-swap. The spinlocks in the engine guard segment bookkeeping: the
 TTL-bucket segment lists, byte reservation and free-segment pool. Index access
-requires no index lock, although expiration and FIFO clear slots while holding a
-bucket lock. With the one exception below, reads never take a lock.
+requires no index lock. Reclamation unlinks a victim from its bucket list under
+the bucket lock, which keeps new writers out, then clears its slots without the
+lock: the orderings that protect readers below never depended on it. With the
+one exception below, reads never take a lock.
 
 Reads take no lock at all. A reader pins the target segment (a reference count),
 re-reads the index slot to confirm nothing changed under it, then checks that
@@ -619,7 +621,7 @@ expected object size.
 
 ## Future work
 
-Three items are known and deliberately deferred.
+Two items are known and deliberately deferred.
 
 - **Reclaim scanning.** `cache_reclaim()` scans all 1024 TTL buckets, locking
   every non-empty one, to find a segment to expire or the best eviction
@@ -629,18 +631,6 @@ Three items are known and deliberately deferred.
   scans. The `reserve_fail_*` counters distinguish deliberate active-merge
   admission refusal from other failures; a rising refusal count alone does not
   establish an insufficient cache size or a slow scan.
-
-- **The write tail under a single TTL class.** When nearly all entries share one
-  TTL bucket, writers can still queue behind expiration and whole-segment FIFO
-  clearing on that bucket's lock. Those walks scale with physical record count
-  and can inflate write tail latency. Bulk merging is already outside the lock;
-  active-merge refusal avoids destructive FIFO while supply is being produced,
-  without waiting for it. The physical walk is bounded by the segment size, so
-  the configured size caps its record footprint, not its elapsed time.
-  Unindexing could move outside the lock after the victim is unlinked from its
-  bucket list: the orderings that protect readers never depended on the lock,
-  unlinking replaces it as the barrier against new writers, and the condemned
-  handoff keeps its two-phase check.
 
 - **Scheduled expiry.** Nothing calls `cache_expire()` yet: expired segments are
   reclaimed inline, by the reservation that needs their space. A periodic call

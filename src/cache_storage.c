@@ -91,8 +91,8 @@ BUG_ON_STATIC(CACHE_TTL_MAX !=
 
 /* Auto segment sizing (cfg.seg_size == 0): the largest power of two yielding at
  * least CACHE_SEG_AUTO_TARGET segments, capped at CACHE_SEG_AUTO_MAX and at
- * cfg.seg_max_entries mean-sized objects. The latter limits dense-segment
- * traversal under the TTL bucket lock, but is an estimate, not a record count.
+ * cfg.seg_max_entries mean-sized objects. The latter limits the records walked
+ * per reclaimed segment, but is an estimate, not a record count.
  * Smaller segments waste less in per-TTL-class open segments (~seg/2 each) and
  * evict at finer grain; larger segments shorten the chains of oversized entries
  * and amortize reclaim better. At the measured ~35 KB mean web response, a 2 MB
@@ -834,7 +834,7 @@ static inline void seg_live_sub(struct seg *seg, const struct cache_record *rec)
 	_HA_ATOMIC_DEC(&seg->n_live);
 }
 
-/* Unlink a segment's entries and return the number of records examined. */
+/* Clear a segment's index slots and return the number of records examined. */
 static unsigned int seg_unindex(const struct cache *cache, struct seg *seg)
 {
 	struct cache_whandle h = { .seg_id = seg_get_id(cache, seg) };
@@ -1173,9 +1173,9 @@ static inline void seg_merge_cursor_set(const struct cache *cache, struct ttl_bu
 }
 
 /* Free the unindexed, unlinked segment <seg_id>, or condemn it to be freed by
- * its last reader. The segment has no writer and the caller holds the lock of
- * the TTL bucket it came from. Returns SEG_RECLAIM_FREED or
- * SEG_RECLAIM_CONDEMNED.
+ * its last reader. The segment has no writer and was unlinked under the lock
+ * of the TTL bucket it came from, which need not be held any more. Returns
+ * SEG_RECLAIM_FREED or SEG_RECLAIM_CONDEMNED.
  */
 static inline enum seg_reclaim_status seg_drain(struct cache *cache, seg_id_t seg_id)
 {
@@ -1185,8 +1185,9 @@ static inline enum seg_reclaim_status seg_drain(struct cache *cache, seg_id_t se
 	/* Stop new readers from keeping a pin: they bump r_refcount first and
 	 * only then check the state, so every reader that got past this store
 	 * is counted by the loads below. No CAS is needed since only code
-	 * holding the bucket lock leaves SEG_S_LIVE; a caller that already
-	 * stored SEG_S_DRAINING loses nothing by our storing it again.
+	 * holding the bucket lock leaves SEG_S_LIVE, and an unlinked segment
+	 * has a single owner; a caller that already stored SEG_S_DRAINING
+	 * loses nothing by our storing it again.
 	 */
 	gen = SEG_STATE_GEN(_HA_ATOMIC_LOAD(&seg->state_gen));
 	HA_ATOMIC_STORE_SEQ_CST(&seg->state_gen,
@@ -1194,11 +1195,11 @@ static inline enum seg_reclaim_status seg_drain(struct cache *cache, seg_id_t se
 
 	/* At this point, there are no writers, no new writers or code trying to
 	 * expire/evict this segment can come because it has been unlinked from
-	 * the TTL bucket and we still hold the lock, no new readers can come
-	 * because the hashtable index slots have been cleared, but there might
-	 * still be pre-existing readers, and in-flight readers who have located
-	 * this segment from the hash table before its slots were cleared, but
-	 * have yet to increment the read refcount.
+	 * the TTL bucket, no new readers can come because the hashtable index
+	 * slots have been cleared, but there might still be pre-existing
+	 * readers, and in-flight readers who have located this segment from the
+	 * hash table before its slots were cleared, but have yet to increment
+	 * the read refcount.
 	 */
 	if (HA_ATOMIC_LOAD_SEQ_CST(&seg->r_refcount) == 0) {
 		/* Relaxed store is fine because of the free-list lock. */
@@ -1285,27 +1286,25 @@ static inline enum seg_reclaim_status seg_drain(struct cache *cache, seg_id_t se
 	return SEG_RECLAIM_CONDEMNED;
 }
 
-/* Reclaim segment <seg_id> of segment list <l>: unindex it, unlink it from the
- * list, then either free it or condemn it to be freed by its last reader.
- * The whole segment chain is reclaimed with its head; the number of segments
- * it counts is stored in <n_segs> (except when blocked). Examined records are
- * added to <records> when non-NULL. The caller holds the TTL bucket lock.
+/* Take segment <seg_id> out of segment list <l> to reclaim it, the part of
+ * reclaiming that needs the TTL bucket lock, which the caller holds. The whole
+ * segment chain goes with its head; the number of segments it counts is stored
+ * in <n_segs>. Returns 0, leaving the segment untouched, if a merge claimed it
+ * or a writer pins it. Otherwise the segment is SEG_S_DRAINING and in no list:
+ * nothing that takes the bucket lock can reach it any more, and seg_unindex()
+ * then seg_drain() finish the job without the lock.
  */
-static inline enum seg_reclaim_status seg_reclaim(struct cache *cache,
-                                                  struct seg_list *l,
-                                                  seg_id_t seg_id,
-                                                  uint32_t *n_segs,
-                                                  unsigned int *records)
+static inline int seg_unlink(struct cache *cache, struct seg_list *l,
+                             seg_id_t seg_id, uint32_t *n_segs)
 {
 	struct seg *seg = &cache->segments[seg_id];
-	unsigned int n_records;
 	uint32_t gen;
 
 	/* The merge owner still parses these bytes or appends copied records to an
 	 * unlinked destination. Leave its state and linkage untouched.
 	 */
 	if (seg->merge_claimed)
-		return SEG_RECLAIM_BLOCKED;
+		return 0;
 
 	/* Setting the state to something other than SEG_S_LIVE stops any new
 	 * reader from keeping a pin - but crucially, they still bump r_refcount
@@ -1324,7 +1323,7 @@ static inline enum seg_reclaim_status seg_reclaim(struct cache *cache,
 	/* Now we check for writer pins. Increments to w_refcount happen under
 	 * the TTL bucket lock we hold, so no new writer can appear. The load
 	 * still needs to be acquire: proceeding on zero means we observed the
-	 * last writer's lock-free decrement, and seg_unindex() below parses
+	 * last writer's lock-free decrement, and seg_unindex() later parses
 	 * record headers (rec_len, hash) that this writer wrote AFTER
 	 * releasing the bucket lock - for a never-published record, this
 	 * acquire pairing with the decrement (an RMW, hence release) is the
@@ -1337,24 +1336,41 @@ static inline enum seg_reclaim_status seg_reclaim(struct cache *cache,
 		/* Relaxed store because we don't have anything to publish. */
 		_HA_ATOMIC_STORE(&seg->state_gen,
 		                 SEG_STATE_MAKE(gen, SEG_S_LIVE));
-		return SEG_RECLAIM_BLOCKED;
+		return 0;
 	}
 
 	/* The head segment records the length of its chain. */
 	*n_segs = seg->n_chain;
-
-	/* Now we unindex, which guarantees no new lookups will get to the seg
-	 * structure anymore, since it won't be found in the hashtable.
-	 */
-	n_records = seg_unindex(cache, seg);
-	if (records)
-		*records += n_records;
 
 	/* Unlink the segment from the TTL bucket. This means it won't be a
 	 * candidate for expiration or eviction anymore. If this segment was
 	 * also the active one, no new writers will be able to find it as well.
 	 */
 	seg_list_splice(cache, l, seg_id, seg_id, CACHE_SEG_NONE);
+	return 1;
+}
+
+/* Reclaim segment <seg_id> of segment list <l> entirely under the TTL bucket
+ * lock, which the caller holds: see seg_unlink(). Examined records are added to
+ * <records> when non-NULL.
+ */
+static inline enum seg_reclaim_status seg_reclaim(struct cache *cache,
+                                                  struct seg_list *l,
+                                                  seg_id_t seg_id,
+                                                  uint32_t *n_segs,
+                                                  unsigned int *records)
+{
+	unsigned int n_records;
+
+	if (!seg_unlink(cache, l, seg_id, n_segs))
+		return SEG_RECLAIM_BLOCKED;
+
+	/* Now we unindex, which guarantees no new lookups will get to the seg
+	 * structure anymore, since it won't be found in the hashtable.
+	 */
+	n_records = seg_unindex(cache, &cache->segments[seg_id]);
+	if (records)
+		*records += n_records;
 
 	return seg_drain(cache, seg_id);
 }
@@ -1470,6 +1486,8 @@ static inline int cache_expire_done(const struct cache_reclaim_ctx *rc)
 /* Reclaim an expired prefix until <rc> stops it, adding the segments freed to
  * its count. Writer pins are skipped; condemned segments consume records but
  * supply no free segments. Whole segments/chains may overrun the record limit.
+ * The caller holds <ttlb>'s lock, which is dropped while each victim is
+ * unindexed and held again on return.
  */
 static void seg_list_expire(struct cache *cache, struct ttl_bucket *ttlb,
                             struct seg_list *l, struct cache_reclaim_ctx *rc)
@@ -1477,7 +1495,8 @@ static void seg_list_expire(struct cache *cache, struct ttl_bucket *ttlb,
 	enum seg_reclaim_status status;
 	struct seg *seg;
 	seg_id_t seg_id, next_id;
-	uint32_t n_segs;
+	uint32_t n_segs, next_gen = 0;
+	unsigned int n_records;
 
 	seg_id = seg_list_first(l);
 	while (seg_id != CACHE_SEG_NONE) {
@@ -1487,12 +1506,31 @@ static void seg_list_expire(struct cache *cache, struct ttl_bucket *ttlb,
 		next_id = seg->next_seg_id;
 		if (!seg_expired(ttlb, seg))
 			break;
-		status = seg_reclaim(cache, l, seg_id, &n_segs,
-		                     rc ? &rc->expire.records : NULL);
+		if (!seg_unlink(cache, l, seg_id, &n_segs)) {
+			seg_id = next_id;
+			continue;
+		}
+		if (next_id != CACHE_SEG_NONE)
+			next_gen = _HA_ATOMIC_LOAD(&cache->segments[next_id].state_gen);
+
+		HA_SPIN_UNLOCK(CACHE_TTLB_LOCK, &ttlb->lock);
+		n_records = seg_unindex(cache, seg);
+		if (rc)
+			rc->expire.records += n_records;
+		status = seg_drain(cache, seg_id);
+		HA_SPIN_LOCK(CACHE_TTLB_LOCK, &ttlb->lock);
+
 		if (status == SEG_RECLAIM_FREED && rc)
 			rc->freed += n_segs;
-		if (status != SEG_RECLAIM_BLOCKED)
-			_HA_ATOMIC_ADD(&cache->stats.segs_expired, n_segs);
+		_HA_ATOMIC_ADD(&cache->stats.segs_expired, n_segs);
+
+		/* A segment leaves a list only by changing state, so a successor
+		 * still live in the same generation is still linked here. If it
+		 * went away meanwhile, start over from the head.
+		 */
+		if (next_id != CACHE_SEG_NONE &&
+		    _HA_ATOMIC_LOAD(&cache->segments[next_id].state_gen) != next_gen)
+			next_id = seg_list_first(l);
 		seg_id = next_id;
 	}
 }
@@ -1802,23 +1840,29 @@ void cache_expire(struct cache *cache)
 	}
 }
 
-/* Evict segment <seg_id> of list <l> whole, the caller holding the bucket's
- * lock, and account for it: segments that reached the free pool are added to
- * <freed>. Returns the status of the reclaim round. Unlike a merge, this does
- * not consult seg_evictable(): it is the fallback when merging cannot run.
+/* Evict segment <seg_id> of list <l> of bucket <ttlb> whole and account for
+ * it: segments that reached the free pool are added to <freed>. The caller
+ * holds the bucket's lock, which is dropped while the victim is unindexed and
+ * held again on return. Returns the status of the reclaim round. Unlike a
+ * merge, this does not consult seg_evictable(): it is the fallback when merging
+ * cannot run.
  */
-static enum cache_reclaim_status seg_evict(struct cache *cache, struct seg_list *l,
-                                           seg_id_t seg_id,
+static enum cache_reclaim_status seg_evict(struct cache *cache, struct ttl_bucket *ttlb,
+                                           struct seg_list *l, seg_id_t seg_id,
                                            struct cache_reclaim_ctx *rc)
 {
 	enum seg_reclaim_status status;
 	uint32_t n_segs;
 
-	status = seg_reclaim(cache, l, seg_id, &n_segs, NULL);
-	if (status == SEG_RECLAIM_BLOCKED) {
+	if (!seg_unlink(cache, l, seg_id, &n_segs)) {
 		_HA_ATOMIC_INC(&cache->stats.reclaim_blocked);
 		return CACHE_RECLAIM_RETRY;
 	}
+	HA_SPIN_UNLOCK(CACHE_TTLB_LOCK, &ttlb->lock);
+	seg_unindex(cache, &cache->segments[seg_id]);
+	status = seg_drain(cache, seg_id);
+	HA_SPIN_LOCK(CACHE_TTLB_LOCK, &ttlb->lock);
+
 	_HA_ATOMIC_ADD(&cache->stats.segs_evicted, n_segs);
 	if (status == SEG_RECLAIM_FREED) {
 		rc->freed += n_segs;
@@ -1872,12 +1916,13 @@ static enum cache_reclaim_status cache_merge_pending(struct cache *cache,
 }
 
 /* Evict one whole segment from <l>, a list of bucket <ttlb>, the fallback when
- * that bucket cannot merge. The bucket lock covers the index clearing. Pool
- * supply is rechecked first because another bucket's merger may have refilled
- * it, and a merger about to return space defers to the caller rather than
- * discarding a live segment, unless the victim is about to expire: it could
- * not be merged and has little left to give. Finding no safe victim within
- * the descriptor bound fails the round rather than waiting for the merger.
+ * that bucket cannot merge. The index clearing runs without the bucket lock,
+ * once the victim is unlinked. Pool supply is rechecked first because another
+ * bucket's merger may have refilled it, and a merger about to return space
+ * defers to the caller rather than discarding a live segment, unless the victim
+ * is about to expire: it could not be merged and has little left to give.
+ * Finding no safe victim within the descriptor bound fails the round rather
+ * than waiting for the merger.
  */
 static enum cache_reclaim_status ttl_bucket_evict(struct cache *cache,
                                                  struct ttl_bucket *ttlb,
@@ -1900,7 +1945,7 @@ static enum cache_reclaim_status ttl_bucket_evict(struct cache *cache,
 	    !seg_expiring(ttlb, &cache->segments[id]))
 		return status;
 	_HA_ATOMIC_INC(&cache->stats.fifo_fallbacks);
-	return seg_evict(cache, l, id, rc);
+	return seg_evict(cache, ttlb, l, id, rc);
 }
 
 /* Merge-based eviction in the shared list of <ttlb>, whose lock the caller
@@ -2258,7 +2303,7 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 	else if (!(cache->flags & CACHE_F_NO_MERGE))
 		status = ttl_bucket_evict(cache, best, best_list, rc);
 	else
-		status = seg_evict(cache, best_list, best_seg_id, rc);
+		status = seg_evict(cache, best, best_list, best_seg_id, rc);
 	HA_SPIN_UNLOCK(CACHE_TTLB_LOCK, &best->lock);
 
 	if (status == CACHE_RECLAIM_PROGRESS || status == CACHE_RECLAIM_MERGING)
