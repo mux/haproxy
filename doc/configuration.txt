@@ -21259,8 +21259,8 @@ deleted before its expiration date.
 The cache uses a hash of the host header and the URI as the key.
 
 It's possible to view the status of a cache using the Unix socket command
-"show cache" consult section 9.3 "Unix Socket commands" of Management Guide
-for more details.
+"show cache"; consult section 9.3 "Unix Socket commands" of the Management
+Guide for more details.
 
 When an object is delivered from the cache, the server name in the log is
 replaced by "<CACHE>".
@@ -21273,21 +21273,23 @@ The cache won't store and won't deliver objects in these cases:
 
 - If the response is not a 200
 - If the response contains a Vary header and either the process-vary option is
-  disabled, or a currently unmanaged header is specified in the Vary value (only
-  accept-encoding, referer and origin are managed for now)
+  disabled, or a currently unmanaged header is specified in the Vary value
+  (only accept-encoding, referer and origin are managed for now)
 - If the Content-Length + the headers size is greater than "max-object-size"
 - If the response is not cacheable
-- If the response does not have an explicit expiration time (s-maxage or max-age
-  Cache-Control directives or Expires header) or a validator (ETag or Last-Modified
-  headers)
+- If the response does not have an explicit expiration time (s-maxage or
+  max-age Cache-Control directives or Expires header) or a validator (ETag or
+  Last-Modified headers)
 - If the process-vary option is enabled, the response varies on the
   accept-encoding header, and "max-secondary-entries" distinct encoding
   combinations are already recorded for its URL
-- If the process-vary option is enabled and the response has an unknown encoding (not
-  mentioned in https://www.iana.org/assignments/http-parameters/http-parameters.xhtml)
+- If the process-vary option is enabled and the response has an unknown
+  encoding (not mentioned in
+  https://www.iana.org/assignments/http-parameters/http-parameters.xhtml)
   while varying on the accept-encoding client header
 
-- If the request is not a GET
+- If the request is not a GET (a HEAD request is not stored, but may be served
+  from an object stored for a GET)
 - If the HTTP version of the request is smaller than 1.1
 - If the request contains an Authorization header
 
@@ -21341,7 +21343,7 @@ max-age <seconds>
 
 max-object-size <bytes>
   Define the maximum size of the objects to be cached. Must not be greater than
-  an half of "total-max-size". If not set, it equals to a 256th of the cache size.
+  half of "total-max-size". If not set, it equals a 256th of the cache size.
   All objects with sizes larger than "max-object-size" will not be cached.
 
 max-secondary-entries <number>
@@ -21381,16 +21383,17 @@ reserved-segments <number>
 
 process-vary <on/off>
   Enable or disable the processing of the Vary header. When disabled, a response
-  containing such a header will never be cached. When enabled, we need to calculate
-  a preliminary hash for a subset of request headers on all the incoming requests
-  (which might come with a cpu cost) which will be used to build a secondary
-  key for a given request (see RFC 7234#4.1). The secondary key is built out of
-  the contents of the 'accept-encoding', 'referer' and 'origin' headers for
-  now. Note that the 'origin' and 'referer' headers are single-valued per the
-  RFC, so a request carrying more than one occurrence of either should be
-  considered malformed. For such requests no secondary key is built and the
-  response is never delivered from the cache so that we can let the server
-  decide how to handle the situation. The default value is off (disabled).
+  containing such a header will never be cached. When enabled, we need to
+  calculate a preliminary hash for a subset of request headers on all the
+  incoming requests (which might come with a cpu cost) which will be used to
+  build a secondary key for a given request (see RFC 7234#4.1). The secondary
+  key is built out of the contents of the 'accept-encoding', 'referer' and
+  'origin' headers for now. Note that the 'origin' and 'referer' headers are
+  single-valued per the RFC, so a request carrying more than one occurrence of
+  either should be considered malformed. For such requests no secondary key is
+  built and the response is never delivered from the cache so that we can let
+  the server decide how to handle the situation. The default value is off
+  (disabled).
 
   Vary routing metadata is stored in a separate cache instance so response
   storage pressure does not evict whole segments of URL anchors. Its memory

@@ -3106,7 +3106,7 @@ show cache [stats]
   2. hash of the entry's key
   3. secondary key of the entry, all zeroes when the response has no Vary
   4. size of the object in bytes
-  5. expiration time, can be negative if already expired
+  5. seconds left before expiration; expired entries are not listed
 
   Entries holding early hints have no secondary hash. Vary anchors have a
   compact metadata payload rather than an HTTP response header; their lines
