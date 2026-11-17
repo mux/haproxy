@@ -1,0 +1,90 @@
+varnishtest "A store of a key already being stored is skipped"
+
+feature ignore_unknown_macro
+feature cmd "command -v socat"
+
+# Barriers order the exchanges: c2 only sends its request once c1 has s1's
+# response headers, so s1's entry is pending, and s1 only completes its body
+# once c2 has its whole response, so s2's store has already been skipped.
+barrier b1 cond 2
+barrier b2 cond 2
+
+server s1 {
+    rxreq
+    txresp -nolen -hdr "Transfer-Encoding: chunked" -hdr "Cache-Control: max-age=60"
+    chunkedlen 16
+    barrier b2 sync
+    chunkedlen 16
+    chunkedlen 0
+} -start
+
+server s2 {
+    rxreq
+    txresp -hdr "Cache-Control: max-age=60" -bodylen 32
+} -start
+
+haproxy h1 -conf {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+        stats socket "${tmpdir}/h1/stats" level admin
+
+    defaults
+        mode http
+        timeout connect "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout client "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout server "${HAPROXY_TEST_TIMEOUT-5s}"
+
+    frontend fe
+        bind "fd@${fe}"
+        default_backend be
+
+    backend be
+        balance roundrobin
+        http-request cache-use c
+        http-response cache-store c
+        server s1 ${s1_addr}:${s1_port}
+        server s2 ${s2_addr}:${s2_port}
+
+    cache c
+        total-max-size 4
+} -start
+
+client c1 -connect ${h1_fe_sock} {
+    txreq -url /x
+    rxresphdrs
+    expect resp.status == 200
+    barrier b1 sync
+    rxrespbody
+    expect resp.bodylen == 32
+} -start
+
+client c2 -connect ${h1_fe_sock} {
+    barrier b1 sync
+    txreq -url /x
+    rxresp
+    expect resp.status == 200
+    expect resp.bodylen == 32
+    barrier b2 sync
+} -start
+
+client c1 -wait
+client c2 -wait
+
+# Served from s1's entry: s1 and s2 have no request left to answer.
+client c3 -connect ${h1_fe_sock} {
+    txreq -url /x
+    rxresp
+    expect resp.status == 200
+    expect resp.bodylen == 32
+} -run
+
+shell {
+    set -e
+    out=$(echo 'show cache stats' | socat -t 5 "${tmpdir}/h1/stats" -)
+    echo "$out"
+    echo "$out" | grep -q '^c.reserve_inflight: 1$'
+    echo "$out" | grep -q '^c.aborts: 0$'
+    echo "$out" | grep -q '^c.publish_fails: 0$'
+}

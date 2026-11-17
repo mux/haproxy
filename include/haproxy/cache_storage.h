@@ -93,11 +93,12 @@ struct cache_stats {
 	uint64_t reclaim_elect_losses;/* Elected victims lost to a concurrent reclaimer */
 	uint64_t reclaim_blocked;     /* Elected victims skipped: writer-pinned or merge-claimed */
 	uint64_t reclaim_no_candidate;/* Scans that found segments but no electable victim */
-	uint64_t publish_fails;   /* Publishes refused: index full or entry incomplete */
+	uint64_t publish_fails;   /* Stores refused: index full or entry incomplete */
 	uint64_t read_pin_fails;  /* Read pins abandoned: the entry's slot kept being
 	                           * rewritten by same-key stores or deletes */
 	uint64_t publish_supersedes; /* Publishes that replaced a live entry of the same key */
 	uint64_t aborts;             /* Reservations abandoned unpublished */
+	uint64_t reserve_inflight;   /* Reservations declined: same key being stored */
 	uint64_t dead_bytes_cum;     /* Bytes left dead in segments until reclaim */
 	uint64_t segs_emptied;       /* Dead segments reclaimed at once, ahead of expiry or eviction */
 	uint64_t segs_expired;    /* Segments reclaimed at expiry */

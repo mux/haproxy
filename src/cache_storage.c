@@ -140,18 +140,24 @@ BUG_ON_STATIC(CACHE_TTL_MAX !=
 #define CACHE_SLOT_FREQ_MASK    (((1ULL << CACHE_SLOT_FREQ_BITS) - 1) << CACHE_SLOT_FREQ_SHIFT)
 #define CACHE_SLOT_TAG_MASK     (((1ULL << CACHE_SLOT_TAG_BITS)  - 1) << CACHE_SLOT_TAG_SHIFT)
 
-/* The counter saturates at the field's maximum. The bit between the
- * frequency and the tag is always set in a live slot, so that one never
- * encodes as all zeroes (the empty value) whatever its other fields hold.
+/* The counter saturates at the field's maximum. The pending bit marks an
+ * entry still being written: only its writer may change or clear such a slot,
+ * and every other index user skips it.
  */
 #define CACHE_SLOT_FREQ_MAX     ((1U << CACHE_SLOT_FREQ_BITS) - 1)
-#define CACHE_SLOT_LIVE         (1ULL << (CACHE_SLOT_FREQ_SHIFT + CACHE_SLOT_FREQ_BITS))
+#define CACHE_SLOT_PENDING      (1ULL << (CACHE_SLOT_FREQ_SHIFT + CACHE_SLOT_FREQ_BITS))
 
-BUG_ON_STATIC(CACHE_SLOT_FREQ_SHIFT + CACHE_SLOT_FREQ_BITS >= CACHE_SLOT_TAG_SHIFT);
+BUG_ON_STATIC(CACHE_SLOT_FREQ_SHIFT + CACHE_SLOT_FREQ_BITS + 1 != CACHE_SLOT_TAG_SHIFT);
 
-/* Accessor macros */
+/* A used slot must never encode as all zeroes, the empty value, although its
+ * tag, segment and counter may each be 0. So the offset field is one-based: it
+ * holds the record's offset in CACHE_OFF_ALIGN units plus one, and is never 0
+ * in a used slot. This costs no range. A record header must fit in the segment
+ * where its record starts, so no record starts in a segment's last unit, and
+ * the largest real start still fits the field once counted from one.
+ */
 #define CACHE_SLOT_OFF(slot)    \
-	((((slot) & CACHE_SLOT_OFF_MASK)  >> CACHE_SLOT_OFF_SHIFT) << CACHE_OFF_SHIFT)
+	(((((slot) & CACHE_SLOT_OFF_MASK) >> CACHE_SLOT_OFF_SHIFT) - 1) << CACHE_OFF_SHIFT)
 #define CACHE_SLOT_SEG(slot)    \
 	((((slot) & CACHE_SLOT_SEG_MASK)  >> CACHE_SLOT_SEG_SHIFT))
 #define CACHE_SLOT_FREQ(slot)   \
@@ -162,12 +168,11 @@ BUG_ON_STATIC(CACHE_SLOT_FREQ_SHIFT + CACHE_SLOT_FREQ_BITS >= CACHE_SLOT_TAG_SHI
 /* Creation macro. The frequency counter counts hits, so a fresh slot
  * carries 0.
  */
-#define CACHE_SLOT_MAKE(tag, seg, off, freq)                              \
-	(((uint64_t)(tag)                     << CACHE_SLOT_TAG_SHIFT)  | \
-	CACHE_SLOT_LIVE                                                 | \
-	( (uint64_t)(freq)                    << CACHE_SLOT_FREQ_SHIFT) | \
-	( (uint64_t)(seg)                     << CACHE_SLOT_SEG_SHIFT)  | \
-	(((uint64_t)(off) >> CACHE_OFF_SHIFT) << CACHE_SLOT_OFF_SHIFT))
+#define CACHE_SLOT_MAKE(tag, seg, off, freq)                                    \
+	(((uint64_t)(tag)                           << CACHE_SLOT_TAG_SHIFT)  | \
+	( (uint64_t)(freq)                          << CACHE_SLOT_FREQ_SHIFT) | \
+	( (uint64_t)(seg)                           << CACHE_SLOT_SEG_SHIFT)  | \
+	((((uint64_t)(off) >> CACHE_OFF_SHIFT) + 1) << CACHE_SLOT_OFF_SHIFT))
 
 /* CACHE_MAX_TOTAL_SIZE is public API (cache_storage.h); it must stay equal to
  * what a slot's location can address: 2^(SEG_BITS + OFF_BITS) offset units of
@@ -305,6 +310,11 @@ struct cache_record {
 	                       * CACHE_OFF_ALIGN_UP(rec_len) */
 };
 
+/* The one-based slot offset relies on no record starting in a segment's last
+ * offset unit, which holds as long as a record header fills a whole unit.
+ */
+BUG_ON_STATIC(sizeof(struct cache_record) < CACHE_OFF_ALIGN);
+
 struct cache {
 	uint32_t flags;                 /* CACHE_F_* flags */
 	struct cache_config cfg;        /* Configuration tunables */
@@ -427,11 +437,11 @@ static inline uint64_t *ht_iter_next(struct ht_iter *it, const XXH128_hash_t *ha
 }
 
 /* Similar to ht_iter_next(), except that we only return pointers to slots that
- * match the tag in <hash>. Useful for lookups. This also sets the slot's value
- * in <val>, so the caller does not need to duplicate the atomic load. Note that
- * this only matches the tag and not the full hash, so the slot we return is
- * only a candidate for the hash; the caller needs to check the full hash to
- * ensure this is the correct slot.
+ * match the tag in <hash>, skipping pending ones. Useful for lookups. This also
+ * sets the slot's value in <val>, so the caller does not need to duplicate the
+ * atomic load. Note that this only matches the tag and not the full hash, so
+ * the slot we return is only a candidate for the hash; the caller needs to
+ * check the full hash to ensure this is the correct slot.
  */
 static inline uint64_t *ht_iter_next_tag(struct ht_iter *it, const XXH128_hash_t *hash, uint64_t *val)
 {
@@ -439,7 +449,7 @@ static inline uint64_t *ht_iter_next_tag(struct ht_iter *it, const XXH128_hash_t
 
 	while ((slotp = ht_iter_next(it, hash)) != NULL) {
 		slot = HA_ATOMIC_LOAD(slotp);
-		if (slot == 0)
+		if (slot == 0 || (slot & CACHE_SLOT_PENDING))
 			continue;
 
 		if (CACHE_HASH_TAG(*hash) != CACHE_SLOT_TAG(slot))
@@ -447,6 +457,75 @@ static inline uint64_t *ht_iter_next_tag(struct ht_iter *it, const XXH128_hash_t
 
 		*val = slot;
 		return slotp;
+	}
+	return NULL;
+}
+
+/* Return the pending slot of the entry being written at <h>. Only its writer
+ * may change or clear it, so it is always found.
+ */
+static uint64_t *ht_find_pending(const struct cache *cache, const struct cache_whandle *h)
+{
+	const struct cache_record *rec = CACHE_HANDLE_REC(cache, h);
+	struct ht_iter it;
+	uint64_t *slotp, slot;
+
+	ht_iter_init(&it, cache);
+	while ((slotp = ht_iter_next(&it, &rec->hash)) != NULL) {
+		slot = _HA_ATOMIC_LOAD(slotp);
+		if ((slot & CACHE_SLOT_PENDING) &&
+		    CACHE_SLOT_SEG(slot) == h->seg_id &&
+		    CACHE_SLOT_OFF(slot) == h->seg_off)
+			return slotp;
+	}
+	/* A write handle always has a pending slot naming its record. */
+	ABORT_NOW();
+	return NULL;
+}
+
+/* Store <slot> in a free slot of one of <hash>'s two buckets, and return it, or
+ * NULL if both are full. Prefer the bucket with more free slots: two-choice
+ * hashing only delivers its load-factor benefit when inserts favor the emptier
+ * bucket, and a more balanced fill defers the day both buckets are full. The
+ * counts are racy, but they only steer the scan order; the CAS decides.
+ */
+static uint64_t *ht_insert(struct cache *cache, const XXH128_hash_t *hash, uint64_t slot)
+{
+	struct ht_bucket *b[2];
+	uint32_t mask;
+	int nfree[2];
+	int i, j;
+
+	mask = cache->index.n_buckets - 1;
+	b[0] = &cache->index.buckets[hash->high64 & mask];
+	b[1] = &cache->index.buckets[hash->low64 & mask];
+	nfree[0] = nfree[1] = 0;
+	for (i = 0; i < 2; i++)
+		for (j = 0; j < CACHE_BUCKET_N_SLOT; j++)
+			if (_HA_ATOMIC_LOAD(&b[i]->slot[j]) == 0)
+				nfree[i]++;
+
+	/* Put the buckets in scan order, emptiest first. */
+	if (nfree[1] > nfree[0]) {
+		struct ht_bucket *tmp = b[0];
+
+		b[0] = b[1];
+		b[1] = tmp;
+	}
+
+	for (i = 0; i < 2; i++) {
+		struct ht_bucket *bkt = b[i];
+
+		for (j = 0; j < CACHE_BUCKET_N_SLOT; j++) {
+			uint64_t slot2;
+
+			slot2 = HA_ATOMIC_LOAD(&bkt->slot[j]);
+			if (slot2 != 0)
+				continue;
+
+			if (HA_ATOMIC_CAS(&bkt->slot[j], &slot2, slot))
+				return &bkt->slot[j];
+		}
 	}
 	return NULL;
 }
@@ -763,9 +842,11 @@ retry:
 		slot = slot2;
 
 		/* We need to validate again that this slot still
-		 * matches our tag and is not empty, since it changed.
+		 * matches our tag and is neither empty nor pending, since
+		 * it changed.
 		 */
-		if (slot != 0 && likely(hash != NULL) &&
+		if (slot != 0 && !(slot & CACHE_SLOT_PENDING) &&
+		    likely(hash != NULL) &&
 		    CACHE_SLOT_TAG(slot) == CACHE_HASH_TAG(*hash)) {
 			if (++tries < CACHE_READ_PIN_TRIES)
 				goto retry;
@@ -2384,7 +2465,9 @@ static inline void cache_reclaim_done(struct cache *cache,
  * becomes the new tail, its free space open to the stores that follow, and the
  * old tail is closed as a rollover would close it. Neither case takes a segment
  * from the pool. Entries spanning several segments stay private, see
- * cache_publish_private(). Returns the handle to publish.
+ * cache_publish_private(). Returns the handle to publish. A copied record's
+ * private segment stays write-pinned: the caller frees it once the entry's slot
+ * no longer names it.
  */
 static struct cache_whandle seg_relocate(struct cache *cache, const struct cache_whandle *h)
 {
@@ -2411,8 +2494,6 @@ static struct cache_whandle seg_relocate(struct cache *cache, const struct cache
 			HA_SPIN_UNLOCK(CACHE_TTLB_LOCK, &ttlb->lock);
 
 			memcpy(CACHE_HANDLE_REC(cache, &nh), rec, rec->rec_len);
-			seg_write_unpin(seg);
-			seg_free_push(cache, h->seg_id);
 			return nh;
 		}
 	}
@@ -2693,7 +2774,7 @@ void cache_delete(struct cache *cache, const struct cache_key *key)
 			}
 			else
 				seg_read_unpin(cache, &cache->segments[h.seg_id]);
-		} while (!removed && slot != 0 &&
+		} while (!removed && slot != 0 && !(slot & CACHE_SLOT_PENDING) &&
 		         CACHE_SLOT_TAG(slot) == CACHE_HASH_TAG(key->hash));
 
 		/* Keep scanning: racing first-time stores of the same key can
@@ -2703,6 +2784,35 @@ void cache_delete(struct cache *cache, const struct cache_key *key)
 	}
 }
 
+/* Give up on the entry being written at <h>, after clearing its pending slot
+ * <slotp> if it has one. A private chain has no reader and sits in no list yet:
+ * it goes straight back to the pool. Bytes reserved in a shared segment lie
+ * dead until it is reclaimed.
+ */
+static void cache_drop(struct cache *cache, const struct cache_whandle *h,
+                       uint64_t *slotp)
+{
+	struct seg *seg = &cache->segments[h->seg_id];
+	unsigned int ttl_bucket;
+	uint32_t state_gen;
+
+	if (slotp != NULL)
+		HA_ATOMIC_STORE(slotp, 0);
+
+	if (seg->flags & SEG_F_PRIVATE) {
+		seg_write_unpin(seg);
+		seg_free_push(cache, h->seg_id);
+		return;
+	}
+
+	_HA_ATOMIC_ADD(&cache->stats.dead_bytes_cum,
+	               CACHE_OFF_ALIGN_UP(CACHE_HANDLE_REC(cache, h)->rec_len));
+	ttl_bucket = seg->ttl_bucket;
+	state_gen = _HA_ATOMIC_LOAD(&seg->state_gen);
+	seg_write_unpin(seg);
+	seg_check_dead(cache, h->seg_id, ttl_bucket, state_gen);
+}
+
 struct cache_whandle cache_reserve(struct cache *cache, const struct cache_key *key,
                                    size_t data_len, time_t expire)
 {
@@ -2710,8 +2820,10 @@ struct cache_whandle cache_reserve(struct cache *cache, const struct cache_key *
 	struct cache_record *rec;
 	struct cache_reclaim_ctx rc;
 	struct ttl_bucket *ttlb;
+	struct ht_iter it;
+	uint64_t *slotp, slot;
 	size_t total_len;
-	unsigned int n_segs;
+	unsigned int n_segs, n_free;
 	uint32_t ttl;
 
 	if (expire <= date.tv_sec)
@@ -2743,6 +2855,30 @@ struct cache_whandle cache_reserve(struct cache *cache, const struct cache_key *
 		total_len = CACHE_OFF_ALIGN_UP(data_len);
 	}
 
+	/* Check the key's buckets before reserving anything: a store of the
+	 * same key in flight makes this one redundant, and without a free
+	 * slot the entry could not be indexed. A tag match is enough, a false
+	 * one only skips a store. Both checks are racy: two stores of a key
+	 * starting together may both proceed, and the insertion below decides
+	 * whether a slot is left.
+	 */
+	n_free = 0;
+	ht_iter_init(&it, cache);
+	while ((slotp = ht_iter_next(&it, &key->hash)) != NULL) {
+		slot = HA_ATOMIC_LOAD(slotp);
+		if (slot == 0)
+			n_free++;
+		else if ((slot & CACHE_SLOT_PENDING) &&
+		         CACHE_SLOT_TAG(slot) == CACHE_HASH_TAG(key->hash)) {
+			_HA_ATOMIC_INC(&cache->stats.reserve_inflight);
+			return CACHE_WHANDLE_NULL;
+		}
+	}
+	if (n_free == 0) {
+		_HA_ATOMIC_INC(&cache->stats.publish_fails);
+		return CACHE_WHANDLE_NULL;
+	}
+
 	ttl = expire - date.tv_sec;
 	if (ttl > CACHE_TTL_MAX)
 		ttl = CACHE_TTL_MAX;
@@ -2772,6 +2908,16 @@ struct cache_whandle cache_reserve(struct cache *cache, const struct cache_key *
 	rec->rec_len = data_len;
 	rec->expire = expire;
 	rec->hash = key->hash;
+
+	/* Index the entry right away, pending: lookups skip it until it is
+	 * published, while stores of the same key see it in flight.
+	 */
+	slot = CACHE_SLOT_MAKE(CACHE_HASH_TAG(key->hash), h.seg_id, h.seg_off, 0);
+	if (!ht_insert(cache, &key->hash, slot | CACHE_SLOT_PENDING)) {
+		_HA_ATOMIC_INC(&cache->stats.publish_fails);
+		cache_drop(cache, &h, NULL);
+		return CACHE_WHANDLE_NULL;
+	}
 
 	return h;
 }
@@ -2865,32 +3011,13 @@ int cache_write(struct cache *cache, struct cache_whandle *h,
 	return 0;
 }
 
-/* Abort a write. A private chain has no reader and sits in no list yet:
- * it goes straight back to the pool. Bytes reserved in a shared segment
- * lie dead until it is reclaimed.
- */
+/* Abort a write. */
 void cache_abort(struct cache *cache, const struct cache_whandle *h)
 {
-	struct seg *seg = &cache->segments[h->seg_id];
-	unsigned int ttl_bucket;
-	uint32_t state_gen;
-
 	BUG_ON_BAD_HANDLE(cache, h);
 
 	_HA_ATOMIC_INC(&cache->stats.aborts);
-
-	if (seg->flags & SEG_F_PRIVATE) {
-		seg_write_unpin(seg);
-		seg_free_push(cache, h->seg_id);
-		return;
-	}
-
-	_HA_ATOMIC_ADD(&cache->stats.dead_bytes_cum,
-	               CACHE_OFF_ALIGN_UP(CACHE_HANDLE_REC(cache, h)->rec_len));
-	ttl_bucket = seg->ttl_bucket;
-	state_gen = _HA_ATOMIC_LOAD(&seg->state_gen);
-	seg_write_unpin(seg);
-	seg_check_dead(cache, h->seg_id, ttl_bucket, state_gen);
+	cache_drop(cache, h, ht_find_pending(cache, h));
 }
 
 /* Link a just-published private chain into its bucket's list, where expiry
@@ -2918,20 +3045,19 @@ int cache_publish(struct cache *cache, const struct cache_whandle *h)
 	struct cache_rhandle rh;
 	struct cache_whandle moved;
 	struct cache_record *rec;
-	struct ht_bucket *b[2];
 	struct seg *seg;
-	uint64_t *slotp, slot;
-	uint64_t old;
-	uint32_t mask, state_gen;
+	uint64_t *slotp, *oldp, slot, old;
+	uint32_t state_gen;
 	unsigned int ttl_bucket;
+	seg_id_t reserved_id;
 	uint16_t tag;
-	int nfree[2];
-	int i, j;
 
 	BUG_ON_BAD_HANDLE(cache, h);
 
 	rec = CACHE_HANDLE_REC(cache, h);
 	seg = &cache->segments[h->seg_id];
+	slotp = ht_find_pending(cache, h);
+	reserved_id = h->seg_id;
 
 	if (seg->flags & SEG_F_NO_LEN) {
 		BUG_ON(h->seg_off != 0);
@@ -2983,27 +3109,26 @@ int cache_publish(struct cache *cache, const struct cache_whandle *h)
 	tag = CACHE_HASH_TAG(rec->hash);
 	slot = CACHE_SLOT_MAKE(tag, h->seg_id, h->seg_off, 0);
 
-	/* First look for an existing entry with the same key and replace it
-	 * in place, so that a key only ever has one live slot: a re-store of
-	 * a known key (e.g. refreshing an expired entry) must supersede the
-	 * old copy, not leave it indexed next to the new one. If we lose the
-	 * replacement CAS, we retry the same slot rather than falling through:
-	 * the value can only have changed to the same entry with a bumped
-	 * frequency counter, to a concurrent store of this very key (which we
-	 * must supersede too, one winner), to empty, or to an unrelated tag -
-	 * the latter two let us resume the scan.
+	/* Clear the published copies of the key before exposing this one, so
+	 * that a re-store (e.g. refreshing an expired entry) supersedes the old
+	 * copy instead of staying indexed next to it. If we lose a clearing
+	 * CAS, we retry the same slot: the value can only have changed to the
+	 * same entry with a bumped frequency counter, to another copy of this
+	 * key, which we clear too, or to something we skip. Two stores of a key
+	 * publishing at once may each miss the other's copy and leave both
+	 * indexed; lookups and deletes handle duplicates.
 	 */
 	ht_iter_init(&it, cache);
-	while ((slotp = ht_iter_next_tag(&it, &rec->hash, &old)) != NULL) {
+	while ((oldp = ht_iter_next_tag(&it, &rec->hash, &old)) != NULL) {
 		do {
-			rh = seg_read_pin(cache, &rec->hash, slotp, &old, 0);
+			rh = seg_read_pin(cache, &rec->hash, oldp, &old, 0);
 			if (CACHE_HANDLE_ERR(rh))
 				break;
 			/* Same key, verified: supersede it. A replaced live
 			 * copy is a concurrent store's loser, counted as dead
 			 * bytes; a replaced expired one is a plain refresh.
 			 */
-			if (HA_ATOMIC_CAS(slotp, &old, slot)) {
+			if (HA_ATOMIC_CAS(oldp, &old, 0)) {
 				struct cache_record *oldrec = CACHE_HANDLE_REC(cache, &rh);
 				struct seg *oldseg = &cache->segments[rh.seg_id];
 				/* Read while pinned: once unpinned the segment may
@@ -3011,10 +3136,6 @@ int cache_publish(struct cache *cache, const struct cache_whandle *h)
 				 */
 				int old_private = oldseg->flags & SEG_F_PRIVATE;
 
-				if (seg->flags & SEG_F_PRIVATE)
-					cache_publish_private(cache, h->seg_id);
-				else
-					seg_live_add(seg, rec);
 				if (!old_private)
 					seg_live_sub(oldseg, oldrec);
 				if (date.tv_sec < oldrec->expire) {
@@ -3025,80 +3146,34 @@ int cache_publish(struct cache *cache, const struct cache_whandle *h)
 				ttl_bucket = oldseg->ttl_bucket;
 				state_gen = _HA_ATOMIC_LOAD(&oldseg->state_gen);
 				seg_read_unpin(cache, oldseg);
-				seg_write_unpin(seg);
 				if (!old_private)
 					seg_check_dead(cache, rh.seg_id, ttl_bucket, state_gen);
-				return 0;
+				break;
 			}
 			seg_read_unpin(cache, &cache->segments[rh.seg_id]);
-		} while (old != 0 && CACHE_SLOT_TAG(old) == tag);
+		} while (old != 0 && !(old & CACHE_SLOT_PENDING) &&
+		         CACHE_SLOT_TAG(old) == tag);
 	}
 
-	/* Find a free item slot. Between the two candidate buckets, prefer the
-	 * one with more free slots: two-choice hashing only delivers its
-	 * load-factor benefit when inserts favor the emptier bucket, and a
-	 * more balanced fill defers the day both buckets are full - a failed
-	 * publish permanently wastes the reserved bytes. The counts are racy,
-	 * but they only steer the scan order; the CAS decides.
+	/* The release store orders the record's contents before the slot that
+	 * exposes them.
 	 */
-	mask = cache->index.n_buckets - 1;
-	b[0] = &cache->index.buckets[rec->hash.high64 & mask];
-	b[1] = &cache->index.buckets[rec->hash.low64 & mask];
-	nfree[0] = nfree[1] = 0;
-	for (i = 0; i < 2; i++)
-		for (j = 0; j < CACHE_BUCKET_N_SLOT; j++)
-			if (_HA_ATOMIC_LOAD(&b[i]->slot[j]) == 0)
-				nfree[i]++;
+	HA_ATOMIC_STORE(slotp, slot);
+	if (seg->flags & SEG_F_PRIVATE)
+		cache_publish_private(cache, h->seg_id);
+	else
+		seg_live_add(seg, rec);
+	seg_write_unpin(seg);
 
-	/* Put the buckets in scan order, emptiest first. */
-	if (nfree[1] > nfree[0]) {
-		struct ht_bucket *tmp = b[0];
-
-		b[0] = b[1];
-		b[1] = tmp;
+	if (h->seg_id != reserved_id) {
+		seg_write_unpin(&cache->segments[reserved_id]);
+		seg_free_push(cache, reserved_id);
 	}
+	return 0;
 
-	for (i = 0; i < 2; i++) {
-		struct ht_bucket *bkt = b[i];
-
-		for (j = 0; j < CACHE_BUCKET_N_SLOT; j++) {
-			uint64_t slot2;
-
-			slot2 = HA_ATOMIC_LOAD(&bkt->slot[j]);
-			if (slot2 != 0)
-				continue;
-
-			/* We found a free slot, try to claim it. */
-			if (!HA_ATOMIC_CAS(&bkt->slot[j], &slot2, slot))
-				continue;
-
-			if (seg->flags & SEG_F_PRIVATE)
-				cache_publish_private(cache, h->seg_id);
-			else
-				seg_live_add(seg, rec);
-			seg_write_unpin(seg);
-			return 0;
-		}
-	}
-
-	/* We didn't find a free slot. A private chain, in no list yet, goes
-	 * back to the pool; bytes reserved in a shared segment are dead space,
-	 * as data may already sit past them.
-	 */
 fail:
 	_HA_ATOMIC_INC(&cache->stats.publish_fails);
-
-	if (seg->flags & SEG_F_PRIVATE) {
-		seg_write_unpin(seg);
-		seg_free_push(cache, h->seg_id);
-		return -1;
-	}
-	_HA_ATOMIC_ADD(&cache->stats.dead_bytes_cum,
-	               CACHE_OFF_ALIGN_UP(rec->rec_len));
-	ttl_bucket = seg->ttl_bucket;
-	state_gen = _HA_ATOMIC_LOAD(&seg->state_gen);
-	seg_write_unpin(seg);
-	seg_check_dead(cache, h->seg_id, ttl_bucket, state_gen);
+	cache_drop(cache, h, slotp);
 	return -1;
 }
 
@@ -3118,6 +3193,7 @@ void cache_get_stats(const struct cache *cache, struct cache_stats *stats)
 	stats->segs_evicted = _HA_ATOMIC_LOAD(&cache->stats.segs_evicted);
 	stats->publish_supersedes = _HA_ATOMIC_LOAD(&cache->stats.publish_supersedes);
 	stats->aborts = _HA_ATOMIC_LOAD(&cache->stats.aborts);
+	stats->reserve_inflight = _HA_ATOMIC_LOAD(&cache->stats.reserve_inflight);
 	stats->dead_bytes_cum = _HA_ATOMIC_LOAD(&cache->stats.dead_bytes_cum);
 	stats->segs_emptied = _HA_ATOMIC_LOAD(&cache->stats.segs_emptied);
 	stats->merges = _HA_ATOMIC_LOAD(&cache->merge_success);
@@ -3178,7 +3254,7 @@ int cache_foreach(struct cache *cache, struct cache_iter *it,
 
 		slotp = &cache->index.buckets[bucket_idx].slot[slot_idx];
 		slot = _HA_ATOMIC_LOAD(slotp);
-		if (slot != 0) {
+		if (slot != 0 && !(slot & CACHE_SLOT_PENDING)) {
 			h = seg_read_pin(cache, NULL, slotp, &slot, 1);
 			if (!CACHE_HANDLE_ERR(h)) {
 				yield = cb(cache, &h, data);

@@ -127,10 +127,11 @@ in the slot itself.
   makes the count configurable up to eight, defaulting to two; here the two
   halves of the digest give two for free.
 - **A full bucket pair fails the insert.** With all sixteen slots taken the
-  publish fails and the entry is not cached, which keeps the index a flat, fixed
-  array with no pointer-chasing. Full pairs are rare with two choices, and the
-  failure costs the bytes already reserved for the record, which stay dead until
-  their segment is reclaimed.
+  reservation fails and the entry is not cached, which keeps the index a flat,
+  fixed array with no pointer-chasing. Full pairs are rare with two choices.
+  The reservation checks for a free slot before taking any space, so only a
+  slot taken in between costs reserved bytes, which stay dead until their
+  segment is reclaimed.
 - **The tag.** Before touching a record, a lookup compares the slot's tag to the
   key's. Only on a tag match does it pin the segment -- an atomic increment of
   the segment's reference count plus a sequentially consistent load -- and read
@@ -139,10 +140,19 @@ in the slot itself.
   atomics of pinning. Since most candidates in a well-distributed table do not
   match, this is a large saving.
 
-An all-zero slot means "empty", so a live slot is kept non-zero by construction:
-the bit between the frequency counter (below) and the tag is always set, while
-the tag, location and counter fields can all legitimately be 0. This lets the
-empty check be a single comparison against zero.
+An all-zero slot means "empty", so the offset field counts 8-byte units from one
+rather than zero, and is never 0 in a used slot. No record starts in a segment's
+last unit, its header would not fit, so this costs no range. The empty check is
+then a single comparison against zero.
+
+An entry is indexed when its space is reserved, with a pending bit set until
+it is published. Lookups, purges and listings skip pending slots, and only the
+entry's writer changes or clears one: publishing clears the bit, aborting
+clears the slot. A pending slot always names a segment its writer pins, so
+reclamation never meets one. A reservation that finds a pending slot with its
+key's tag declines, so concurrent misses on one URL store it once instead of
+each reserving a full copy. A tag match is enough there, as a false one only
+skips a store.
 
 ## Concurrency & scalability
 
@@ -177,15 +187,15 @@ whether to serve from a segment on its way out. `cache_delete()` skips it, so
 that a purge cannot miss an entry whose segment is transiently draining.
 
 The slot also carries Segcache's per-item frequency counter (the ASFC) in seven
-bits between the location and the tag. It counts hits, so it starts at 0 when a
-record is published or relocated by a merge: the records of a merged segment
-then compete on the hits they gather from that point, and a record that stopped
-being hot cannot outlive its popularity by several merges. A served hit bumps it
-with a single compare-and-swap -- exactly for the first sixteen hits, then with
-probability 1/count, so a hot entry soon stops rewriting its slot -- and a lost
-bump is dropped: the counter is approximate. A reader revalidating its pin
-ignores the counter bits, and the compare-and-swaps that clear or replace a slot
-retry while it still names the same record.
+bits between the location and the pending bit. It counts hits, so it starts at 0
+when a record is published or relocated by a merge: the records of a merged
+segment then compete on the hits they gather from that point, and a record that
+stopped being hot cannot outlive its popularity by several merges. A served hit
+bumps it with a single compare-and-swap -- exactly for the first sixteen hits,
+then with probability 1/count, so a hot entry soon stops rewriting its slot --
+and a lost bump is dropped: the counter is approximate. A reader revalidating
+its pin ignores the counter bits, and the compare-and-swaps that clear or
+replace a slot retry while it still names the same record.
 
 One narrow exception keeps the no-lock claim honest: a segment reclaimed while
 readers still hold pins is *condemned* and handed to its last reader, whose
