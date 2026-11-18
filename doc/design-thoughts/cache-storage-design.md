@@ -308,27 +308,28 @@ what it earns from now on. Carrying part of the count forward keeps records that
 stopped being popular ahead of newcomers, and retained less on production
 traces.
 
-Demand-driven expiration counts physical records examined, including dead and
-aborted records. Let E be the segment size divided by the configured mean object
-size, rounded up, and N the segments needed for the maximum object size,
-including its record header. The minimum is 4E records and the maximum is E
-multiplied by N clamped between 4 and 32. Without a configured object limit, the
-arena capacity supplies N. Thresholds are initialized only on reservation
-pressure and shared across all rounds of one reservation or streaming growth
-operation. Whole segments and private chains stay indivisible, so the final unit
-can overrun the maximum. Descriptor walks and lock waiting are not bounded by
-this record count. `cache_expire()` still walks full expired prefixes.
+A reservation, or a growth step of a private entry, needs one segment, and
+reclaims in units that are never interrupted: expiring or evicting a segment or
+a private chain, or a whole merge. A reclaim budget of 1024 records bounds how
+many units it runs. It counts the physical records those units examine,
+including dead and aborted ones, and the scans of the TTL buckets: a scan reads
+every bucket head, which costs about as much as 16 records on x86, plus a record
+for every four buckets it locks and searches. The first unit always starts, so
+that every reservation can make progress; later ones start only while the
+budget lasts, and the last one may overrun it. A reservation therefore walks at
+most the budget plus one unit, the largest being a merge. Lock waiting is not
+bounded. `cache_expire()` still walks full expired prefixes.
 
 A reservation short of free segments reclaims space in two steps:
 
 - **Expire first.** Within each TTL bucket, visit private chains before shared
-  segments. Continue after satisfying demand until the minimum record count, but
-  stop at the maximum even if supply is insufficient. Writer-pinned segments are
-  skipped. Reader-pinned segments are unindexed and condemned: they consume
-  record work but do not supply free segments yet. No live data is evicted just
-  to reach the minimum. If no more expired records are found, stop batching.
-- **Then merge around the oldest.** If expiration falls short, budget spent or
-  not, elect an old safe victim. Each bucket has a shared and a private
+  segments. Once demand is satisfied, keep expiring while the budget lasts: the
+  records are unindexed once either way, and each segment freed early spares a
+  later reservation a scan. Writer-pinned segments are skipped. Reader-pinned
+  segments are unindexed and condemned: they cost their records but do not
+  supply free segments yet. No live data is evicted to free segments early.
+- **Then merge around the oldest.** If expiration falls short, budget allowing,
+  elect an old safe victim. Each bucket has a shared and a private
   queue. Within a bounded 64-descriptor search of each queue, skip claimed and
   write-pinned segments, then elect the oldest candidate across buckets.
   Unindexing parses record headers, so a write pin means a candidate cannot be
@@ -392,13 +393,13 @@ keeps aborting a large download -- a health check fetching a big file every
 second is the real-world case -- fills the cache with dead segments at its own
 pace and pushes live ones out ahead of them.
 
-The expiration record budget bounds expiration only. Once it is spent, the
-round stops expiring and still runs its merge or eviction, and the later rounds
-of the same reservation go straight to eviction. The reservation is retried
-even after the last allowed reclaim round. The attempt and busy-round limits bound
-the total work; eviction and merging are not counted as expiration records.
-Each retry uses the pool's current supply rather than a cumulative count that
-other reservations may already have consumed.
+A reservation scans again when contention left it short: another reservation
+took the freed segment, the victim was pinned, or an election was lost. Every
+scan is charged to the budget, so a reservation that keeps losing segments to
+others gives up once it is spent. A merge is a single unit: stopping it early
+would leave its destination half empty, so the budget never cuts it short. Each
+retry uses the pool's current supply rather than a cumulative count that other
+reservations may already have consumed.
 
 ### Why not a popularity admission filter
 
@@ -441,11 +442,14 @@ and the copy, when it happens, is a single memcpy on the writer's thread of
 bytes written once already. Only chains stay private.
 
 Private segments are also what makes entries larger than a segment possible.
-When a write runs past the end of a private entry's reservation, the engine
-takes more segments from the free pool and splices them onto the tail of the
-entry's chain. A **jumbo** entry is one that has grown this way, or one whose
-known length exceeded a segment and was reserved as a chain in one step: either
-way, a chain of segments private to that single entry.
+When a write runs past the end of a private entry's chain, the engine takes more
+segments from the free pool and splices them onto its tail. A **jumbo** entry is
+one that has grown this way: of unknown length, or of a known length exceeding a
+segment, which is reserved with its first segment only and grows the same way as
+its data arrives. Either way, it is a chain of segments private to that single
+entry. Growing one segment at a time gives each step the same budget, whatever
+the entry's size, at the cost of a store that may fail partway, its data already
+written.
 
 That is a deliberate departure from both Segcache implementations, which simply
 refuse to cache an object larger than a segment. HTTP object sizes vary

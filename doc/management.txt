@@ -3138,8 +3138,8 @@ show cache [stats]
                                reservation
      reserve_fail_giveup       Of those, the ones finding nothing left to
                                reclaim (free, being written, or draining)
-     reserve_fail_attempts     Of those, the ones that ran out of attempts
-     reserve_fail_busy         Of those, the ones making no progress
+     reserve_fail_budget       Of those, the ones that spent their reclaim
+                               budget
      reserve_merging_rescued   Reservations sent back for one final attempt
                                that space returned by a merger satisfied; a
                                high count means the final check rarely fails

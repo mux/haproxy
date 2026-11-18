@@ -87,8 +87,7 @@ struct cache_stats {
 	uint64_t reserve_fails;   /* Reservations refused, merge declines included */
 	uint64_t reserve_fail_giveup;     /* ... because no listed segment was left:
 	                                   * all free, unpublished or condemned */
-	uint64_t reserve_fail_attempts;   /* ... because the attempts cap was reached */
-	uint64_t reserve_fail_busy;       /* ... because consecutive rounds made no progress */
+	uint64_t reserve_fail_budget;     /* ... because the reclaim budget was spent */
 	uint64_t reclaim_calls;       /* Reclaim scans started */
 	uint64_t reclaim_elect_losses;/* Elected victims lost to a concurrent reclaimer */
 	uint64_t reclaim_blocked;     /* Elected victims skipped: writer-pinned or merge-claimed */

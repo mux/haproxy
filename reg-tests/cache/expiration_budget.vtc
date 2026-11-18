@@ -1,4 +1,4 @@
-varnishtest "Demand expiration batches records without draining the prefix"
+varnishtest "Demand expiration continues past the need within the budget"
 
 feature ignore_unknown_macro
 feature cmd "command -v socat"
@@ -53,7 +53,8 @@ client c1 -connect ${h1_fe_sock} {
     }
     delay 3
 
-    # E=16 and Nmax=1 clamp the factor to four, giving 64 records.
+    # One scan and 256 single-record segments fit in the budget: the
+    # reservation needing one segment expires them all.
     txreq
     rxresp
     expect resp.status == 200
@@ -65,8 +66,8 @@ shell {
     out=$(echo 'show cache stats' | socat -t 5 "${tmpdir}/h1/stats" -)
     echo "$out"
     echo "$out" | grep -q '^budget.n_segs: 256$'
-    echo "$out" | grep -q '^budget.segs_expired: 64$'
-    echo "$out" | grep -q '^budget.n_free: 63$'
+    echo "$out" | grep -q '^budget.segs_expired: 256$'
+    echo "$out" | grep -q '^budget.n_free: 255$'
     echo "$out" | grep -q '^budget.reclaim_calls: 1$'
     echo "$out" | grep -q '^budget.segs_evicted: 0$'
     echo "$out" | grep -q '^budget.reserve_fails: 0$'
