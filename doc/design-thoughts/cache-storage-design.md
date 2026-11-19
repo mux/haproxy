@@ -46,7 +46,7 @@ segment, instead get segments of their own; both cases are covered under
 
 The segment size is derived, not configured directly: `mean-object-size`,
 `segment-max-entries` and `total-max-size` determine it, and the product of the
-first two is what selects the upper bound. Sizing targets 64 segments, with a
+first two is what selects the upper bound. Sizing targets 2048 segments, with a
 lower target of 16 mean-sized objects per segment and at least 16 segments when
 possible. It caps size at `segment-max-entries` (256 by default) times
 `mean-object-size`, then rounds down to a power of two. Sizes that would leave a

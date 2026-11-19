@@ -111,7 +111,7 @@ BUG_ON_STATIC(CACHE_TTL_MAX !=
  * precedence over the expected-entry ceiling.
  */
 #define CACHE_SEG_AUTO_MAX      CACHE_SEG_MAX_SIZE
-#define CACHE_SEG_AUTO_TARGET   64
+#define CACHE_SEG_AUTO_TARGET   2048
 #define CACHE_SEG_AUTO_MIN_OBJS CACHE_SEG_MIN_ENTRIES
 #define CACHE_SEG_AUTO_MIN_SEGS 16
 

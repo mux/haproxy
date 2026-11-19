@@ -68,19 +68,19 @@ haproxy h1 -conf {
         http-response cache-store small_default
         http-request return status 200
 
-    # Default cap: 128 * 256 = 32768 bytes, versus the former 256 KiB.
+    # Default cap: 128 * 256 = 32768 bytes, versus 65536 from the capacity.
     cache small_default
-        total-max-size 16
+        total-max-size 128
         mean-object-size 128
 
     cache small_override
-        total-max-size 16
+        total-max-size 128
         mean-object-size 128
         segment-max-entries 512
 
     # 128 * 300 = 38400, rounded down to 32768.
     cache non_power
-        total-max-size 16
+        total-max-size 128
         mean-object-size 128
         segment-max-entries 300
 
@@ -90,13 +90,14 @@ haproxy h1 -conf {
         mean-object-size 128
         segment-max-entries 16
 
-    # The default 4 KiB mean now caps auto sizing at 1 MiB.
+    # With the default 4 KiB mean, the capacity selects 128 KiB.
     cache normal_default
-        total-max-size 128
+        total-max-size 256
 
+    # 4096 * 16 = 65536.
     cache normal_override
-        total-max-size 128
-        segment-max-entries 512
+        total-max-size 256
+        segment-max-entries 16
 
     # Keep at least 16 segments when the mean-based lower target is large.
     cache few_objects
@@ -125,13 +126,13 @@ shell {
     set -e
     out=$(echo 'show cache stats' | socat -t 5 "${tmpdir}/h1/stats" -)
     echo "$out"
-    echo "$out" | grep -q '^small_default.n_segs: 512$'
-    echo "$out" | grep -q '^small_override.n_segs: 256$'
-    echo "$out" | grep -q '^non_power.n_segs: 512$'
+    echo "$out" | grep -q '^small_default.n_segs: 4096$'
+    echo "$out" | grep -q '^small_override.n_segs: 2048$'
+    echo "$out" | grep -q '^non_power.n_segs: 4096$'
     echo "$out" | grep -q '^minimum.n_segs: 4096$'
-    echo "$out" | grep -q '^normal_default.n_segs: 128$'
-    echo "$out" | grep -q '^normal_override.n_segs: 64$'
+    echo "$out" | grep -q '^normal_default.n_segs: 2048$'
+    echo "$out" | grep -q '^normal_override.n_segs: 4096$'
     echo "$out" | grep -q '^few_objects.n_segs: 16$'
-    echo "$out" | grep -q '^small_arena.n_segs: 64$'
+    echo "$out" | grep -q '^small_arena.n_segs: 256$'
     echo "$out" | grep -q '^byte_ceiling.n_segs: 16$'
 }

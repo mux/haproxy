@@ -21424,7 +21424,7 @@ segment-max-entries <number>
   a sizing estimate, not a runtime limit on the number of physical records.
 
   The segment size is derived from this value, "mean-object-size" and
-  "total-max-size". Sizing targets 64 segments, keeps at least 16 of them, and
+  "total-max-size". Sizing targets 2048 segments, keeps at least 16 of them, and
   otherwise keeps at least 16 mean objects in a segment. The result is then
   bounded above by "segment-max-entries" times "mean-object-size", rounded down
   to a power of two. It is also never above 8388608 bytes (8 MB), the largest
