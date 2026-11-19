@@ -328,41 +328,39 @@ A reservation short of free segments reclaims space in two steps:
   later reservation a scan. Writer-pinned segments are skipped. Reader-pinned
   segments are unindexed and condemned: they cost their records but do not
   supply free segments yet. No live data is evicted to free segments early.
-- **Then merge around the oldest.** If expiration falls short, budget allowing,
-  elect an old safe victim. Each bucket has a shared and a private
+- **Then evict from one queue.** If expiration falls short, budget allowing,
+  elect a queue and a safe victim in it. Each bucket has a shared and a private
   queue. Within a bounded 64-descriptor search of each queue, skip claimed and
-  write-pinned segments, then elect the oldest candidate across buckets.
-  Unindexing parses record headers, so a write pin means a candidate cannot be
-  reclaimed safely. A private candidate is a chain owned by one entry and can
-  only be evicted whole. A shared candidate hands its bucket to the merge, which
-  examines up to sixteen segments from where the previous merge stopped, then,
-  if needed, up to sixteen from the head towards that resume point. A run
-  already in progress may finish across it, rechecking at most two segments.
-  Without a distinct resume point, it examines up to 32 from the head. A run
-  needs at least three consecutive eligible segments: neither the write tail nor
-  being written, and more than twenty seconds from expiry. They are merged into
-  a destination taken from a small reserve of `reserved-segments` segments,
-  defaulting to min(nbthread, 4) further capped at a 64th of the segment count
-  (floored at one), that ordinary reservations leave alone so a merge can always
-  run. The destination keeps its oldest source's creation time, so that it
-  expires no later than any record it holds, and also records when it was
-  merged. The election ranks segments by the later of the two: a merged segment
-  counts as young, so older private chains come up for eviction first. The
-  sources return to the pool, unless a reader still pins them, in which
-  case they are condemned and their return is delayed until that reader unpins
-  -- which is why a burst of merges can want more destinations than there are
-  concurrent merges, and why `merges_no_dst` and `segs_condemned` are reported.
-  Without a run or destination, use a bounded safe FIFO victim only when no
-  merger is active in the arena. If any bucket's merger is producing supply,
-  decline storage instead of evicting useful content or waiting for it, unless
-  the victim expires within twenty seconds: it could not be merged and has
-  little left to give. Read pins do not block reclamation; a victim held by
-  readers is condemned and handed to its last reader. With
-  `reserved-segments 0`, ordinary reservations may consume the entire pool: no
-  destination is held aside. Merging is still attempted, and succeeds whenever a
-  segment happens to be free when the merge needs one; it is just more likely to
-  find none and fall back to whole-segment eviction. The separate
-  `CACHE_F_NO_MERGE` flag disables merging explicitly.
+  write-pinned segments, then elect one queue across buckets: see *Which queue
+  gives up space* and *What leaves the elected queue* below. Unindexing parses
+  record headers, so a write pin means a candidate cannot be reclaimed safely. A
+  private candidate is a chain owned by one entry and can only be evicted whole.
+  A shared candidate hands its bucket to the merge, which examines up to sixteen
+  segments from where the previous merge stopped, then, if needed, up to sixteen
+  from the head towards that resume point. A run already in progress may finish
+  across it, rechecking at most two segments. Without a distinct resume point,
+  it examines up to 32 from the head. A run needs at least three consecutive
+  eligible segments: neither the write tail nor being written, and more than
+  twenty seconds from expiry. They are merged into a destination taken from a
+  small reserve of `reserved-segments` segments, defaulting to min(nbthread, 4)
+  further capped at a 64th of the segment count (floored at one), that ordinary
+  reservations leave alone so a merge can always run. The destination keeps its
+  oldest source's creation time, so that it expires no later than any record it
+  holds. The sources return to the pool, unless a reader still pins them, in
+  which case they are condemned and their return is delayed until that reader
+  unpins -- which is why a burst of merges can want more destinations than there
+  are concurrent merges, and why `merges_no_dst` and `segs_condemned` are
+  reported. Without a run or destination, use a bounded safe FIFO victim only
+  when no merger is active in the arena. If any bucket's merger is producing
+  supply, decline storage instead of evicting useful content or waiting for it,
+  unless the victim expires within twenty seconds: it could not be merged and
+  has little left to give. Read pins do not block reclamation; a victim held by
+  readers is condemned and handed to its last reader. With `reserved-segments
+  0`, ordinary reservations may consume the entire pool: no destination is held
+  aside. Merging is still attempted, and succeeds whenever a segment happens to
+  be free when the merge needs one; it is just more likely to find none and fall
+  back to whole-segment eviction. The separate `CACHE_F_NO_MERGE` flag disables
+  merging explicitly.
 
 Refusal is a capacity decision, not a popularity filter. It applies only after a
 reservation and bounded expiration fail to provide usable space and the elected
@@ -401,6 +399,105 @@ would leave its destination half empty, so the budget never cuts it short. Each
 retry uses the pool's current supply rather than a cumulative count that other
 reservations may already have consumed.
 
+### Which queue gives up space
+
+Each eviction takes a segment from one queue, so the choice of queue, repeated
+at every eviction, is what divides the cache's memory between the queues: the
+shared and the private one of every TTL bucket.
+
+The aim is to give every object the same time in the cache, whichever queue
+holds it. That is what a single queue over the whole cache would do, and it
+favours no size or TTL over another. Memcached at [Facebook][fb] pursues the
+same aim between its slab classes: it moves memory to a class whose next victim
+was used more recently than the others', so that the oldest items have the same
+age in every class.
+
+That method reads the age of the item a queue is about to evict, which tells how
+long the queue keeps its content only if the queue evicts in order of age.
+Neither kind of queue does here. A merge leaves the records it keeps in their
+sources' place, under the oldest source's creation time, and a private eviction
+leaves in place the chains it spares. The head of a queue can therefore be far
+older than what the queue is giving up. Ranked by it, a queue would lose memory
+for keeping its popular content.
+
+The time a queue gives its content can be computed instead of read. A queue that
+holds 1000 segments and receives ten per second keeps a segment for 100 seconds
+on average. This is [Little's law][ll], and it holds whatever order the segments
+leave in. The election compares this **retention time**: the segments a queue
+holds, divided by the segments stored in it per second. The queue with the
+longest one gives up space.
+
+The count is in segments, not in bytes of live records. Memory is what the
+election divides, and a queue holds memory by the segment: a segment costs its
+full size whatever is still alive in it. Counted in live bytes, a queue whose
+records were deleted or replaced in place would look smaller than the memory it
+occupies, and would be spared for wasting it. A byte count would also have to
+follow every record indexed or unindexed, which happens outside the bucket's
+lock. The segment count only changes when a segment joins or leaves a queue,
+under that lock.
+
+The retention time has three properties that the age of a segment lacks:
+
+- **It gives every object the same time.** Taking space from the queue with the
+  longest retention time shortens it, so all queues settle at the same one. Each
+  then holds its store rate times that time: a queue receiving a third of what
+  is written to the cache gets a third of its memory.
+- **It keeps the two choices apart.** The records a merge retains and the chains
+  an eviction spares change neither a queue's size nor its store rate. What a
+  queue keeps is decided within its share of memory and takes nothing from the
+  other queues.
+- **It moves smoothly.** An eviction changes a queue's size by a few segments.
+  The age of a head jumps whenever the head changes, and an election ranked by
+  it swings between queues in long runs.
+
+A shared queue's retention time is halved before the comparison, so shared
+queues settle at twice the retention time of private ones. Shared queues hold
+the objects that fit in a segment and private queues the larger ones, so this
+moves memory from large objects to small ones: more objects are kept, which
+raises the hit ratio and can lower the byte hit ratio. The divisor,
+`CACHE_SHARED_AGE_DIV`, sets that balance. At one, small and large objects are
+kept equally long; below one, large objects are kept longer.
+
+The store rate is counted per second and averaged exponentially over a window as
+long as the retention time itself, bounded between one second and 4096, and of
+sixty seconds until a retention time is known. A chain counts for every segment
+in it. A merge destination is not a store: it replaces its sources. A second
+without a store counts as zero: the rate of an idle queue decays, its retention
+time grows, and it gives its memory up to the queues still being written. A
+queue without a measurable rate is ranked as if its retention time were the age
+of its candidate.
+
+### What leaves the elected queue
+
+Neither kind of queue simply gives up its head.
+
+A shared queue is merged, as described above. Each merge resumes where the
+bucket's previous one stopped, so successive merges sweep the queue from oldest
+to newest and start over. Age only decides when a segment comes up; the score of
+each record decides whether it survives.
+
+A private queue holds chains, and a chain is owned by a single entry: it is kept
+whole or evicted whole, and there is nothing to merge. The queue is swept the
+same way, by a hand that resumes where the previous eviction stopped and wraps
+from the newest chain to the oldest. For each chain, the hand reads the hit
+counter of its entry:
+
+- **Not hit** since the hand last passed, or since it was stored: the chain is
+  evicted, and the hand stops there.
+- **Hit**: the chain is spared. Its counter restarts from zero, it stays where
+  it is, and the hand moves on. It must be hit again before the hand comes back
+  to be spared again.
+
+After eight chains spared in a row, or when every chain was hit, the least-hit
+chain examined is evicted, the first on ties, so that an eviction stays bounded.
+Each chain examined costs the reclaim budget one record. This is [SIEVE][sieve]
+applied to chains. A single hit is enough to be spared: requiring more did worse
+on the traces tried. A spared chain is not moved to the newest end either: the
+queue stays in the order expiration walks it.
+
+With `CACHE_F_NO_MERGE`, neither choice applies: every queue is a plain FIFO,
+elected by the age of its head and evicted from it.
+
 ### Why not a popularity admission filter
 
 Caching an object only on its second request is common practice for HTTP caches:
@@ -427,7 +524,7 @@ segment**: a segment owned by that single entry, whose record grows as chunks
 are written and whose true length is fixed only when the entry is published.
 Records in shared segments are laid out back-to-back at reservation time and
 have no such freedom, which is why the two kinds do not mix: each TTL bucket
-keeps two segment queues, shared and private, and reclamation visits both in
+keeps two segment queues, shared and private, and expiration visits both in
 creation order.
 
 Most such entries turn out small once complete -- compressed pages and API
@@ -659,6 +756,9 @@ Two items are known and deliberately deferred.
 
 - Segcache (NSDI '21): [usenix.org][seg]
 - S3-FIFO (SOSP '23): [dl.acm.org][s3], overview at [s3fifo.com][s3o]
+- SIEVE (NSDI '24): [usenix.org][sieve]
+- Scaling Memcache at Facebook (NSDI '13): [usenix.org][fb]
+- Little's law (Operations Research '61): [doi.org][ll]
 - Akamai one-hit-wonder filtering (ACM CCR '15): [dl.acm.org][ak]
 - nginx `proxy_cache_min_uses`: [nginx.org][ng]
 - Twitter cache traces: [github.com][tw]
@@ -667,6 +767,9 @@ Two items are known and deliberately deferred.
 [seg]: https://www.usenix.org/conference/nsdi21/presentation/yang-juncheng
 [s3]: https://dl.acm.org/doi/10.1145/3600006.3613147
 [s3o]: https://s3fifo.com/
+[sieve]: https://www.usenix.org/conference/nsdi24/presentation/zhang-yazhuo
+[fb]: https://www.usenix.org/conference/nsdi13/technical-sessions/presentation/nishtala
+[ll]: https://doi.org/10.1287/opre.9.3.383
 [ak]: https://dl.acm.org/doi/10.1145/2805789.2805800
 [ng]: https://nginx.org/en/docs/http/ngx_http_proxy_module.html
 [tw]: https://github.com/twitter/cache-trace

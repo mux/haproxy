@@ -255,12 +255,17 @@ struct seg {
 	uint32_t state_gen;      /* SEG_S_* state + generation */
 	uint8_t flags;           /* SEG_F_* */
 	uint8_t merge_claimed;   /* Protected by the owning TTL bucket's lock */
-	uint32_t merge_ts;       /* Last merge into this segment, 0 if none */
 };
 
+/* A list of segments. The owning TTL bucket's lock protects its counters. */
 struct seg_list {
 	seg_id_t first_seg_id;
 	seg_id_t last_seg_id;
+	uint32_t n_segs;         /* Segments held, every one of a chain counted */
+	uint32_t rate_ts;        /* Second that rate_acc counts */
+	uint32_t rate_acc;       /* Segments appended during rate_ts */
+	double rate;             /* Segments appended per second, averaged */
+	double rate_period;      /* Seconds that rate is averaged over */
 };
 
 struct ttl_bucket {
@@ -269,6 +274,8 @@ struct ttl_bucket {
 	uint32_t ttl_approx;
 	seg_id_t merge_next;     /* Where the next merge resumes, or CACHE_SEG_NONE */
 	uint32_t merge_next_gen; /* Generation of merge_next when it was set */
+	seg_id_t prv_next;       /* Where the next private eviction resumes, or CACHE_SEG_NONE */
+	uint32_t prv_next_gen;   /* Generation of prv_next when it was set */
 	__decl_thread(HA_SPINLOCK_T lock);
 	unsigned int merges_inflight; /* Zero or one owner, under the TTL lock */
 };
@@ -538,6 +545,13 @@ static uint64_t *ht_insert(struct cache *cache, const XXH128_hash_t *hash, uint6
 	return NULL;
 }
 
+/* A list's append rate is averaged over its retention time, as computed by
+ * seg_list_elect_ts(): CACHE_RATE_PERIOD_INIT seconds until one is known,
+ * CACHE_RATE_PERIOD_MAX at most.
+ */
+#define CACHE_RATE_PERIOD_INIT 60
+#define CACHE_RATE_PERIOD_MAX  4096
+
 /* Small segment list API - avoids code duplication with the shared and private
  * segment lists in TTL buckets. The relaxed atomic stores and loads on
  * first_seg_id only exist because of an optimization in cache_reclaim() where
@@ -547,6 +561,35 @@ static inline void seg_list_init(struct seg_list *l)
 {
 	l->first_seg_id = CACHE_SEG_NONE;
 	l->last_seg_id = CACHE_SEG_NONE;
+	l->n_segs = 0;
+	l->rate_ts = 0;
+	l->rate_acc = 0;
+	l->rate = 0.0;
+	l->rate_period = CACHE_RATE_PERIOD_INIT;
+}
+
+/* Bring <l>'s append rate up to the current second: the last second counted
+ * enters the average, and the seconds without an append since then decay it.
+ */
+static inline void seg_list_rate_update(struct seg_list *l)
+{
+	int32_t elapsed = (uint32_t)date.tv_sec - l->rate_ts;
+	double keep = 1.0 - 1.0 / l->rate_period;
+	uint32_t idle;
+
+	if (elapsed == 0)
+		return;
+	if (elapsed > 0) {
+		l->rate = keep * l->rate + (1.0 - keep) * l->rate_acc;
+		l->rate_acc = 0;
+		/* Decay by <keep> to the power of the idle seconds. */
+		for (idle = elapsed - 1; idle; idle >>= 1) {
+			if (idle & 1)
+				l->rate *= keep;
+			keep *= keep;
+		}
+	}
+	l->rate_ts = date.tv_sec;
 }
 
 static inline void seg_list_append(const struct cache *cache, struct seg_list *l,
@@ -564,13 +607,17 @@ static inline void seg_list_append(const struct cache *cache, struct seg_list *l
 	l->last_seg_id = seg_id;
 	if (l->first_seg_id == CACHE_SEG_NONE)
 		_HA_ATOMIC_STORE(&l->first_seg_id, seg_id);
+
+	l->n_segs += seg->n_chain;
+	seg_list_rate_update(l);
+	l->rate_acc += seg->n_chain;
 }
 
 static inline void seg_list_splice(const struct cache *cache, struct seg_list *l,
                                    seg_id_t first_id, seg_id_t last_id, seg_id_t new_id)
 {
 	struct seg *first, *last, *new;
-	seg_id_t prev_id, next_id;
+	seg_id_t prev_id, next_id, id;
 	seg_id_t after_prev, before_next;
 
 	first = &cache->segments[first_id];
@@ -578,10 +625,17 @@ static inline void seg_list_splice(const struct cache *cache, struct seg_list *l
 	prev_id = first->prev_seg_id;
 	next_id = last->next_seg_id;
 
+	for (id = first_id; ; id = cache->segments[id].next_seg_id) {
+		l->n_segs -= cache->segments[id].n_chain;
+		if (id == last_id)
+			break;
+	}
+
 	if (new_id != CACHE_SEG_NONE) {
 		new = &cache->segments[new_id];
 		new->prev_seg_id = first->prev_seg_id;
 		new->next_seg_id = last->next_seg_id;
+		l->n_segs += new->n_chain;
 		after_prev = new_id;
 		before_next = new_id;
 	} else {
@@ -648,7 +702,6 @@ static inline void seg_reinit(struct seg *seg)
 	seg->create_ts = date.tv_sec;
 	seg->flags = 0;
 	seg->merge_claimed = 0;
-	seg->merge_ts = 0;
 	_HA_ATOMIC_STORE(&seg->live_bytes, 0);
 	_HA_ATOMIC_STORE(&seg->n_live, 0);
 	_HA_ATOMIC_STORE(&seg->state_gen, SEG_STATE_MAKE(gen + 1, SEG_S_LIVE));
@@ -1032,11 +1085,8 @@ static void seg_merge(struct cache *cache, seg_id_t dst_id, const seg_id_t *srcs
 	struct seg *src;
 
 	memset(res, 0, sizeof(*res));
-	/* The destination expires with its oldest source, but ranks for
-	 * eviction by when it was merged.
-	 */
+	/* The destination expires with its oldest source. */
 	dst->create_ts = cache->segments[srcs[0]].create_ts;
-	dst->merge_ts = date.tv_sec;
 	dst->ttl_bucket = cache->segments[srcs[0]].ttl_bucket;
 	if (copy_all)
 		cutoff = 0.0;
@@ -1239,30 +1289,31 @@ static unsigned int seg_merge_claim(const struct cache *cache, const struct ttl_
 	return n;
 }
 
-/* The bucket's resume point for its next merge, or CACHE_SEG_NONE when unset
- * or when the segment it named has been reclaimed since (its generation moved
- * on, or it is no longer live).
+/* A bucket's resume point <next> of generation <gen>, for its next merge or
+ * private eviction, or CACHE_SEG_NONE when unset or when the segment it named
+ * has been reclaimed since (its generation moved on, or it is no longer live).
+ * The caller holds the bucket's lock.
  */
-static inline seg_id_t seg_merge_cursor(const struct cache *cache, struct ttl_bucket *ttlb)
+static inline seg_id_t seg_cursor(const struct cache *cache, seg_id_t *next, uint32_t gen)
 {
 	uint32_t w;
 
-	if (ttlb->merge_next == CACHE_SEG_NONE)
+	if (*next == CACHE_SEG_NONE)
 		return CACHE_SEG_NONE;
-	w = _HA_ATOMIC_LOAD(&cache->segments[ttlb->merge_next].state_gen);
-	if (SEG_STATE(w) != SEG_S_LIVE || SEG_STATE_GEN(w) != ttlb->merge_next_gen)
-		ttlb->merge_next = CACHE_SEG_NONE;
-	return ttlb->merge_next;
+	w = _HA_ATOMIC_LOAD(&cache->segments[*next].state_gen);
+	if (SEG_STATE(w) != SEG_S_LIVE || SEG_STATE_GEN(w) != gen)
+		*next = CACHE_SEG_NONE;
+	return *next;
 }
 
-static inline void seg_merge_cursor_set(const struct cache *cache, struct ttl_bucket *ttlb,
-                                        seg_id_t seg_id)
+static inline void seg_cursor_set(const struct cache *cache, seg_id_t *next, uint32_t *gen,
+                                  seg_id_t seg_id)
 {
-	ttlb->merge_next = seg_id;
+	*next = seg_id;
 	if (seg_id != CACHE_SEG_NONE) {
 		uint32_t w = _HA_ATOMIC_LOAD(&cache->segments[seg_id].state_gen);
 
-		ttlb->merge_next_gen = SEG_STATE_GEN(w);
+		*gen = SEG_STATE_GEN(w);
 	}
 }
 
@@ -1888,6 +1939,7 @@ struct cache *cache_new(const struct cache_config *ucfg, uint flags,
 		seg_list_init(&ttlb->segs);
 		seg_list_init(&ttlb->prv_segs);
 		ttlb->merge_next = CACHE_SEG_NONE;
+		ttlb->prv_next = CACHE_SEG_NONE;
 		HA_SPIN_INIT(&ttlb->lock);
 	}
 
@@ -1950,26 +2002,163 @@ static enum cache_reclaim_status seg_evict(struct cache *cache, struct ttl_bucke
  */
 #define CACHE_FIFO_SCAN_MAX 64
 
-/* Find the oldest safe victim in list order. The caller holds its TTL lock. Do
- * not mistake a claimed or writer-pinned head for an empty victim set.
+/* Tell whether segment <seg> can be evicted whole: not claimed by a merge, not
+ * being written, and still live. The caller holds its TTL lock.
  */
-static seg_id_t seg_fifo_find(struct cache *cache, struct seg_list *l)
+static inline int seg_fifo_safe(struct seg *seg)
 {
-	seg_id_t id = seg_list_first(l), found = CACHE_SEG_NONE;
+	return !seg->merge_claimed && !HA_ATOMIC_LOAD(&seg->w_refcount) &&
+	       SEG_STATE(_HA_ATOMIC_LOAD(&seg->state_gen)) == SEG_S_LIVE;
+}
+
+/* Find the first safe victim in list order from <id>. The caller holds its TTL
+ * lock. Do not mistake a claimed or writer-pinned head for an empty victim set.
+ */
+static seg_id_t seg_fifo_find(struct cache *cache, seg_id_t id)
+{
+	seg_id_t found = CACHE_SEG_NONE;
 	unsigned int steps = 0;
 
 	while (id != CACHE_SEG_NONE && steps < CACHE_FIFO_SCAN_MAX) {
 		struct seg *seg = &cache->segments[id];
 
 		steps++;
-		if (!seg->merge_claimed && !HA_ATOMIC_LOAD(&seg->w_refcount) &&
-		    SEG_STATE(_HA_ATOMIC_LOAD(&seg->state_gen)) == SEG_S_LIVE) {
+		if (seg_fifo_safe(seg)) {
 			found = id;
 			break;
 		}
 		id = seg->next_seg_id;
 	}
 	return found;
+}
+
+/* At most this many private chains are spared by one eviction. */
+#define CACHE_PRV_SPARE_MAX 8
+
+/* Return the index slot of the record held by private chain <seg_id>, with its
+ * value in <slot>, or NULL if that record is no longer indexed.
+ */
+static uint64_t *seg_chain_slot(const struct cache *cache, seg_id_t seg_id, uint64_t *slot)
+{
+	const struct cache_record *rec;
+	struct ht_iter it;
+	uint64_t *slotp;
+
+	rec = (const struct cache_record *)((char *)cache->arena +
+	                                    CACHE_ARENA_OFF(cache, seg_id, 0));
+	ht_iter_init(&it, cache);
+	while ((slotp = ht_iter_next_tag(&it, &rec->hash, slot)) != NULL) {
+		if (CACHE_SLOT_SEG(*slot) == seg_id && CACHE_SLOT_OFF(*slot) == 0)
+			return slotp;
+	}
+	return NULL;
+}
+
+/* The chain an eviction in <l>, the private list of <ttlb>, examines first: the
+ * first safe one from the bucket's resume point, else from the head. The caller
+ * holds the bucket's lock.
+ */
+static seg_id_t seg_prv_candidate(struct cache *cache, struct ttl_bucket *ttlb,
+                                  struct seg_list *l)
+{
+	seg_id_t id;
+
+	id = seg_cursor(cache, &ttlb->prv_next, ttlb->prv_next_gen);
+	id = seg_fifo_find(cache, id);
+	if (id == CACHE_SEG_NONE)
+		id = seg_fifo_find(cache, seg_list_first(l));
+	return id;
+}
+
+/* Choose the victim of an eviction in <l>, the private list of <ttlb>, whose
+ * lock the caller holds. Chains are examined from seg_prv_candidate() on,
+ * wrapping to the head, each costing <rc> one record. The first chain not hit
+ * since it was last examined is the victim. A chain that was hit is spared: its
+ * counter restarts and it stays in place. After CACHE_PRV_SPARE_MAX spared
+ * chains, or when all were hit, the least-hit one is the victim.
+ */
+static seg_id_t seg_prv_victim(struct cache *cache, struct ttl_bucket *ttlb,
+                               struct seg_list *l, struct cache_reclaim_ctx *rc)
+{
+	seg_id_t id, next, first, least = CACHE_SEG_NONE;
+	unsigned int spared = 0, steps = 0, hits, least_hits = UINT_MAX;
+	uint64_t *slotp, slot;
+
+	id = first = seg_prv_candidate(cache, ttlb, l);
+	while (id != CACHE_SEG_NONE && steps < CACHE_FIFO_SCAN_MAX) {
+		struct seg *seg = &cache->segments[id];
+
+		steps++;
+		next = seg->next_seg_id;
+		if (next == CACHE_SEG_NONE)
+			next = seg_list_first(l);
+		if (!seg_fifo_safe(seg)) {
+			id = next;
+			if (id == first)
+				break;
+			continue;
+		}
+
+		rc->spent++;
+		hits = 0;
+		slotp = seg_chain_slot(cache, id, &slot);
+		if (slotp)
+			hits = CACHE_SLOT_FREQ(slot);
+		if (!hits) {
+			if (next == id)
+				next = CACHE_SEG_NONE;
+			seg_cursor_set(cache, &ttlb->prv_next, &ttlb->prv_next_gen, next);
+			return id;
+		}
+
+		if (hits < least_hits) {
+			least_hits = hits;
+			least = id;
+		}
+		/* A lost race with a hit is harmless: the counter is approximate. */
+		HA_ATOMIC_CAS(slotp, &slot, slot & ~CACHE_SLOT_FREQ_MASK);
+		seg_cursor_set(cache, &ttlb->prv_next, &ttlb->prv_next_gen, next);
+		if (++spared == CACHE_PRV_SPARE_MAX)
+			break;
+		id = next;
+		if (id == first)
+			break;
+	}
+	return least;
+}
+
+/* A shared list's retention time is divided by this before lists are compared,
+ * so shared lists keep their content that many times longer than private ones.
+ * Shared lists hold the objects that fit in a segment, private lists the larger
+ * ones. A larger value moves memory to small objects, which raises the hit
+ * ratio and can lower the byte hit ratio. A smaller value does the opposite. At
+ * 1, small and large objects are kept equally long.
+ */
+#define CACHE_SHARED_AGE_DIV 2
+
+/* Return the timestamp <l> competes with when a list is elected for eviction,
+ * the oldest winning: the current time minus the list's retention time. That is
+ * how long a segment stays in <l> on average: the segments held divided by
+ * those appended per second. Unlike the age of the head, it does not depend on
+ * which segments a merge retains or an eviction spares. <shared> tells a shared
+ * list from a private one. Without a measurable rate, the creation time of
+ * candidate <seg> stands in. The caller holds the lock of the list's bucket.
+ */
+static uint32_t seg_list_elect_ts(struct seg_list *l, int shared, const struct seg *seg)
+{
+	double age;
+
+	seg_list_rate_update(l);
+	if (l->rate < 1e-9)
+		return seg->create_ts;
+
+	age = l->n_segs / l->rate;
+	l->rate_period = MIN(MAX(age, 1.0), (double)CACHE_RATE_PERIOD_MAX);
+	if (shared)
+		age /= CACHE_SHARED_AGE_DIV;
+	if (age >= date.tv_sec)
+		return 0;
+	return date.tv_sec - age;
 }
 
 /* Report whether an arena merger is about to return space to the shared pool.
@@ -2008,7 +2197,10 @@ static enum cache_reclaim_status ttl_bucket_evict(struct cache *cache,
 	status = cache_merge_pending(cache, rc);
 	if (status == CACHE_RECLAIM_PROGRESS)
 		return status;
-	id = seg_fifo_find(cache, l);
+	if (l == &ttlb->prv_segs)
+		id = seg_prv_victim(cache, ttlb, l, rc);
+	else
+		id = seg_fifo_find(cache, seg_list_first(l));
 	if (id == CACHE_SEG_NONE) {
 		if (status == CACHE_RECLAIM_MERGING)
 			return status;
@@ -2064,7 +2256,7 @@ static enum cache_reclaim_status ttl_bucket_merge(struct cache *cache,
 	/* Split the budget between cursor and head, finishing runs across the
 	 * cursor. Without a distinct cursor, search only from the head.
 	 */
-	seg_id = seg_merge_cursor(cache, ttlb);
+	seg_id = seg_cursor(cache, &ttlb->merge_next, ttlb->merge_next_gen);
 	if (seg_id != CACHE_SEG_NONE && seg_id != seg_list_first(l)) {
 		head_id = seg_merge_find(cache, ttlb, seg_id, CACHE_SEG_NONE,
 		                         CACHE_MERGE_SCAN_MAX / 2);
@@ -2077,7 +2269,8 @@ static enum cache_reclaim_status ttl_bucket_merge(struct cache *cache,
 		head_id = seg_merge_find(cache, ttlb, seg_list_first(l),
 		                         CACHE_SEG_NONE, CACHE_MERGE_SCAN_MAX);
 	if (head_id == CACHE_SEG_NONE) {
-		seg_merge_cursor_set(cache, ttlb, CACHE_SEG_NONE);
+		seg_cursor_set(cache, &ttlb->merge_next, &ttlb->merge_next_gen,
+		               CACHE_SEG_NONE);
 		return ttl_bucket_evict(cache, ttlb, l, rc);
 	}
 
@@ -2152,7 +2345,7 @@ static enum cache_reclaim_status ttl_bucket_merge(struct cache *cache,
 		_HA_ATOMIC_INC(&cache->merge_empty);
 		supply = 0;
 	}
-	seg_merge_cursor_set(cache, ttlb, seg_id);
+	seg_cursor_set(cache, &ttlb->merge_next, &ttlb->merge_next_gen, seg_id);
 
 	for (i = 0; i < res.merged; i++) {
 		if (seg_drain(cache, srcs[i]) == SEG_RECLAIM_FREED)
@@ -2221,7 +2414,7 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 	struct seg_list *best_list;
 	struct seg *seg;
 	enum cache_reclaim_status status;
-	uint32_t oldest_ts, best_gen;
+	uint32_t oldest_ts, best_gen, ts;
 	seg_id_t seg_id, best_seg_id;
 	uint32_t scan_off;
 	unsigned int locked = 0;
@@ -2237,9 +2430,9 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 	if (!rc->shortfall)
 		return CACHE_RECLAIM_PROGRESS;
 
-	/* Locate the oldest segment which is our best candidate for eviction.
-	 * While here, see if any segments can be expired. Note that the oldest
-	 * segment is not necessarily expirable.
+	/* Locate the list that ranks oldest, and in it our best candidate for
+	 * eviction. While here, see if any segments can be expired. Note that
+	 * this candidate is not necessarily expirable.
 	 */
 	oldest_ts = UINT32_MAX;
 	best = NULL;
@@ -2247,8 +2440,8 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 	seen = vanished = 0;
 
 	/* Start the scan at a random offset. This is mostly useful when
-	 * several segments are tied for the oldest creation timestamp - an
-	 * easy occurrence at one-second granularity. Concurrent reclaimers
+	 * several lists are tied for the oldest timestamp - an easy
+	 * occurrence at one-second granularity. Concurrent reclaimers
 	 * then elect different victims instead of all racing for the
 	 * first-scanned one.
 	 */
@@ -2289,8 +2482,12 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 			}
 
 			/* Read the head again after expiration. */
-			seg_id = !(cache->flags & CACHE_F_NO_MERGE) ? seg_fifo_find(cache, lists[j]) :
-			         seg_list_first(lists[j]);
+			if (cache->flags & CACHE_F_NO_MERGE)
+				seg_id = seg_list_first(lists[j]);
+			else if (lists[j] == &ttlb->prv_segs)
+				seg_id = seg_prv_candidate(cache, ttlb, lists[j]);
+			else
+				seg_id = seg_fifo_find(cache, seg_list_first(lists[j]));
 
 			/* The head is fresh, or expired but writer-pinned:
 			 * evaluate it as an eviction candidate below (a
@@ -2298,11 +2495,15 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 			 */
 			if (seg_id != CACHE_SEG_NONE) {
 				seg = &cache->segments[seg_id];
+				if (cache->flags & CACHE_F_NO_MERGE)
+					ts = seg->create_ts;
+				else
+					ts = seg_list_elect_ts(lists[j], j == 1, seg);
 				if (_HA_ATOMIC_LOAD(&seg->w_refcount) == 0 &&
-				    (best == NULL || MAX(seg->create_ts, seg->merge_ts) < oldest_ts)) {
+				    (best == NULL || ts < oldest_ts)) {
 					uint32_t sw = _HA_ATOMIC_LOAD(&seg->state_gen);
 
-					oldest_ts = MAX(seg->create_ts, seg->merge_ts);
+					oldest_ts = ts;
 					best_gen = SEG_STATE_GEN(sw);
 					best_seg_id = seg_id;
 					best_list = lists[j];
