@@ -548,7 +548,7 @@ static uint64_t *ht_insert(struct cache *cache, const XXH128_hash_t *hash, uint6
 }
 
 /* A list's append rate is averaged over its retention time, as computed by
- * seg_list_elect_ts(): CACHE_RATE_PERIOD_INIT seconds until one is known,
+ * seg_list_elect_age(): CACHE_RATE_PERIOD_INIT seconds until one is known,
  * CACHE_RATE_PERIOD_MAX at most.
  */
 #define CACHE_RATE_PERIOD_INIT 60
@@ -2203,29 +2203,27 @@ static seg_id_t seg_prv_victim(struct cache *cache, struct ttl_bucket *ttlb,
  */
 #define CACHE_SHARED_AGE_DIV 2
 
-/* Return the timestamp <l> competes with when a list is elected for eviction,
- * the oldest winning: the current time minus the list's retention time. That is
- * how long a segment stays in <l> on average: the segments held divided by
- * those appended per second. Unlike the age of the head, it does not depend on
- * which segments a merge retains or an eviction spares. <shared> tells a shared
- * list from a private one. Without a measurable rate, the creation time of
- * candidate <seg> stands in. The caller holds the lock of the list's bucket.
+/* Return what <l> competes with when a list is elected for eviction, the
+ * largest winning: the list's retention time in seconds. That is how long a
+ * segment stays in <l> on average: the segments held divided by those appended
+ * per second. Unlike the age of the head, it does not depend on which segments
+ * a merge retains or an eviction spares. <shared> tells a shared list from a
+ * private one. Without a measurable rate, the age of candidate <seg> stands
+ * in. The caller holds the lock of the list's bucket.
  */
-static uint32_t seg_list_elect_ts(struct seg_list *l, int shared, const struct seg *seg)
+static double seg_list_elect_age(struct seg_list *l, int shared, const struct seg *seg)
 {
 	double age;
 
 	seg_list_rate_update(l);
 	if (l->rate < 1e-9)
-		return seg->create_ts;
+		return (int64_t)date.tv_sec - seg->create_ts;
 
 	age = l->n_segs / l->rate;
 	l->rate_period = MIN(MAX(age, 1.0), (double)CACHE_RATE_PERIOD_MAX);
 	if (shared)
 		age /= CACHE_SHARED_AGE_DIV;
-	if (age >= date.tv_sec)
-		return 0;
-	return date.tv_sec - age;
+	return age;
 }
 
 /* Report whether an arena merger is about to return space to the shared pool.
@@ -2481,7 +2479,8 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 	struct seg_list *best_list;
 	struct seg *seg;
 	enum cache_reclaim_status status;
-	uint32_t oldest_ts, best_gen, ts;
+	double longest, age;
+	uint32_t best_gen;
 	seg_id_t seg_id, best_seg_id;
 	uint32_t scan_off;
 	unsigned int locked = 0;
@@ -2497,11 +2496,11 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 	if (!rc->shortfall)
 		return CACHE_RECLAIM_PROGRESS;
 
-	/* Locate the list that ranks oldest, and in it our best candidate for
-	 * eviction. While here, see if any segments can be expired. Note that
-	 * this candidate is not necessarily expirable.
+	/* Locate the list that keeps its segments longest, and in it our best
+	 * candidate for eviction. While here, see if any segments can be
+	 * expired. Note that this candidate is not necessarily expirable.
 	 */
-	oldest_ts = UINT32_MAX;
+	longest = 0;
 	best = NULL;
 	best_list = NULL;		/* Quiet GCC */
 	best_gen = 0;			/* Quiet GCC */
@@ -2509,10 +2508,10 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 	seen = 0;
 
 	/* Start the scan at a random offset. This is mostly useful when
-	 * several lists are tied for the oldest timestamp - an easy
-	 * occurrence at one-second granularity. Concurrent reclaimers
-	 * then elect different victims instead of all racing for the
-	 * first-scanned one.
+	 * several lists are tied - an easy occurrence without merging,
+	 * where segment ages in whole seconds are compared. Concurrent
+	 * reclaimers then elect different victims instead of all racing
+	 * for the first-scanned one.
 	 */
 	scan_off = statistical_prng() & (CACHE_TTL_N_BUCKETS - 1);
 	for (i = ttl_used_first(cache, scan_off, 0); i < CACHE_TTL_N_BUCKETS;
@@ -2553,14 +2552,14 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 			if (seg_id != CACHE_SEG_NONE) {
 				seg = &cache->segments[seg_id];
 				if (cache->flags & CACHE_F_NO_MERGE)
-					ts = seg->create_ts;
+					age = (int64_t)date.tv_sec - seg->create_ts;
 				else
-					ts = seg_list_elect_ts(lists[j], j == 1, seg);
+					age = seg_list_elect_age(lists[j], j == 1, seg);
 				if (_HA_ATOMIC_LOAD(&seg->w_refcount) == 0 &&
-				    (best == NULL || ts < oldest_ts)) {
+				    (best == NULL || age > longest)) {
 					uint32_t sw = _HA_ATOMIC_LOAD(&seg->state_gen);
 
-					oldest_ts = ts;
+					longest = age;
 					best_gen = SEG_STATE_GEN(sw);
 					best_seg_id = seg_id;
 					best_list = lists[j];
