@@ -36,6 +36,7 @@
 #include <haproxy/bug.h>
 #include <haproxy/cache_storage.h>
 #include <haproxy/clock.h>
+#include <haproxy/time.h>
 #include <haproxy/tools.h>
 
 #include <stdint.h>
@@ -570,26 +571,27 @@ static inline void seg_list_init(struct seg_list *l)
 
 /* Bring <l>'s append rate up to the current second: the last second counted
  * enters the average, and the seconds without an append since then decay it.
+ * Seconds are counted on the date all threads share, which only moves
+ * forward: under the bucket lock, a caller never sees it go back.
  */
 static inline void seg_list_rate_update(struct seg_list *l)
 {
-	int32_t elapsed = (uint32_t)date.tv_sec - l->rate_ts;
+	uint32_t now = ns_to_sec(HA_ATOMIC_LOAD(global_now_ns));
+	uint32_t elapsed = now - l->rate_ts;
 	double keep = 1.0 - 1.0 / l->rate_period;
 	uint32_t idle;
 
 	if (elapsed == 0)
 		return;
-	if (elapsed > 0) {
-		l->rate = keep * l->rate + (1.0 - keep) * l->rate_acc;
-		l->rate_acc = 0;
-		/* Decay by <keep> to the power of the idle seconds. */
-		for (idle = elapsed - 1; idle; idle >>= 1) {
-			if (idle & 1)
-				l->rate *= keep;
-			keep *= keep;
-		}
+	l->rate = keep * l->rate + (1.0 - keep) * l->rate_acc;
+	l->rate_acc = 0;
+	/* Decay by <keep> to the power of the idle seconds. */
+	for (idle = elapsed - 1; idle; idle >>= 1) {
+		if (idle & 1)
+			l->rate *= keep;
+		keep *= keep;
 	}
-	l->rate_ts = date.tv_sec;
+	l->rate_ts = now;
 }
 
 static inline void seg_list_append(const struct cache *cache, struct seg_list *l,
