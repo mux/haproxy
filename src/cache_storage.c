@@ -770,31 +770,35 @@ static inline void seg_reinit(struct seg *seg)
 	_HA_ATOMIC_STORE(&seg->state_gen, SEG_STATE_MAKE(gen + 1, SEG_S_LIVE));
 }
 
-/* Grab <n_segs> segments from the free-list. */
+/* Grab up to <n_segs> segments from the free-list, linked as a chain. The pool
+ * may supply fewer. Only a caller setting <reserve> may take the reserved
+ * segments.
+ */
 static inline seg_id_t seg_free_pop(struct cache *cache, unsigned int n_segs, int reserve)
 {
 	seg_id_t first_seg_id, seg_id;
-	unsigned int n_left;
+	unsigned int n_avail, n_left;
 	struct seg *seg;
 
 	BUG_ON(n_segs == 0);
 
 	HA_SPIN_LOCK(CACHE_LOCK, &cache->pool_lock);
-	if (!reserve && _HA_ATOMIC_LOAD(&cache->n_free) < cache->cfg.n_reserved + n_segs) {
+	n_avail = _HA_ATOMIC_LOAD(&cache->n_free);
+	if (!reserve)
+		n_avail -= MIN(n_avail, cache->cfg.n_reserved);
+	if (n_segs > n_avail)
+		n_segs = n_avail;
+	if (n_segs == 0) {
 		HA_SPIN_UNLOCK(CACHE_LOCK, &cache->pool_lock);
 		return CACHE_SEG_NONE;
 	}
 	first_seg_id = cache->free_seg_id;
 	seg_id = first_seg_id;
 	n_left = n_segs;
-	while (seg_id != CACHE_SEG_NONE && n_left > 0) {
+	while (n_left > 0) {
 		seg = &cache->segments[seg_id];
 		seg_id = seg->next_chain_id;
 		n_left--;
-	}
-	if (n_left > 0) {
-		HA_SPIN_UNLOCK(CACHE_LOCK, &cache->pool_lock);
-		return CACHE_SEG_NONE;
 	}
 	_HA_ATOMIC_SUB(&cache->n_free, n_segs);
 	cache->free_seg_id = seg->next_chain_id;
@@ -1758,7 +1762,7 @@ static inline uint16_t ttl_bucket_get_id(const struct cache *cache, const struct
 
 /* Reserve <size> bytes in a TTL bucket's tail segment, or in a fresh segment
  * from the free pool. An entry larger than a segment gets only its first one
- * here; cache_write() grows its chain as it is written. Returns a null handle
+ * here; cache_make_room() grows its chain. Returns a null handle
  * when no segment is available; the caller decides whether to reclaim and
  * retry.
  */
@@ -3061,8 +3065,100 @@ static void cache_drop(struct cache *cache, const struct cache_whandle *h,
 	seg_check_dead(cache, h->seg_id, ttl_bucket, state_gen);
 }
 
-struct cache_whandle cache_reserve(struct cache *cache, const struct cache_key *key,
-                                   size_t data_len, time_t expire)
+/* Make room for <len> more bytes at <h>, within the limits set on entries. A
+ * private chain holds the record from the start of its first segment, and
+ * grows when these bytes go past its end: an unknown-length record grows with
+ * it, a known-length one already had its full length. The pool may supply the
+ * missing segments in several steps: they join the chain once all are there.
+ * Returns 0 on success, or -1 with the reservation unchanged.
+ */
+static int cache_make_room(struct cache *cache, struct cache_whandle *h, size_t len)
+{
+	struct cache_record *rec = CACHE_HANDLE_REC(cache, h);
+	struct seg *head = &cache->segments[h->seg_id];
+	struct seg *tail, *last;
+	struct cache_reclaim_ctx rc;
+	seg_id_t seg_id, first_id;
+	unsigned int n_segs, n_left;
+	size_t chain_cap;
+
+	if (len > cache->arena_len - sizeof(*rec) ||
+	    h->data_off > cache->arena_len - sizeof(*rec) - len)
+		return -1;
+
+	if (cache->cfg.max_obj_size > 0 &&
+	    (len > cache->cfg.max_obj_size ||
+	     h->data_off > cache->cfg.max_obj_size - len))
+		return -1;
+
+	if (len > CACHE_REC_CAPACITY(rec) - h->data_off &&
+	    (cache->flags & CACHE_F_NO_JUMBO || !(head->flags & SEG_F_NO_LEN)))
+		return -1;
+
+	chain_cap = (size_t)head->n_chain * cache->cfg.seg_size - sizeof(*rec);
+	if (!(head->flags & SEG_F_PRIVATE) || len <= chain_cap - h->data_off)
+		return 0;
+
+	/* Get the missing segments, evicting or expiring our way to them when
+	 * the pool has none to supply, with the same accounting as
+	 * cache_reserve(). Reclaim can never free the entry being grown: its
+	 * head is write-pinned, so at worst it elects it and comes back
+	 * empty-handed.
+	 */
+	n_segs = cache_seg_count(cache, len - (chain_cap - h->data_off));
+	first_id = CACHE_SEG_NONE;
+	last = NULL;
+	n_left = n_segs;
+	while (n_left > 0) {
+		cache_reclaim_init(&rc, 1);
+		while ((seg_id = seg_free_pop(cache, n_left, 0)) == CACHE_SEG_NONE) {
+			if (cache_reclaim_try(cache, &rc) == CACHE_RECLAIM_GIVEUP) {
+				if (first_id != CACHE_SEG_NONE)
+					seg_free_push(cache, first_id);
+				return -1;
+			}
+		}
+		cache_reclaim_done(cache, &rc);
+		if (last)
+			last->next_chain_id = seg_id;
+		else
+			first_id = seg_id;
+
+		/* Count each segment the pool supplied. */
+		do {
+			last = &cache->segments[seg_id];
+			seg_id = last->next_chain_id;
+			n_left--;
+		} while (seg_id != CACHE_SEG_NONE);
+	}
+
+	/* If the last write completely filled the chain, h->cur_seg_id is
+	 * CACHE_SEG_NONE, so we walk the chain to find back its last segment.
+	 */
+	if (h->cur_seg_id == CACHE_SEG_NONE) {
+		seg_id = seg_chain_nth(cache, h->seg_id, head->n_chain - 1);
+		h->cur_seg_id = first_id;
+	} else
+		seg_id = h->cur_seg_id;
+	tail = &cache->segments[seg_id];
+
+	/* This loop only iterates for a misbehaving writer: one that got room
+	 * from cache_reserve_with() and did not write the bytes it announced
+	 * before a larger write. Otherwise the segment being written is
+	 * already the last one.
+	 */
+	while (tail->next_chain_id != CACHE_SEG_NONE)
+		tail = &cache->segments[tail->next_chain_id];
+	tail->next_chain_id = first_id;
+
+	if (head->flags & SEG_F_NO_LEN)
+		rec->rec_len += (size_t)n_segs * cache->cfg.seg_size;
+	head->n_chain += n_segs;
+	return 0;
+}
+
+struct cache_whandle cache_reserve_with(struct cache *cache, const struct cache_key *key,
+                                        size_t data_len, size_t ready_len, time_t expire)
 {
 	struct cache_whandle h;
 	struct cache_record *rec;
@@ -3159,79 +3255,30 @@ struct cache_whandle cache_reserve(struct cache *cache, const struct cache_key *
 		return CACHE_WHANDLE_NULL;
 	}
 
+	/* The caller writes <ready_len> bytes next: their room is made now. */
+	if (cache_make_room(cache, &h, ready_len) < 0) {
+		cache_drop(cache, &h, ht_find_pending(cache, &h));
+		return CACHE_WHANDLE_NULL;
+	}
+
 	return h;
+}
+
+struct cache_whandle cache_reserve(struct cache *cache, const struct cache_key *key,
+                                   size_t data_len, time_t expire)
+{
+	return cache_reserve_with(cache, key, data_len, 0, expire);
 }
 
 int cache_write(struct cache *cache, struct cache_whandle *h,
                 const void *data, size_t len)
 {
-	struct cache_record *rec;
-	struct seg *seg, *head, *tail;
-	struct cache_reclaim_ctx rc;
-	seg_id_t seg_id;
-	size_t chain_cap;
+	struct seg *seg;
 
 	BUG_ON_BAD_HANDLE(cache, h);
 
-	rec = CACHE_HANDLE_REC(cache, h);
-
-	if (len > cache->arena_len - sizeof(*rec) ||
-	    h->data_off > cache->arena_len - sizeof(*rec) - len)
+	if (cache_make_room(cache, h, len) < 0)
 		return -1;
-
-	if (cache->cfg.max_obj_size > 0 &&
-	    (len > cache->cfg.max_obj_size ||
-	     h->data_off > cache->cfg.max_obj_size - len))
-		return -1;
-
-	head = &cache->segments[h->seg_id];
-	if (len > CACHE_REC_CAPACITY(rec) - h->data_off &&
-	    (cache->flags & CACHE_F_NO_JUMBO || !(head->flags & SEG_F_NO_LEN)))
-		return -1;
-
-	/* A private chain holds the record from the start of its first
-	 * segment. Grow it one segment at a time while the write goes past its
-	 * end: an unknown-length record grows with it, a known-length one
-	 * already had its full length. A failed step leaves the chain grown by
-	 * the steps before it, which the caller's abort frees with the rest.
-	 */
-	chain_cap = (size_t)head->n_chain * cache->cfg.seg_size - sizeof(*rec);
-	tail = NULL;
-	while ((head->flags & SEG_F_PRIVATE) && len > chain_cap - h->data_off) {
-		/* If the last write completely filled the last segment, then
-		 * h->cur_seg_id would be CACHE_SEG_NONE, so we walk the chain
-		 * to find back the last valid segment.
-		 */
-		if (!tail) {
-			if (h->cur_seg_id == CACHE_SEG_NONE)
-				seg_id = seg_chain_nth(cache, h->seg_id, head->n_chain - 1);
-			else
-				seg_id = h->cur_seg_id;
-			tail = &cache->segments[seg_id];
-		}
-
-		/* Get the segment, evicting or expiring our way to it when
-		 * the pool cannot supply it, with the same accounting as
-		 * cache_reserve(). Reclaim can never free the entry being
-		 * grown: its head is write-pinned, so at worst it elects it
-		 * and comes back empty-handed.
-		 */
-		cache_reclaim_init(&rc, 1);
-		while ((seg_id = seg_free_pop(cache, 1, 0)) == CACHE_SEG_NONE) {
-			if (cache_reclaim_try(cache, &rc) == CACHE_RECLAIM_GIVEUP)
-				return -1;
-		}
-		cache_reclaim_done(cache, &rc);
-		if (head->flags & SEG_F_NO_LEN)
-			rec->rec_len += cache->cfg.seg_size;
-		tail->next_chain_id = seg_id;
-		tail = &cache->segments[seg_id];
-		head->n_chain++;
-		chain_cap += cache->cfg.seg_size;
-
-		if (h->cur_seg_id == CACHE_SEG_NONE)
-			h->cur_seg_id = seg_id;
-	}
 
 	while (len > 0) {
 		size_t off;

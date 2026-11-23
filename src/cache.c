@@ -1518,7 +1518,8 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 	/* store latest value */
 	object.latest_validation = date.tv_sec;
 
-	cache_ctx->handle = cache_reserve(cache->store, key, len, expire);
+	cache_ctx->handle = cache_reserve_with(cache->store, key, len,
+	                                       sizeof(object) + trash.data, expire);
 	if (CACHE_HANDLE_ERR(cache_ctx->handle))
 		goto out;
 	cache_ctx->vary_signature = vary_signature;

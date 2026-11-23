@@ -222,6 +222,13 @@ void cache_release(struct cache *c, const struct cache_rhandle *h);
 struct cache_whandle cache_reserve(struct cache *c, const struct cache_key *key,
                                    size_t data_len, time_t expire);
 
+/* Like cache_reserve(), for a caller that holds <ready_len> bytes of the entry
+ * and writes them right away. The reservation also makes room for these bytes,
+ * and fails if it cannot: writing them then never fails for lack of space.
+ */
+struct cache_whandle cache_reserve_with(struct cache *c, const struct cache_key *key,
+                                        size_t data_len, size_t ready_len, time_t expire);
+
 /* Write (append) data to an entry after a successful reservation. Returns 0 on
  * success, or -1 in case of an out-of-bounds write. The error is mostly useful
  * when a reservation's size was not known in advance (cache_reserve() was
