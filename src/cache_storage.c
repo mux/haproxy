@@ -348,6 +348,7 @@ struct cache {
 
 	struct seg *segments;           /* Segment descriptor table */
 	struct ttl_bucket *ttl_buckets; /* TTL buckets for writes */
+	unsigned long ttl_used[CACHE_TTL_N_BUCKETS / LONGBITS]; /* TTL buckets holding segments */
 	__decl_thread(HA_SPINLOCK_T pool_lock); /* Lock for the pool of free segments */
 	seg_id_t free_seg_id;           /* Free-list of segments */
 	unsigned int n_free;            /* Number of free segments in the pool */
@@ -554,9 +555,7 @@ static uint64_t *ht_insert(struct cache *cache, const XXH128_hash_t *hash, uint6
 #define CACHE_RATE_PERIOD_MAX  4096
 
 /* Small segment list API - avoids code duplication with the shared and private
- * segment lists in TTL buckets. The relaxed atomic stores and loads on
- * first_seg_id only exist because of an optimization in cache_reclaim() where
- * this field is read without a lock.
+ * segment lists in TTL buckets.
  */
 static inline void seg_list_init(struct seg_list *l)
 {
@@ -594,7 +593,61 @@ static inline void seg_list_rate_update(struct seg_list *l)
 	l->rate_ts = now;
 }
 
-static inline void seg_list_append(const struct cache *cache, struct seg_list *l,
+/* One bit per TTL bucket, set while the bucket holds at least one segment.
+ * Bits change under the bucket's lock and are read without it.
+ */
+static inline void ttl_used_set(struct cache *cache, unsigned int id)
+{
+	_HA_ATOMIC_OR(&cache->ttl_used[id / LONGBITS], 1UL << (id % LONGBITS));
+}
+
+static inline void ttl_used_clear(struct cache *cache, unsigned int id)
+{
+	_HA_ATOMIC_AND(&cache->ttl_used[id / LONGBITS], ~(1UL << (id % LONGBITS)));
+}
+
+/* Return the first TTL bucket in use from <from> on, or CACHE_TTL_N_BUCKETS
+ * if there is none.
+ */
+static inline unsigned int ttl_used_next(const struct cache *cache, unsigned int from)
+{
+	unsigned int w = from / LONGBITS;
+	unsigned long bits;
+
+	if (from >= CACHE_TTL_N_BUCKETS)
+		return CACHE_TTL_N_BUCKETS;
+	bits = _HA_ATOMIC_LOAD(&cache->ttl_used[w]) & (~0UL << (from % LONGBITS));
+	while (!bits) {
+		if (++w == CACHE_TTL_N_BUCKETS / LONGBITS)
+			return CACHE_TTL_N_BUCKETS;
+		bits = _HA_ATOMIC_LOAD(&cache->ttl_used[w]);
+	}
+	return w * LONGBITS + my_ffsl(bits) - 1;
+}
+
+/* A scan visits the TTL buckets from <off> on and wraps, so that the bucket
+ * of rank <i> is (<off> + <i>) modulo CACHE_TTL_N_BUCKETS. Return the rank of
+ * the first bucket in use from rank <i> on, or CACHE_TTL_N_BUCKETS if there
+ * is none.
+ */
+static inline unsigned int ttl_used_first(const struct cache *cache, unsigned int off,
+                                         unsigned int i)
+{
+	unsigned int id;
+
+	if (i < CACHE_TTL_N_BUCKETS - off) {
+		id = ttl_used_next(cache, off + i);
+		if (id < CACHE_TTL_N_BUCKETS)
+			return id - off;
+		i = CACHE_TTL_N_BUCKETS - off;
+	}
+	id = ttl_used_next(cache, i - (CACHE_TTL_N_BUCKETS - off));
+	if (id < off)
+		return id + CACHE_TTL_N_BUCKETS - off;
+	return CACHE_TTL_N_BUCKETS;
+}
+
+static inline void seg_list_append(struct cache *cache, struct seg_list *l,
                                    seg_id_t seg_id)
 {
 	struct seg *seg, *prev;
@@ -607,15 +660,17 @@ static inline void seg_list_append(const struct cache *cache, struct seg_list *l
 	seg->prev_seg_id = l->last_seg_id;
 	seg->next_seg_id = CACHE_SEG_NONE;
 	l->last_seg_id = seg_id;
-	if (l->first_seg_id == CACHE_SEG_NONE)
-		_HA_ATOMIC_STORE(&l->first_seg_id, seg_id);
+	if (l->first_seg_id == CACHE_SEG_NONE) {
+		l->first_seg_id = seg_id;
+		ttl_used_set(cache, seg->ttl_bucket);
+	}
 
 	l->n_segs += seg->n_chain;
 	seg_list_rate_update(l);
 	l->rate_acc += seg->n_chain;
 }
 
-static inline void seg_list_splice(const struct cache *cache, struct seg_list *l,
+static inline void seg_list_splice(struct cache *cache, struct seg_list *l,
                                    seg_id_t first_id, seg_id_t last_id, seg_id_t new_id)
 {
 	struct seg *first, *last, *new;
@@ -647,8 +702,14 @@ static inline void seg_list_splice(const struct cache *cache, struct seg_list *l
 
 	if (prev_id != CACHE_SEG_NONE)
 		cache->segments[prev_id].next_seg_id = after_prev;
-	else
-		_HA_ATOMIC_STORE(&l->first_seg_id, after_prev);
+	else {
+		const struct ttl_bucket *ttlb = &cache->ttl_buckets[first->ttl_bucket];
+
+		l->first_seg_id = after_prev;
+		if (ttlb->segs.first_seg_id == CACHE_SEG_NONE &&
+		    ttlb->prv_segs.first_seg_id == CACHE_SEG_NONE)
+			ttl_used_clear(cache, first->ttl_bucket);
+	}
 
 	if (next_id != CACHE_SEG_NONE)
 		cache->segments[next_id].prev_seg_id = before_next;
@@ -658,7 +719,7 @@ static inline void seg_list_splice(const struct cache *cache, struct seg_list *l
 
 static inline seg_id_t seg_list_first(struct seg_list *l)
 {
-	return _HA_ATOMIC_LOAD(&l->first_seg_id);
+	return l->first_seg_id;
 }
 
 static inline seg_id_t seg_list_last(struct seg_list *l)
@@ -2420,7 +2481,7 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 	seg_id_t seg_id, best_seg_id;
 	uint32_t scan_off;
 	unsigned int locked = 0;
-	int i, j, seen, vanished;
+	int i, j, seen;
 
 	/* Every pass is charged a scan, even one finding the pool covered:
 	 * another reservation then takes the space first, and retrying is not
@@ -2438,8 +2499,10 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 	 */
 	oldest_ts = UINT32_MAX;
 	best = NULL;
+	best_list = NULL;		/* Quiet GCC */
+	best_gen = 0;			/* Quiet GCC */
 	best_seg_id = CACHE_SEG_NONE;	/* Quiet old GCC versions */
-	seen = vanished = 0;
+	seen = 0;
 
 	/* Start the scan at a random offset. This is mostly useful when
 	 * several lists are tied for the oldest timestamp - an easy
@@ -2448,32 +2511,20 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 	 * first-scanned one.
 	 */
 	scan_off = statistical_prng() & (CACHE_TTL_N_BUCKETS - 1);
-	for (i = 0; i < CACHE_TTL_N_BUCKETS; i++) {
+	for (i = ttl_used_first(cache, scan_off, 0); i < CACHE_TTL_N_BUCKETS;
+	     i = ttl_used_first(cache, scan_off, i + 1)) {
 		struct seg_list *lists[2];
-		seg_id_t head[2];
 
 		ttlb = &cache->ttl_buckets[(scan_off + i) & (CACHE_TTL_N_BUCKETS - 1)];
 		lists[0] = &ttlb->prv_segs;
 		lists[1] = &ttlb->segs;
-
-		/* Unlocked read first to avoid taking the lock if possible. */
-		for (j = 0; j < 2; j++)
-			head[j] = seg_list_first(lists[j]);
-		if (head[0] == CACHE_SEG_NONE && head[1] == CACHE_SEG_NONE)
-			continue;
 
 		seen = 1;
 		if (++locked % CACHE_SCAN_LOCKED_PER_REC == 0)
 			rc->spent++;
 		HA_SPIN_LOCK(CACHE_TTLB_LOCK, &ttlb->lock);
 		for (j = 0; j < 2; j++) {
-			/* Now that we hold the TTL bucket lock, we need to
-			 * re-read segment ID and validate it.
-			 */
 			seg_id = seg_list_first(lists[j]);
-			if (head[j] != CACHE_SEG_NONE && head[j] != seg_id)
-				vanished = 1;
-
 			if (seg_id == CACHE_SEG_NONE)
 				continue;
 
@@ -2524,14 +2575,11 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 	 * for writes. In the former case, we need to give up. This should not
 	 * really happen in practice unless this thread has been stuck for a
 	 * very long time or this function was called at an inappropriate time.
-	 * In the edge case where we saw a segment with the unlocked load of
-	 * first_seg_id but it was gone when we read again, it means a segment
-	 * was reclaimed, so we return CACHE_RECLAIM_PROGRESS in this case,
-	 * just like when the scan freed some expired segments, even short of
-	 * the need.
+	 * A scan that freed some expired segments reports progress, even short
+	 * of the need.
 	 */
 	if (best == NULL) {
-		if (rc->freed > 0 || vanished)
+		if (rc->freed > 0)
 			return CACHE_RECLAIM_PROGRESS;
 		if (!(cache->flags & CACHE_F_NO_MERGE)) {
 			status = cache_merge_pending(cache, rc);
