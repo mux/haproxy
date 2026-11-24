@@ -2508,10 +2508,9 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 	seen = 0;
 
 	/* Start the scan at a random offset. This is mostly useful when
-	 * several lists are tied - an easy occurrence without merging,
-	 * where segment ages in whole seconds are compared. Concurrent
-	 * reclaimers then elect different victims instead of all racing
-	 * for the first-scanned one.
+	 * several lists are tied. Concurrent reclaimers then elect
+	 * different victims instead of all racing for the first-scanned
+	 * one.
 	 */
 	scan_off = statistical_prng() & (CACHE_TTL_N_BUCKETS - 1);
 	for (i = ttl_used_first(cache, scan_off, 0); i < CACHE_TTL_N_BUCKETS;
@@ -2551,10 +2550,7 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 			 */
 			if (seg_id != CACHE_SEG_NONE) {
 				seg = &cache->segments[seg_id];
-				if (cache->flags & CACHE_F_NO_MERGE)
-					age = (int64_t)date.tv_sec - seg->create_ts;
-				else
-					age = seg_list_elect_age(lists[j], j == 1, seg);
+				age = seg_list_elect_age(lists[j], j == 1, seg);
 				if (_HA_ATOMIC_LOAD(&seg->w_refcount) == 0 &&
 				    (best == NULL || age > longest)) {
 					uint32_t sw = _HA_ATOMIC_LOAD(&seg->state_gen);
