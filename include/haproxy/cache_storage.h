@@ -89,7 +89,6 @@ struct cache_stats {
 	                                   * all free, unpublished or condemned */
 	uint64_t reserve_fail_budget;     /* ... because the reclaim budget was spent */
 	uint64_t reclaim_calls;       /* Reclaim scans started */
-	uint64_t reclaim_elect_losses;/* Elected victims lost to a concurrent reclaimer */
 	uint64_t reclaim_blocked;     /* Elected victims skipped: writer-pinned or merge-claimed */
 	uint64_t reclaim_no_candidate;/* Scans that found segments but no electable victim */
 	uint64_t publish_fails;   /* Stores refused: index full or entry incomplete */

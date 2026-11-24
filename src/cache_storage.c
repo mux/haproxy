@@ -2450,9 +2450,9 @@ static enum cache_reclaim_status ttl_bucket_merge(struct cache *cache,
 /* Attempt to reclaim a segment for a new reservation. We always attempt to
  * reclaim an expired segment before evicting a live one.
  *
- * The scan locks each non-empty TTL bucket and may repeat after a lost
- * election or a write-pinned victim. The expiration record budget does not
- * bound bucket scans, skipped writer pins or time spent waiting for locks.
+ * The scan locks each non-empty TTL bucket and may repeat after a
+ * write-pinned victim. The expiration record budget does not bound bucket
+ * scans, skipped writer pins or time spent waiting for locks.
  *
  * <rc>'s shortfall is the number of segments the caller is waiting for:
  * expired segments freed during the scan count towards it. Expiration
@@ -2480,8 +2480,7 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 	struct seg *seg;
 	enum cache_reclaim_status status;
 	double longest, age;
-	uint32_t best_gen;
-	seg_id_t seg_id, best_seg_id;
+	seg_id_t seg_id;
 	uint32_t scan_off;
 	unsigned int locked = 0;
 	int i, j, seen;
@@ -2496,15 +2495,12 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 	if (!rc->shortfall)
 		return CACHE_RECLAIM_PROGRESS;
 
-	/* Locate the list that keeps its segments longest, and in it our best
-	 * candidate for eviction. While here, see if any segments can be
-	 * expired. Note that this candidate is not necessarily expirable.
+	/* Locate the list that keeps its segments longest. While here, see if
+	 * any segments can be expired.
 	 */
 	longest = 0;
 	best = NULL;
 	best_list = NULL;		/* Quiet GCC */
-	best_gen = 0;			/* Quiet GCC */
-	best_seg_id = CACHE_SEG_NONE;	/* Quiet old GCC versions */
 	seen = 0;
 
 	/* Start the scan at a random offset. This is mostly useful when
@@ -2553,11 +2549,7 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 				age = seg_list_elect_age(lists[j], j == 1, seg);
 				if (_HA_ATOMIC_LOAD(&seg->w_refcount) == 0 &&
 				    (best == NULL || age > longest)) {
-					uint32_t sw = _HA_ATOMIC_LOAD(&seg->state_gen);
-
 					longest = age;
-					best_gen = SEG_STATE_GEN(sw);
-					best_seg_id = seg_id;
 					best_list = lists[j];
 					best = ttlb;
 				}
@@ -2606,29 +2598,6 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 	 */
 
 	HA_SPIN_LOCK(CACHE_TTLB_LOCK, &best->lock);
-	seg_id = seg_list_first(best_list);
-	if ((cache->flags & CACHE_F_NO_MERGE) && seg_id != best_seg_id) {
-		/* If the head segment changed, someone successfully
-		 * reclaimed it, so we need to retry.
-		 */
-		HA_SPIN_UNLOCK(CACHE_TTLB_LOCK, &best->lock);
-
-		_HA_ATOMIC_INC(&cache->stats.reclaim_elect_losses);
-		return CACHE_RECLAIM_PROGRESS;
-	}
-
-	seg = &cache->segments[best_seg_id];
-	if (SEG_STATE_GEN(_HA_ATOMIC_LOAD(&seg->state_gen)) != best_gen ||
-	    (!(cache->flags & CACHE_F_NO_MERGE) &&
-	     SEG_STATE(_HA_ATOMIC_LOAD(&seg->state_gen)) != SEG_S_LIVE)) {
-		/* Like above, there was some kind of progress: the segment
-		 * was reclaimed and reused since we elected it.
-		 */
-		HA_SPIN_UNLOCK(CACHE_TTLB_LOCK, &best->lock);
-
-		_HA_ATOMIC_INC(&cache->stats.reclaim_elect_losses);
-		return CACHE_RECLAIM_PROGRESS;
-	}
 
 	/* Another reclaimer may have refilled the pool since the election. */
 	if (cache_pool_covers(cache, rc)) {
@@ -2641,8 +2610,16 @@ static enum cache_reclaim_status cache_reclaim(struct cache *cache,
 		status = ttl_bucket_merge(cache, best, rc);
 	else if (!(cache->flags & CACHE_F_NO_MERGE))
 		status = ttl_bucket_evict(cache, best, best_list, rc);
-	else
-		status = seg_evict(cache, best, best_list, best_seg_id, rc);
+	else {
+		/* Without merging, the victim is the head of the list. Other
+		 * reclaimers may have emptied the list since the election.
+		 */
+		seg_id = seg_list_first(best_list);
+		if (seg_id == CACHE_SEG_NONE)
+			status = CACHE_RECLAIM_PROGRESS;
+		else
+			status = seg_evict(cache, best, best_list, seg_id, rc);
+	}
 	HA_SPIN_UNLOCK(CACHE_TTLB_LOCK, &best->lock);
 
 	if (status == CACHE_RECLAIM_PROGRESS || status == CACHE_RECLAIM_MERGING)
@@ -3470,7 +3447,6 @@ void cache_get_stats(const struct cache *cache, struct cache_stats *stats)
 	stats->reserve_fail_giveup = _HA_ATOMIC_LOAD(&cache->stats.reserve_fail_giveup);
 	stats->reserve_fail_budget = _HA_ATOMIC_LOAD(&cache->stats.reserve_fail_budget);
 	stats->reclaim_calls = _HA_ATOMIC_LOAD(&cache->stats.reclaim_calls);
-	stats->reclaim_elect_losses = _HA_ATOMIC_LOAD(&cache->stats.reclaim_elect_losses);
 	stats->reclaim_blocked = _HA_ATOMIC_LOAD(&cache->stats.reclaim_blocked);
 	stats->reclaim_no_candidate = _HA_ATOMIC_LOAD(&cache->stats.reclaim_no_candidate);
 	stats->publish_fails = _HA_ATOMIC_LOAD(&cache->stats.publish_fails);

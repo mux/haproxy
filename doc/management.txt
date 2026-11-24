@@ -3144,8 +3144,6 @@ show cache [stats]
                                that space returned by a merger satisfied; a
                                high count means the final check rarely fails
      reclaim_calls             Scans looking for space to reclaim
-     reclaim_elect_losses      Scans whose chosen segment was reclaimed by
-                               another thread first
      reclaim_blocked           Segments left alone because an object was still
                                being written into them, or a merge was reading
                                them
